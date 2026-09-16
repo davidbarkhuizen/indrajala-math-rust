@@ -186,3 +186,122 @@ pub fn layer_apply_accumulated_gradient(
     };
     Ok((new_w, new_b))
 }
+
+/// `AdamArrayLayer.apply_accumulated_gradient`: the Adam (Kingma & Ba, 2014) update rule - see
+/// docs/adam-array-layer.md - as one fused call per parameter (`W` or `b`) instead of composing
+/// it from several `Array` operators. Shape-agnostic like `layer_apply_accumulated_gradient`
+/// above, so this one helper covers both the `W`/`grad_W`/`m_W`/`v_W` (2D) and `b`/`grad_b`/`m_b`/
+/// `v_b` (1D) cases. `t` is the step count *after* incrementing - mirrors
+/// `AdamArrayLayer._t += 1` happening before the bias-correction terms are computed, so the
+/// Python caller increments its own `_t` and passes the new value in rather than this function
+/// owning the counter.
+#[allow(clippy::too_many_arguments)]
+fn adam_update(
+    param: &RustArray,
+    grad: &RustArray,
+    m: &RustArray,
+    v: &RustArray,
+    t: u32,
+    beta1: f64,
+    beta2: f64,
+    epsilon: f64,
+    learning_rate: f64,
+    batch_size: f64,
+) -> (RustArray, RustArray, RustArray) {
+    let bias_correction1 = 1.0 - beta1.powi(t as i32);
+    let bias_correction2 = 1.0 - beta2.powi(t as i32);
+
+    let n = param.data.len();
+    let mut new_param_data = Vec::with_capacity(n);
+    let mut new_m_data = Vec::with_capacity(n);
+    let mut new_v_data = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let g = grad.data[i] / batch_size;
+        let new_m = beta1 * m.data[i] + (1.0 - beta1) * g;
+        let new_v = beta2 * v.data[i] + (1.0 - beta2) * g * g;
+        let m_hat = new_m / bias_correction1;
+        let v_hat = new_v / bias_correction2;
+        new_param_data.push(param.data[i] - learning_rate * m_hat / (v_hat.sqrt() + epsilon));
+        new_m_data.push(new_m);
+        new_v_data.push(new_v);
+    }
+
+    (
+        RustArray {
+            data: new_param_data,
+            shape: param.shape,
+        },
+        RustArray {
+            data: new_m_data,
+            shape: param.shape,
+        },
+        RustArray {
+            data: new_v_data,
+            shape: param.shape,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+pub fn layer_adam_apply_accumulated_gradient(
+    w: &RustArray,
+    b: &RustArray,
+    grad_w: &RustArray,
+    grad_b: &RustArray,
+    m_w: &RustArray,
+    v_w: &RustArray,
+    m_b: &RustArray,
+    v_b: &RustArray,
+    t: u32,
+    beta1: f64,
+    beta2: f64,
+    epsilon: f64,
+    learning_rate: f64,
+    batch_size: usize,
+) -> PyResult<(RustArray, RustArray, RustArray, RustArray, RustArray, RustArray)> {
+    require_same_shape(w, grad_w, "layer_adam_apply_accumulated_gradient (W, grad_W)")?;
+    require_same_shape(w, m_w, "layer_adam_apply_accumulated_gradient (W, m_W)")?;
+    require_same_shape(w, v_w, "layer_adam_apply_accumulated_gradient (W, v_W)")?;
+    require_same_shape(b, grad_b, "layer_adam_apply_accumulated_gradient (b, grad_b)")?;
+    require_same_shape(b, m_b, "layer_adam_apply_accumulated_gradient (b, m_b)")?;
+    require_same_shape(b, v_b, "layer_adam_apply_accumulated_gradient (b, v_b)")?;
+    if batch_size == 0 {
+        return Err(PyValueError::new_err(
+            "layer_adam_apply_accumulated_gradient requires batch_size >= 1",
+        ));
+    }
+    if t == 0 {
+        return Err(PyValueError::new_err(
+            "layer_adam_apply_accumulated_gradient requires t >= 1 (the step count after incrementing)",
+        ));
+    }
+
+    let (new_w, new_m_w, new_v_w) = adam_update(
+        w,
+        grad_w,
+        m_w,
+        v_w,
+        t,
+        beta1,
+        beta2,
+        epsilon,
+        learning_rate,
+        batch_size as f64,
+    );
+    let (new_b, new_m_b, new_v_b) = adam_update(
+        b,
+        grad_b,
+        m_b,
+        v_b,
+        t,
+        beta1,
+        beta2,
+        epsilon,
+        learning_rate,
+        batch_size as f64,
+    );
+
+    Ok((new_w, new_b, new_m_w, new_v_w, new_m_b, new_v_b))
+}

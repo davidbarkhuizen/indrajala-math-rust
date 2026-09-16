@@ -10,9 +10,9 @@ mod ufuncs;
 
 use array::RustArray;
 use fused::{
-    layer_accumulate_gradient, layer_accumulate_gradient_batch, layer_apply_accumulated_gradient,
-    layer_forward, layer_forward_batch, layer_hidden_delta, layer_hidden_delta_batch,
-    layer_output_delta,
+    layer_accumulate_gradient, layer_accumulate_gradient_batch,
+    layer_adam_apply_accumulated_gradient, layer_apply_accumulated_gradient, layer_forward,
+    layer_forward_batch, layer_hidden_delta, layer_hidden_delta_batch, layer_output_delta,
 };
 use linalg::outer;
 use mnist::decode_mnist_pixels;
@@ -44,6 +44,7 @@ fn indrajala_ml_array(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(layer_accumulate_gradient, m)?)?;
     m.add_function(wrap_pyfunction!(layer_accumulate_gradient_batch, m)?)?;
     m.add_function(wrap_pyfunction!(layer_apply_accumulated_gradient, m)?)?;
+    m.add_function(wrap_pyfunction!(layer_adam_apply_accumulated_gradient, m)?)?;
     m.add_class::<RustArray>()?;
     Ok(())
 }
