@@ -390,3 +390,75 @@ pub fn layer_momentum_apply_accumulated_gradient(
 
     Ok((new_w, new_b, new_prev_delta_w, new_prev_delta_b))
 }
+
+/// `ReLUArrayLayer.forward`: `max(0, self.W @ x + self.b)`, `x`/`b` both 1D - see
+/// docs/relu-array-layer.md. Inlines `array_relu`'s own formula (`ufuncs.rs`) rather than
+/// calling it as a separate op, the same "one Rust call per layer method" discipline every
+/// other `fused.rs` function follows.
+#[pyfunction]
+pub fn layer_relu_forward(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
+    let z = matmul(w, x)?;
+    let z = z.combine_with_array(b, |a, bv| a + bv, "add")?;
+    Ok(RustArray {
+        data: z.data.iter().map(|&v| v.max(0.0)).collect(),
+        shape: z.shape,
+    })
+}
+
+/// `ReLUArrayLayer.forward_batch`: `max(0, X @ self.W.T + self.b)`, `X` 2D (`batch, input_size`).
+#[pyfunction]
+pub fn layer_relu_forward_batch(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
+    let w_t = w.transpose();
+    let z = matmul(x, &w_t)?;
+    let z = z.combine_with_array(b, |a, bv| a + bv, "add")?;
+    Ok(RustArray {
+        data: z.data.iter().map(|&v| v.max(0.0)).collect(),
+        shape: z.shape,
+    })
+}
+
+/// `ReLUArrayLayer.compute_hidden_delta`: `(next_layer.W.T @ next_layer.delta) * (self.a > 0.0)` -
+/// inlines `array_relu_mask`'s own formula rather than calling it as a separate op, single-example
+/// (`next_delta`/`a` both 1D).
+#[pyfunction]
+pub fn layer_relu_hidden_delta(
+    next_w: &RustArray,
+    next_delta: &RustArray,
+    a: &RustArray,
+) -> PyResult<RustArray> {
+    let downstream = matmul(&next_w.transpose(), next_delta)?;
+    require_same_shape(&downstream, a, "layer_relu_hidden_delta")?;
+    let data = downstream
+        .data
+        .iter()
+        .zip(a.data.iter())
+        .map(|(&d, &av)| if av > 0.0 { d } else { 0.0 })
+        .collect();
+    Ok(RustArray {
+        data,
+        shape: a.shape,
+    })
+}
+
+/// `ReLUArrayLayer.compute_hidden_delta_batch`: `(next_layer.delta_batch @ next_layer.W) *
+/// (self.A > 0.0)` - batched, no transpose on `next_w` (same shape-of-call-sites distinction
+/// `layer_hidden_delta_batch` itself already documents).
+#[pyfunction]
+pub fn layer_relu_hidden_delta_batch(
+    next_w: &RustArray,
+    next_delta_batch: &RustArray,
+    a_batch: &RustArray,
+) -> PyResult<RustArray> {
+    let downstream = matmul(next_delta_batch, next_w)?;
+    require_same_shape(&downstream, a_batch, "layer_relu_hidden_delta_batch")?;
+    let data = downstream
+        .data
+        .iter()
+        .zip(a_batch.data.iter())
+        .map(|(&d, &av)| if av > 0.0 { d } else { 0.0 })
+        .collect();
+    Ok(RustArray {
+        data,
+        shape: a_batch.shape,
+    })
+}
