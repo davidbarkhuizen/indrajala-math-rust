@@ -296,3 +296,40 @@ pub fn layer_adam_apply_accumulated_gradient(
 
     Ok((new_w, new_b, new_m_w, new_v_w, new_m_b, new_v_b))
 }
+
+/// `L2ArrayLayer.apply_accumulated_gradient`: `W -= learning_rate * (grad_W / batch_size +
+/// l2_lambda * W); b -= learning_rate * grad_b / batch_size` (bias unregularized) - see
+/// docs/l2-array-layer.md. No persistent per-parameter state at all (unlike
+/// `layer_adam_apply_accumulated_gradient`/`layer_momentum_apply_accumulated_gradient`), so this
+/// takes only `W`/`b`/`grad_W`/`grad_b` plus the scalar `l2_lambda` - the simplest fused op in
+/// this round.
+#[pyfunction]
+pub fn layer_l2_apply_accumulated_gradient(
+    w: &RustArray,
+    b: &RustArray,
+    grad_w: &RustArray,
+    grad_b: &RustArray,
+    l2_lambda: f64,
+    learning_rate: f64,
+    batch_size: usize,
+) -> PyResult<(RustArray, RustArray)> {
+    require_same_shape(w, grad_w, "layer_l2_apply_accumulated_gradient (W, grad_W)")?;
+    require_same_shape(b, grad_b, "layer_l2_apply_accumulated_gradient (b, grad_b)")?;
+    if batch_size == 0 {
+        return Err(PyValueError::new_err(
+            "layer_l2_apply_accumulated_gradient requires batch_size >= 1",
+        ));
+    }
+    let scale = learning_rate / (batch_size as f64);
+    let new_w = RustArray {
+        data: same_shape_elementwise(&w.data, &grad_w.data, |wv, gv| {
+            wv - scale * gv - learning_rate * l2_lambda * wv
+        }),
+        shape: w.shape,
+    };
+    let new_b = RustArray {
+        data: same_shape_elementwise(&b.data, &grad_b.data, |bv, gv| bv - scale * gv),
+        shape: b.shape,
+    };
+    Ok((new_w, new_b))
+}
