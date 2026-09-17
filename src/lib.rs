@@ -17,7 +17,7 @@ use fused::{
 use linalg::outer;
 use mnist::decode_mnist_pixels;
 use random::uniform;
-use ufuncs::{argmax, exp, sum_axis0};
+use ufuncs::{argmax, array_relu, array_relu_mask, exp, sum_axis0};
 
 /// Proves the PyO3/maturin toolchain works end to end - importable and callable from Python,
 /// nothing array-specific yet. See docs/rust-array-core.md's "PR 0" for why this stage exists
@@ -34,6 +34,8 @@ fn indrajala_ml_array(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(outer, m)?)?;
     m.add_function(wrap_pyfunction!(sum_axis0, m)?)?;
     m.add_function(wrap_pyfunction!(argmax, m)?)?;
+    m.add_function(wrap_pyfunction!(array_relu, m)?)?;
+    m.add_function(wrap_pyfunction!(array_relu_mask, m)?)?;
     m.add_function(wrap_pyfunction!(uniform, m)?)?;
     m.add_function(wrap_pyfunction!(decode_mnist_pixels, m)?)?;
     m.add_function(wrap_pyfunction!(layer_forward, m)?)?;

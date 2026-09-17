@@ -2,6 +2,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::array::{RustArray, Shape};
+use crate::ops::same_shape_elementwise;
 
 /// Elementwise `e^x` over a whole array - mirrors `array_layer.sigmoid`'s own reliance on
 /// `exp`'s overflow behavior (a large negative `z` drives `exp(-z)` to `f64::INFINITY`, and
@@ -40,6 +41,36 @@ pub fn sum_axis0(arr: &RustArray) -> PyResult<RustArray> {
             "sum_axis0 requires a 2D array, got a 1D vector",
         )),
     }
+}
+
+/// Elementwise `max(0.0, x)` - the Rust core's counterpart to `np.maximum(0.0, z)`
+/// (`ArrayLayer.forward`'s array-level `relu_activation`, see docs/relu-array-layer.md), this
+/// crate's first genuinely new ufunc since `np.maximum`/`np.where` were explicitly named as
+/// deferred in docs/numpy-interface-subset.md's "explicitly not required" section.
+#[pyfunction]
+pub fn array_relu(arr: &RustArray) -> RustArray {
+    RustArray {
+        data: arr.data.iter().map(|&v| v.max(0.0)).collect(),
+        shape: arr.shape,
+    }
+}
+
+/// `downstream * (a > 0.0)` - ReLU's derivative mask, zeroing out the downstream gradient
+/// wherever this layer's own cached activation was <= 0 (`ReLUArrayLayer.compute_hidden_delta`/
+/// `compute_hidden_delta_batch`'s shared formula, see docs/relu-array-layer.md). Shape-agnostic
+/// (single-example 1D or batched 2D), so one function covers both call shapes.
+#[pyfunction]
+pub fn array_relu_mask(downstream: &RustArray, a: &RustArray) -> PyResult<RustArray> {
+    if downstream.shape != a.shape {
+        return Err(PyValueError::new_err(format!(
+            "array_relu_mask requires matching shapes, got {:?} and {:?}",
+            downstream.shape, a.shape
+        )));
+    }
+    Ok(RustArray {
+        data: same_shape_elementwise(&downstream.data, &a.data, |d, av| if av > 0.0 { d } else { 0.0 }),
+        shape: downstream.shape,
+    })
 }
 
 /// The index of the largest element in a 1D array - `classify_state`'s own
