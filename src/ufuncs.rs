@@ -73,6 +73,44 @@ pub fn array_relu_mask(downstream: &RustArray, a: &RustArray) -> PyResult<RustAr
     })
 }
 
+/// Numerically-stable softmax normalization - `SoftmaxArrayLayer.forward`/`forward_batch`'s own
+/// max-shift-then-exponentiate-then-normalize formula (see docs/softmax-array-layer.md), added
+/// as its own primitive before either array-based softmax class exists, the same "prove the
+/// primitive against numpy first" staging `array_relu`/`array_relu_mask` already established for
+/// ReLU. A 1D vector is normalized as one whole distribution (`forward`'s shape); a 2D matrix is
+/// normalized row-wise, one independent distribution per row (`forward_batch`'s shape) - the
+/// genuinely new reduction shape docs/numpy-interface-subset.md's "explicitly not required"
+/// section flagged as deferred (general axis-parameterized reductions), resolved here as this
+/// one fixed case rather than a general `axis=` parameter, matching `sum_axis0`'s own precedent.
+#[pyfunction]
+pub fn array_softmax(arr: &RustArray) -> RustArray {
+    fn normalize_row(row: &[f64]) -> Vec<f64> {
+        let max_value = row.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let exp_values: Vec<f64> = row.iter().map(|&v| (v - max_value).exp()).collect();
+        let total: f64 = exp_values.iter().sum();
+        exp_values.iter().map(|&e| e / total).collect()
+    }
+
+    match arr.shape {
+        Shape::Vector(_) => RustArray {
+            data: normalize_row(&arr.data),
+            shape: arr.shape,
+        },
+        Shape::Matrix(rows, cols) => {
+            let mut out = vec![0.0; rows * cols];
+            for row in 0..rows {
+                let start = row * cols;
+                let normalized = normalize_row(&arr.data[start..start + cols]);
+                out[start..start + cols].copy_from_slice(&normalized);
+            }
+            RustArray {
+                data: out,
+                shape: arr.shape,
+            }
+        }
+    }
+}
+
 /// The index of the largest element in a 1D array - `classify_state`'s own
 /// `np.argmax(self.predict_probabilities(state))`. Strict `>` (not `>=`) when scanning left to
 /// right keeps the first occurrence on a tie, matching numpy's own `np.argmax` tie-breaking rule
