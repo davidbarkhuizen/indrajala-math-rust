@@ -4,7 +4,7 @@ use pyo3::prelude::*;
 use crate::array::RustArray;
 use crate::linalg::{matmul, outer};
 use crate::ops::same_shape_elementwise;
-use crate::ufuncs::sum_axis0;
+use crate::ufuncs::{array_softmax, sum_axis0};
 
 /// docs/rust-production-cutover.md's phase 0b: one Rust function per `ArrayLayer` method,
 /// doing the entire computation in one call instead of composing it from several separate
@@ -460,5 +460,38 @@ pub fn layer_relu_hidden_delta_batch(
     Ok(RustArray {
         data,
         shape: a_batch.shape,
+    })
+}
+
+/// `SoftmaxArrayLayer.forward`: `array_softmax(self.W @ x + self.b)`, `x`/`b` both 1D - see
+/// docs/softmax-array-layer.md. Reuses `array_softmax` (`ufuncs.rs`, stage 2's primitive)
+/// directly rather than inlining its max/sum reduction, unlike ReLU's trivial elementwise
+/// formula - the extra call is Rust-internal, not a second Python/Rust FFI crossing.
+#[pyfunction]
+pub fn layer_softmax_forward(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
+    let z = matmul(w, x)?;
+    let z = z.combine_with_array(b, |a, bv| a + bv, "add")?;
+    Ok(array_softmax(&z))
+}
+
+/// `SoftmaxArrayLayer.forward_batch`: `array_softmax(X @ self.W.T + self.b)`, row-wise
+/// normalization, `X` 2D (`batch, input_size`).
+#[pyfunction]
+pub fn layer_softmax_forward_batch(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
+    let w_t = w.transpose();
+    let z = matmul(x, &w_t)?;
+    let z = z.combine_with_array(b, |a, bv| a + bv, "add")?;
+    Ok(array_softmax(&z))
+}
+
+/// `SoftmaxArrayLayer.compute_output_delta`/`compute_output_delta_batch`: `a - reference` -
+/// `SoftmaxOutputNode`'s own simplification, no `a*(1-a)` damping term at all - shape-agnostic
+/// like `layer_output_delta`, so one function covers both the single-example and batched case.
+#[pyfunction]
+pub fn layer_softmax_output_delta(a: &RustArray, reference: &RustArray) -> PyResult<RustArray> {
+    require_same_shape(a, reference, "layer_softmax_output_delta")?;
+    Ok(RustArray {
+        data: same_shape_elementwise(&a.data, &reference.data, |av, rv| av - rv),
+        shape: a.shape,
     })
 }
