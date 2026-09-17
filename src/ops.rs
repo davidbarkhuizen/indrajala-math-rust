@@ -15,7 +15,9 @@ fn extract_scalar(value: &PyAny) -> PyResult<f64> {
     Err(PyTypeError::new_err("expected a numeric scalar"))
 }
 
-fn same_shape_elementwise(a: &[f64], b: &[f64], op: impl Fn(f64, f64) -> f64) -> Vec<f64> {
+// pub(crate): fused.rs's layer_apply_accumulated_gradient reuses this directly rather than
+// hand-writing the same zip/map loop for its own W/grad_W and b/grad_b scaled-subtract pairs.
+pub(crate) fn same_shape_elementwise(a: &[f64], b: &[f64], op: impl Fn(f64, f64) -> f64) -> Vec<f64> {
     a.iter().zip(b.iter()).map(|(&x, &y)| op(x, y)).collect()
 }
 

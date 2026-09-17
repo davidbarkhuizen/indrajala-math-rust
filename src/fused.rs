@@ -3,6 +3,7 @@ use pyo3::prelude::*;
 
 use crate::array::RustArray;
 use crate::linalg::{matmul, outer};
+use crate::ops::same_shape_elementwise;
 use crate::ufuncs::sum_axis0;
 
 /// docs/rust-production-cutover.md's phase 0b: one Rust function per `ArrayLayer` method,
@@ -167,21 +168,11 @@ pub fn layer_apply_accumulated_gradient(
     }
     let scale = learning_rate / (batch_size as f64);
     let new_w = RustArray {
-        data: w
-            .data
-            .iter()
-            .zip(grad_w.data.iter())
-            .map(|(&wv, &gv)| wv - scale * gv)
-            .collect(),
+        data: same_shape_elementwise(&w.data, &grad_w.data, |wv, gv| wv - scale * gv),
         shape: w.shape,
     };
     let new_b = RustArray {
-        data: b
-            .data
-            .iter()
-            .zip(grad_b.data.iter())
-            .map(|(&bv, &gv)| bv - scale * gv)
-            .collect(),
+        data: same_shape_elementwise(&b.data, &grad_b.data, |bv, gv| bv - scale * gv),
         shape: b.shape,
     };
     Ok((new_w, new_b))
