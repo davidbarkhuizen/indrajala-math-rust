@@ -32,21 +32,32 @@ fn sigmoid(z: &RustArray) -> RustArray {
     }
 }
 
+/// `self.W @ x + self.b`, `x`/`b` both 1D - the pre-activation shared by every `layer_*forward`
+/// below (plain sigmoid, ReLU, softmax, dropout's own pre-mask sigmoid); each differs only in
+/// what it does to this value, not in how it's computed.
+fn linear_preactivation(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
+    let z = matmul(w, x)?;
+    z.combine_with_array(b, |a, bv| a + bv, "add")
+}
+
+/// `X @ self.W.T + self.b`, `X` 2D (`batch, input_size`) - the batched analogue of
+/// `linear_preactivation` above, shared the same way by every `layer_*forward_batch`.
+fn linear_preactivation_batch(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
+    let w_t = w.transpose();
+    let z = matmul(x, &w_t)?;
+    z.combine_with_array(b, |a, bv| a + bv, "add")
+}
+
 /// `ArrayLayer.forward`: `sigmoid(self.W @ x + self.b)`, `x`/`b` both 1D.
 #[pyfunction]
 pub fn layer_forward(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
-    let z = matmul(w, x)?;
-    let z = z.combine_with_array(b, |a, bv| a + bv, "add")?;
-    Ok(sigmoid(&z))
+    Ok(sigmoid(&linear_preactivation(w, x, b)?))
 }
 
 /// `ArrayLayer.forward_batch`: `sigmoid(X @ self.W.T + self.b)`, `X` 2D (`batch, input_size`).
 #[pyfunction]
 pub fn layer_forward_batch(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
-    let w_t = w.transpose();
-    let z = matmul(x, &w_t)?;
-    let z = z.combine_with_array(b, |a, bv| a + bv, "add")?;
-    Ok(sigmoid(&z))
+    Ok(sigmoid(&linear_preactivation_batch(w, x, b)?))
 }
 
 /// `ArrayLayer.compute_output_delta`/`compute_output_delta_batch`: `(a - reference) * a * (1 -
@@ -67,6 +78,35 @@ pub fn layer_output_delta(a: &RustArray, reference: &RustArray) -> PyResult<Rust
     })
 }
 
+/// `next_layer.W.T @ next_layer.delta`, single-example (`next_delta`/`a` both 1D), shape-checked
+/// against `a` - the downstream term shared by every `layer_*hidden_delta` below (plain sigmoid,
+/// ReLU, dropout); each differs only in what elementwise formula it applies on top, not in how
+/// the downstream matmul itself is computed.
+fn hidden_downstream(
+    next_w: &RustArray,
+    next_delta: &RustArray,
+    a: &RustArray,
+    context: &str,
+) -> PyResult<RustArray> {
+    let downstream = matmul(&next_w.transpose(), next_delta)?;
+    require_same_shape(&downstream, a, context)?;
+    Ok(downstream)
+}
+
+/// `next_layer.delta_batch @ next_layer.W` - the batched analogue of `hidden_downstream` above,
+/// no transpose on `next_w` (`next_delta_batch`'s batch axis is on the left instead of `next_w`'s
+/// being on the left, a genuinely different call shape, not just a shape-agnostic reuse).
+fn hidden_downstream_batch(
+    next_w: &RustArray,
+    next_delta_batch: &RustArray,
+    a_batch: &RustArray,
+    context: &str,
+) -> PyResult<RustArray> {
+    let downstream = matmul(next_delta_batch, next_w)?;
+    require_same_shape(&downstream, a_batch, context)?;
+    Ok(downstream)
+}
+
 /// `ArrayLayer.compute_hidden_delta`: `(next_layer.W.T @ next_layer.delta) * self.a * (1 -
 /// self.a)`, single-example (`next_delta`/`a` both 1D).
 #[pyfunction]
@@ -75,8 +115,7 @@ pub fn layer_hidden_delta(
     next_delta: &RustArray,
     a: &RustArray,
 ) -> PyResult<RustArray> {
-    let downstream = matmul(&next_w.transpose(), next_delta)?;
-    require_same_shape(&downstream, a, "layer_hidden_delta")?;
+    let downstream = hidden_downstream(next_w, next_delta, a, "layer_hidden_delta")?;
     let data = downstream
         .data
         .iter()
@@ -90,18 +129,15 @@ pub fn layer_hidden_delta(
 }
 
 /// `ArrayLayer.compute_hidden_delta_batch`: `(next_layer.delta_batch @ next_layer.W) * self.A *
-/// (1 - self.A)` - batched, no transpose on `next_w` (unlike the single-example case above,
-/// since `next_delta_batch`'s batch axis is on the left instead of `next_w`'s being on the
-/// left), so this is a genuinely different call shape, not just a shape-agnostic reuse of
-/// `layer_hidden_delta`.
+/// (1 - self.A)` - batched; see `hidden_downstream_batch` for why this needs its own downstream
+/// computation rather than reusing `hidden_downstream`.
 #[pyfunction]
 pub fn layer_hidden_delta_batch(
     next_w: &RustArray,
     next_delta_batch: &RustArray,
     a_batch: &RustArray,
 ) -> PyResult<RustArray> {
-    let downstream = matmul(next_delta_batch, next_w)?;
-    require_same_shape(&downstream, a_batch, "layer_hidden_delta_batch")?;
+    let downstream = hidden_downstream_batch(next_w, next_delta_batch, a_batch, "layer_hidden_delta_batch")?;
     let data = downstream
         .data
         .iter()
@@ -398,8 +434,7 @@ pub fn layer_momentum_apply_accumulated_gradient(
 /// other `fused.rs` function follows.
 #[pyfunction]
 pub fn layer_relu_forward(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
-    let z = matmul(w, x)?;
-    let z = z.combine_with_array(b, |a, bv| a + bv, "add")?;
+    let z = linear_preactivation(w, x, b)?;
     Ok(RustArray {
         data: z.data.iter().map(|&v| v.max(0.0)).collect(),
         shape: z.shape,
@@ -409,9 +444,7 @@ pub fn layer_relu_forward(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResu
 /// `ReLUArrayLayer.forward_batch`: `max(0, X @ self.W.T + self.b)`, `X` 2D (`batch, input_size`).
 #[pyfunction]
 pub fn layer_relu_forward_batch(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
-    let w_t = w.transpose();
-    let z = matmul(x, &w_t)?;
-    let z = z.combine_with_array(b, |a, bv| a + bv, "add")?;
+    let z = linear_preactivation_batch(w, x, b)?;
     Ok(RustArray {
         data: z.data.iter().map(|&v| v.max(0.0)).collect(),
         shape: z.shape,
@@ -427,8 +460,7 @@ pub fn layer_relu_hidden_delta(
     next_delta: &RustArray,
     a: &RustArray,
 ) -> PyResult<RustArray> {
-    let downstream = matmul(&next_w.transpose(), next_delta)?;
-    require_same_shape(&downstream, a, "layer_relu_hidden_delta")?;
+    let downstream = hidden_downstream(next_w, next_delta, a, "layer_relu_hidden_delta")?;
     let data = downstream
         .data
         .iter()
@@ -450,8 +482,7 @@ pub fn layer_relu_hidden_delta_batch(
     next_delta_batch: &RustArray,
     a_batch: &RustArray,
 ) -> PyResult<RustArray> {
-    let downstream = matmul(next_delta_batch, next_w)?;
-    require_same_shape(&downstream, a_batch, "layer_relu_hidden_delta_batch")?;
+    let downstream = hidden_downstream_batch(next_w, next_delta_batch, a_batch, "layer_relu_hidden_delta_batch")?;
     let data = downstream
         .data
         .iter()
@@ -470,19 +501,14 @@ pub fn layer_relu_hidden_delta_batch(
 /// formula - the extra call is Rust-internal, not a second Python/Rust FFI crossing.
 #[pyfunction]
 pub fn layer_softmax_forward(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
-    let z = matmul(w, x)?;
-    let z = z.combine_with_array(b, |a, bv| a + bv, "add")?;
-    Ok(array_softmax(&z))
+    Ok(array_softmax(&linear_preactivation(w, x, b)?))
 }
 
 /// `SoftmaxArrayLayer.forward_batch`: `array_softmax(X @ self.W.T + self.b)`, row-wise
 /// normalization, `X` 2D (`batch, input_size`).
 #[pyfunction]
 pub fn layer_softmax_forward_batch(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
-    let w_t = w.transpose();
-    let z = matmul(x, &w_t)?;
-    let z = z.combine_with_array(b, |a, bv| a + bv, "add")?;
-    Ok(array_softmax(&z))
+    Ok(array_softmax(&linear_preactivation_batch(w, x, b)?))
 }
 
 /// `SoftmaxArrayLayer.compute_output_delta`/`compute_output_delta_batch`: `a - reference` -
@@ -513,8 +539,7 @@ pub fn layer_dropout_forward(
     drop_probability: f64,
     training: bool,
 ) -> PyResult<(RustArray, RustArray, RustArray)> {
-    let z = matmul(w, x)?;
-    let z = z.combine_with_array(b, |a, bv| a + bv, "add")?;
+    let z = linear_preactivation(w, x, b)?;
     let base = sigmoid(&z);
     let (a, mask) = dropout_forward_from_base(&base, drop_probability, training);
     Ok((a, mask, base))
@@ -532,9 +557,7 @@ pub fn layer_dropout_forward_batch(
     drop_probability: f64,
     training: bool,
 ) -> PyResult<(RustArray, RustArray, RustArray)> {
-    let w_t = w.transpose();
-    let z = matmul(x, &w_t)?;
-    let z = z.combine_with_array(b, |a, bv| a + bv, "add")?;
+    let z = linear_preactivation_batch(w, x, b)?;
     let base = sigmoid(&z);
     let (a, mask) = dropout_forward_from_base(&base, drop_probability, training);
     Ok((a, mask, base))
@@ -597,8 +620,7 @@ pub fn layer_dropout_hidden_delta(
     keep_probability: f64,
     was_training: bool,
 ) -> PyResult<RustArray> {
-    let downstream = matmul(&next_w.transpose(), next_delta)?;
-    require_same_shape(&downstream, base_activation, "layer_dropout_hidden_delta")?;
+    let downstream = hidden_downstream(next_w, next_delta, base_activation, "layer_dropout_hidden_delta")?;
     Ok(dropout_hidden_delta_from_downstream(
         &downstream,
         base_activation,
@@ -620,8 +642,12 @@ pub fn layer_dropout_hidden_delta_batch(
     keep_probability: f64,
     was_training: bool,
 ) -> PyResult<RustArray> {
-    let downstream = matmul(next_delta_batch, next_w)?;
-    require_same_shape(&downstream, base_activation_batch, "layer_dropout_hidden_delta_batch")?;
+    let downstream = hidden_downstream_batch(
+        next_w,
+        next_delta_batch,
+        base_activation_batch,
+        "layer_dropout_hidden_delta_batch",
+    )?;
     Ok(dropout_hidden_delta_from_downstream(
         &downstream,
         base_activation_batch,
