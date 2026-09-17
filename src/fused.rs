@@ -333,3 +333,60 @@ pub fn layer_l2_apply_accumulated_gradient(
     };
     Ok((new_w, new_b))
 }
+
+/// `MomentumArrayLayer.apply_accumulated_gradient`: `delta = learning_rate * grad / batch_size +
+/// momentum * prev_delta; param -= delta` - see docs/momentum-array-layer.md. One previous-delta
+/// array per parameter tensor, shape-agnostic like `layer_apply_accumulated_gradient` (covers
+/// both the `W`/`grad_W`/`prev_delta_W` (2D) and `b`/`grad_b`/`prev_delta_b` (1D) cases via two
+/// calls from the Python caller, the same convention `layer_apply_accumulated_gradient` itself
+/// uses).
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+pub fn layer_momentum_apply_accumulated_gradient(
+    w: &RustArray,
+    b: &RustArray,
+    grad_w: &RustArray,
+    grad_b: &RustArray,
+    prev_delta_w: &RustArray,
+    prev_delta_b: &RustArray,
+    momentum: f64,
+    learning_rate: f64,
+    batch_size: usize,
+) -> PyResult<(RustArray, RustArray, RustArray, RustArray)> {
+    require_same_shape(w, grad_w, "layer_momentum_apply_accumulated_gradient (W, grad_W)")?;
+    require_same_shape(w, prev_delta_w, "layer_momentum_apply_accumulated_gradient (W, prev_delta_W)")?;
+    require_same_shape(b, grad_b, "layer_momentum_apply_accumulated_gradient (b, grad_b)")?;
+    require_same_shape(b, prev_delta_b, "layer_momentum_apply_accumulated_gradient (b, prev_delta_b)")?;
+    if batch_size == 0 {
+        return Err(PyValueError::new_err(
+            "layer_momentum_apply_accumulated_gradient requires batch_size >= 1",
+        ));
+    }
+    let scale = learning_rate / (batch_size as f64);
+
+    let new_delta_w_data: Vec<f64> = (0..w.data.len())
+        .map(|i| scale * grad_w.data[i] + momentum * prev_delta_w.data[i])
+        .collect();
+    let new_w = RustArray {
+        data: same_shape_elementwise(&w.data, &new_delta_w_data, |wv, dv| wv - dv),
+        shape: w.shape,
+    };
+    let new_prev_delta_w = RustArray {
+        data: new_delta_w_data,
+        shape: w.shape,
+    };
+
+    let new_delta_b_data: Vec<f64> = (0..b.data.len())
+        .map(|i| scale * grad_b.data[i] + momentum * prev_delta_b.data[i])
+        .collect();
+    let new_b = RustArray {
+        data: same_shape_elementwise(&b.data, &new_delta_b_data, |bv, dv| bv - dv),
+        shape: b.shape,
+    };
+    let new_prev_delta_b = RustArray {
+        data: new_delta_b_data,
+        shape: b.shape,
+    };
+
+    Ok((new_w, new_b, new_prev_delta_w, new_prev_delta_b))
+}
