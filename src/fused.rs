@@ -4,6 +4,7 @@ use pyo3::prelude::*;
 use crate::array::RustArray;
 use crate::linalg::{matmul, outer};
 use crate::ops::same_shape_elementwise;
+use crate::random::draw_bernoulli_mask;
 use crate::ufuncs::{array_softmax, sum_axis0};
 
 /// docs/rust-production-cutover.md's phase 0b: one Rust function per `ArrayLayer` method,
@@ -494,4 +495,164 @@ pub fn layer_softmax_output_delta(a: &RustArray, reference: &RustArray) -> PyRes
         data: same_shape_elementwise(&a.data, &reference.data, |av, rv| av - rv),
         shape: a.shape,
     })
+}
+
+/// `DropoutArrayLayer.forward`: `sigmoid(self.W @ x + self.b)`, with a training-time
+/// inverted-dropout mask drawn internally (`random.rs`'s `draw_bernoulli_mask`) - see
+/// docs/dropout-array-layer.md. Returns `(a, mask, base_activation)`: `DropoutRustArrayLayer`
+/// keeps `mask`/`base_activation` around as this layer's own forward-time snapshots for
+/// `layer_dropout_hidden_delta` below, the same role `_mask`/`_base_activation` play on the
+/// numpy-backed `DropoutArrayLayer`. `x`/`b` both 1D; at `training=false` the mask is all-ones
+/// and `a == base_activation` exactly, no rescale - matching `DropoutNode.forward`'s own
+/// eval-mode no-op.
+#[pyfunction]
+pub fn layer_dropout_forward(
+    w: &RustArray,
+    x: &RustArray,
+    b: &RustArray,
+    drop_probability: f64,
+    training: bool,
+) -> PyResult<(RustArray, RustArray, RustArray)> {
+    let z = matmul(w, x)?;
+    let z = z.combine_with_array(b, |a, bv| a + bv, "add")?;
+    let base = sigmoid(&z);
+    let (a, mask) = dropout_forward_from_base(&base, drop_probability, training);
+    Ok((a, mask, base))
+}
+
+/// `DropoutArrayLayer.forward_batch`: `sigmoid(X @ self.W.T + self.b)`, with one independent
+/// mask entry per (example, unit) pair (`draw_bernoulli_mask`'s flat draw over the whole
+/// `batch_size * size` buffer) - matching `forward`'s own per-example-independent-draw
+/// requirement, not one mask shared across the batch. `X` 2D (`batch, input_size`).
+#[pyfunction]
+pub fn layer_dropout_forward_batch(
+    w: &RustArray,
+    x: &RustArray,
+    b: &RustArray,
+    drop_probability: f64,
+    training: bool,
+) -> PyResult<(RustArray, RustArray, RustArray)> {
+    let w_t = w.transpose();
+    let z = matmul(x, &w_t)?;
+    let z = z.combine_with_array(b, |a, bv| a + bv, "add")?;
+    let base = sigmoid(&z);
+    let (a, mask) = dropout_forward_from_base(&base, drop_probability, training);
+    Ok((a, mask, base))
+}
+
+/// Shared by `layer_dropout_forward`/`layer_dropout_forward_batch` above - both differ only in
+/// how `base` (the pre-mask sigmoid) was computed (single-example matvec vs. batched matmul),
+/// not in how the mask is drawn and applied on top of it.
+fn dropout_forward_from_base(
+    base: &RustArray,
+    drop_probability: f64,
+    training: bool,
+) -> (RustArray, RustArray) {
+    let keep_probability = 1.0 - drop_probability;
+    let size = base.data.len();
+    if training {
+        let mask_data = draw_bernoulli_mask(drop_probability, size);
+        let a_data: Vec<f64> = base
+            .data
+            .iter()
+            .zip(mask_data.iter())
+            .map(|(&bv, &mv)| bv * mv / keep_probability)
+            .collect();
+        (
+            RustArray {
+                data: a_data,
+                shape: base.shape,
+            },
+            RustArray {
+                data: mask_data,
+                shape: base.shape,
+            },
+        )
+    } else {
+        (
+            base.clone(),
+            RustArray {
+                data: vec![1.0; size],
+                shape: base.shape,
+            },
+        )
+    }
+}
+
+/// `DropoutArrayLayer.compute_hidden_delta`: `(next_layer.W.T @ next_layer.delta) *
+/// base_activation*(1-base_activation) * scale`, where `scale = mask/keep_probability` if
+/// `was_training` else `1.0` - see docs/dropout-array-layer.md. `base_activation`/`mask` are the
+/// forward-time snapshots `layer_dropout_forward` returned, not re-derived here; `was_training`
+/// is a forward-time snapshot of `training` too, not a live re-read - mirrors
+/// `DropoutNode.compute_hidden_delta`'s own `_was_training` subtlety (docs/dropout.md's
+/// "design"): the caller's own `training` flag is already back to `false` by the time backward
+/// runs, so the rescale must be decided from what `forward` actually did. Single-example
+/// (`next_delta`/`base_activation`/`mask` all 1D).
+#[pyfunction]
+pub fn layer_dropout_hidden_delta(
+    next_w: &RustArray,
+    next_delta: &RustArray,
+    base_activation: &RustArray,
+    mask: &RustArray,
+    keep_probability: f64,
+    was_training: bool,
+) -> PyResult<RustArray> {
+    let downstream = matmul(&next_w.transpose(), next_delta)?;
+    require_same_shape(&downstream, base_activation, "layer_dropout_hidden_delta")?;
+    Ok(dropout_hidden_delta_from_downstream(
+        &downstream,
+        base_activation,
+        mask,
+        keep_probability,
+        was_training,
+    ))
+}
+
+/// `DropoutArrayLayer.compute_hidden_delta_batch`: batched, no transpose on `next_w` (same
+/// shape-of-call-sites distinction `layer_hidden_delta_batch`/`layer_relu_hidden_delta_batch`
+/// already document).
+#[pyfunction]
+pub fn layer_dropout_hidden_delta_batch(
+    next_w: &RustArray,
+    next_delta_batch: &RustArray,
+    base_activation_batch: &RustArray,
+    mask_batch: &RustArray,
+    keep_probability: f64,
+    was_training: bool,
+) -> PyResult<RustArray> {
+    let downstream = matmul(next_delta_batch, next_w)?;
+    require_same_shape(&downstream, base_activation_batch, "layer_dropout_hidden_delta_batch")?;
+    Ok(dropout_hidden_delta_from_downstream(
+        &downstream,
+        base_activation_batch,
+        mask_batch,
+        keep_probability,
+        was_training,
+    ))
+}
+
+/// Shared by `layer_dropout_hidden_delta`/`layer_dropout_hidden_delta_batch` above - both differ
+/// only in how `downstream` was computed, not in the elementwise formula applied on top of it.
+fn dropout_hidden_delta_from_downstream(
+    downstream: &RustArray,
+    base_activation: &RustArray,
+    mask: &RustArray,
+    keep_probability: f64,
+    was_training: bool,
+) -> RustArray {
+    let data = downstream
+        .data
+        .iter()
+        .zip(base_activation.data.iter())
+        .zip(mask.data.iter())
+        .map(|((&d, &base_value), &mask_value)| {
+            let sigmoid_derivative = base_value * (1.0 - base_value);
+            let scale = if was_training { mask_value / keep_probability } else { 1.0 };
+            d * sigmoid_derivative * scale
+        })
+        .collect();
+    RustArray {
+        data,
+        shape: base_activation.shape,
+    }
 }

@@ -85,3 +85,36 @@ pub fn uniform(low: f64, high: f64, shape: &PyAny) -> PyResult<RustArray> {
         Shape::Matrix(rows, cols) => RustArray::from_matrix(data, rows, cols),
     })
 }
+
+/// Draws `size` independent inverted-dropout keep/drop entries (1.0 kept, 0.0 dropped), each
+/// `>= drop_probability` against a fresh uniform-in-`[0,1)` draw - exactly
+/// `np.random.random(shape) >= drop_probability`'s own comparison
+/// (`DropoutArrayLayer.forward`, see docs/dropout-array-layer.md), just inlined here as a flat
+/// `Vec<f64>` rather than a `RustArray` so `fused.rs`'s `layer_dropout_forward`/
+/// `layer_dropout_forward_batch` can draw a mask internally, in the same Rust call that also
+/// does the matmul/sigmoid, without a second Python/Rust FFI crossing - the same "one Rust call
+/// per layer method" discipline `layer_forward`/`layer_relu_forward` already established. Kept
+/// `pub(crate)` (not a `#[pyfunction]` itself) since `bernoulli_mask` below is the
+/// Python-visible, independently-testable entry point to this same logic.
+pub(crate) fn draw_bernoulli_mask(drop_probability: f64, size: usize) -> Vec<f64> {
+    let mut rng = Xorshift128Plus::new(fresh_seed());
+    (0..size)
+        .map(|_| if rng.next_unit_f64() >= drop_probability { 1.0 } else { 0.0 })
+        .collect()
+}
+
+/// The standalone, Python-visible counterpart to `draw_bernoulli_mask` above - lets the mask
+/// distribution itself be checked directly (statistically, per this module's own doc comment on
+/// why bit-identical parity isn't achievable), before either `DropoutArrayLayer`'s Rust
+/// counterpart or its fused forward ops are ever built on top of it - the same "prove the
+/// primitive against numpy before building the layer" discipline `array_relu`/`array_softmax`
+/// established for their own stages (`ufuncs.rs`).
+#[pyfunction]
+pub fn bernoulli_mask(drop_probability: f64, shape: &PyAny) -> PyResult<RustArray> {
+    let shape = parse_shape(shape)?;
+    let data = draw_bernoulli_mask(drop_probability, shape.size());
+    Ok(match shape {
+        Shape::Vector(_) => RustArray::from_vector(data),
+        Shape::Matrix(rows, cols) => RustArray::from_matrix(data, rows, cols),
+    })
+}
