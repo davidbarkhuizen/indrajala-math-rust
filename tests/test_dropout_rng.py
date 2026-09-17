@@ -1,5 +1,5 @@
 """
-docs/dropout-array-layer.md's Rust-matmul-backed follow-on: bernoulli_mask/draw_bernoulli_mask,
+docs/design-docs/array-siblings/dropout-array-layer.md's Rust-matmul-backed follow-on: bernoulli_mask/draw_bernoulli_mask,
 this crate's first genuinely new RNG primitive since uniform() (random.rs) - a fresh category, not
 a mechanical fused-arithmetic port (see that document's "design"/"risks and open questions").
 Checked directly against numpy's own np.random.random(shape) >= drop_probability formula before

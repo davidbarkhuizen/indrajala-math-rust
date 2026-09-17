@@ -7,7 +7,7 @@ use crate::array::{parse_shape, RustArray, Shape};
 
 /// A hand-rolled xorshift128+ generator - a small, well-known public-domain algorithm,
 /// implemented directly rather than pulled from the `rand` crate, matching this crate's own
-/// "hand-build everything, no convenience dependencies" posture (see docs/rust-array-core.md's
+/// "hand-build everything, no convenience dependencies" posture (see docs/architecture/rust-array-core.md's
 /// own "crate structure").
 ///
 /// See that document's own "PR 7": this is the one operation in the whole interface subset where
@@ -89,7 +89,7 @@ pub fn uniform(low: f64, high: f64, shape: &PyAny) -> PyResult<RustArray> {
 /// Draws `size` independent inverted-dropout keep/drop entries (1.0 kept, 0.0 dropped), each
 /// `>= drop_probability` against a fresh uniform-in-`[0,1)` draw - exactly
 /// `np.random.random(shape) >= drop_probability`'s own comparison
-/// (`DropoutArrayLayer.forward`, see docs/dropout-array-layer.md), just inlined here as a flat
+/// (`DropoutArrayLayer.forward`, see docs/design-docs/array-siblings/dropout-array-layer.md), just inlined here as a flat
 /// `Vec<f64>` rather than a `RustArray` so `fused.rs`'s `layer_dropout_forward`/
 /// `layer_dropout_forward_batch` can draw a mask internally, in the same Rust call that also
 /// does the matmul/sigmoid, without a second Python/Rust FFI crossing - the same "one Rust call

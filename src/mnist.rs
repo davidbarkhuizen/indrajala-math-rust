@@ -8,7 +8,7 @@ use crate::array::RustArray;
 /// fused into one pass rather than built from this core's general reshape/slice/astype
 /// primitives - nothing else in the interface subset needs a `uint8` array type, so there is no
 /// reusable machinery to build this on top of, only this one decode to port directly (see
-/// docs/rust-array-core.md's own "crate structure": "a direct port of what
+/// docs/architecture/rust-array-core.md's own "crate structure": "a direct port of what
 /// load_mnist_dataset_as_array needs"). `data` is a raw byte buffer of `record_size`-byte
 /// records (784 pixel bytes + 1 label byte for real MNIST); returns pixels only, normalized to
 /// `[0.0, 1.0]`, shape `(record_count, record_size - 1)` - labels are dropped here exactly as

@@ -1,5 +1,5 @@
 """
-PR 7's own claim, per docs/rust-array-core.md: decode_mnist_pixels matches
+PR 7's own claim, per docs/architecture/rust-array-core.md: decode_mnist_pixels matches
 load_mnist_dataset_as_array's real output on a real MNIST sample, exact match expected here -
 integer-to-float conversion and division have no RNG-style irreproducibility, unlike uniform().
 """

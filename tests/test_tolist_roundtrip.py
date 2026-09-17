@@ -1,5 +1,5 @@
 """
-PR 8's own claim, per docs/rust-array-core.md: .tolist() and construct-from-list (PR 1's own
+PR 8's own claim, per docs/architecture/rust-array-core.md: .tolist() and construct-from-list (PR 1's own
 Array(...)) round-trip a 1D and a 2D array through list-and-back with bit-identical recovery -
 the pair save()/load() rely on for JSON serialization.
 """

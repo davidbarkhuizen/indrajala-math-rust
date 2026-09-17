@@ -1,8 +1,8 @@
 """
-PR 2's own claim, per docs/rust-array-core.md: .T (a no-op on 1D, a real transpose on 2D) and
+PR 2's own claim, per docs/architecture/rust-array-core.md: .T (a no-op on 1D, a real transpose on 2D) and
 arr[:, :-1]-style contiguous slicing, checked against a hand-constructed array with a known,
 distinctive pattern - the same "is the indexing convention right" discipline
-docs/convolutional-layers.md's own hot-pixel test uses.
+docs/features/convolutional-layers.md's own hot-pixel test uses.
 """
 
 import pytest

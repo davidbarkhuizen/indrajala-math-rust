@@ -1,5 +1,5 @@
 """
-docs/rust-production-cutover.md's phase 0b: one Rust function per `ArrayLayer` method, doing the
+docs/architecture/rust-production-cutover.md's phase 0b: one Rust function per `ArrayLayer` method, doing the
 entire computation in a single call instead of composing it from several separate `Array`
 operator/ufunc calls in Python. Checked two ways per function - against real numpy applying the
 same formula directly, and against `indrajala_ml.model.array_layer.ArrayLayer` itself (the actual

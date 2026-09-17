@@ -1,6 +1,6 @@
 """
-PR 9's own claim, per docs/rust-array-core.md: not new functionality - a single, consolidated
-sweep through every operation in docs/numpy-interface-subset.md's own table, checked against real
+PR 9's own claim, per docs/architecture/rust-array-core.md: not new functionality - a single, consolidated
+sweep through every operation in docs/architecture/numpy-interface-subset.md's own table, checked against real
 numpy (three-way, against a pure-Python reference too, where one exists independent of numpy
 itself) in one auditable file, rather than something someone has to reassemble from PRs 1-8's
 scattered per-stage test files to answer "has the whole subset actually been checked."
@@ -122,7 +122,7 @@ def test_full_subset_sweep_against_numpy(seed):
 
 
 def test_uniform_is_excluded_from_bit_identical_parity_by_design():
-    # the one documented exception - see docs/rust-array-core.md's own "PR 7": statistical
+    # the one documented exception - see docs/architecture/rust-array-core.md's own "PR 7": statistical
     # plausibility only, not per-draw equality against numpy's Mersenne Twister.
     draws = uniform(-1.0, 1.0, 2000)
     values = [draws[i] for i in range(2000)]

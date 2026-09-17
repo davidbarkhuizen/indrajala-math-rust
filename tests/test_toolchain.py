@@ -1,5 +1,5 @@
 """
-PR 0's own claim, per docs/rust-array-core.md: the PyO3/maturin toolchain works end to end - the
+PR 0's own claim, per docs/architecture/rust-array-core.md: the PyO3/maturin toolchain works end to end - the
 extension builds, installs into the active venv, and is importable and callable from Python.
 No array type exists yet, so there's nothing to parity-check against numpy or pure Python here.
 """

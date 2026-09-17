@@ -1,5 +1,5 @@
 """
-PR 6's own claim, per docs/rust-array-core.md: argmax matches numpy's own tie-breaking rule
+PR 6's own claim, per docs/architecture/rust-array-core.md: argmax matches numpy's own tie-breaking rule
 (first occurrence on a tie), checked with a randomized sweep plus an explicit tied-maximum case.
 """
 

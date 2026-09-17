@@ -22,8 +22,8 @@ fn available_parallelism_cached() -> usize {
 /// exercised by the current class design but part of its documented contract), and matrix @
 /// matrix (`X @ self.W.T`, `next_layer.delta_batch @ next_layer.W`,
 /// `self.delta_batch.T @ input_activation_batch`). All three cases are SIMD-accelerated - see
-/// docs/rust-array-core.md's own "status" for the measured results and
-/// docs/research-and-analysis.md for why the matrix@vector case (this codebase's actual
+/// docs/architecture/rust-array-core.md's own "status" for the measured results and
+/// docs/research/research-and-analysis.md for why the matrix@vector case (this codebase's actual
 /// `batch_size=1` production path - `fused.rs::layer_forward`/`layer_hidden_delta` call it on
 /// every `learn()` step) turned out to matter contrary to this comment's own earlier claim that
 /// it didn't (2026-09-16 measurement: ~97% of a fused forward call's cost at the real
@@ -79,11 +79,11 @@ pub(crate) fn matmul(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
 /// at the end - and uses that *same* grouping in both the scalar fallback and the AVX2 path,
 /// which is what actually matters: a training run's result must not depend on which machine
 /// happens to run it. Verified bit-identical between the two paths the same way axpy_row's own
-/// AVX2 addition was (docs/research-and-analysis.md) - exact IEEE-754 bit-pattern comparison,
+/// AVX2 addition was (docs/research/research-and-analysis.md) - exact IEEE-754 bit-pattern comparison,
 /// not just `pytest.approx`. This does change the *value* matmul produces from what a naive
 /// sequential sum gave before this change (last-few-ULPs noise, same category as numpy's own
 /// internal reduction order already not matching Python's sequential sum - see
-/// docs/vectorized-array-classes.md's "summation-order rounding" - not a new risk category, and
+/// docs/architecture/vectorized-array-classes.md's "summation-order rounding" - not a new risk category, and
 /// every parity check against numpy/the pure-Python reference already tolerates it via rtol, not
 /// exact equality).
 #[inline]
@@ -154,7 +154,7 @@ unsafe fn dot_product_avx2_fma(a: &[f64], b: &[f64]) -> f64 {
     dot_product_tail(a, b, i, combine_lanes(lanes))
 }
 
-/// Threaded row-splitting on top of the size-gated blocking below (docs/rust-production-cutover.md's
+/// Threaded row-splitting on top of the size-gated blocking below (docs/architecture/rust-production-cutover.md's
 /// follow-on optimization work, matmul batch>=32 gap). Splits the output's row range across
 /// `std::thread::scope` workers - safe without `'static` data (each worker borrows `a_data`/
 /// `b_data` read-only and writes into its own disjoint slice of `out`, via `split_at_mut`) - only
@@ -222,7 +222,7 @@ fn matmul_2d(a_data: &[f64], b_data: &[f64], out: &mut [f64], r1: usize, c1: usi
 /// time, reading both `a` and `b` row-contiguously.
 ///
 /// Blocked over `row` and `k` when `b` is big enough for it to matter
-/// (docs/rust-production-cutover.md's follow-on optimization work): without blocking, every
+/// (docs/architecture/rust-production-cutover.md's follow-on optimization work): without blocking, every
 /// output row re-streams the *entire* `b` matrix once (`k` ranges over all of `c1`), so if `b`
 /// doesn't fit in cache, `b` gets re-fetched from memory once per output row. Blocking caps how
 /// much of `b` needs to stay resident at once (one `K_BLOCK`-row slab) and reuses it across
@@ -287,7 +287,7 @@ fn matmul_2d_row_range(
 /// `f64::mul_add`/`_mm256_fmadd_pd`, so this call produces the same bits whether or not the
 /// running machine has AVX2, matching the bit-identical invariant this file's
 /// blocking/threading already hold to (2026-09-16, explicit SIMD intrinsics work: see
-/// docs/research-and-analysis.md). A plain `_mm256_mul_pd` + `_mm256_add_pd` pair would vectorize
+/// docs/research/research-and-analysis.md). A plain `_mm256_mul_pd` + `_mm256_add_pd` pair would vectorize
 /// fine but round twice per element like the old `+=` loop did, silently reintroducing a
 /// bit-level divergence between this path and any non-AVX2 fallback - FMA is the only way to keep
 /// both the speed and the invariant.

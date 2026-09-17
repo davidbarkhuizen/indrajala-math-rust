@@ -1,5 +1,5 @@
 """
-PR 7's own claim, per docs/rust-array-core.md: uniform() cannot be checked for bit-identical
+PR 7's own claim, per docs/architecture/rust-array-core.md: uniform() cannot be checked for bit-identical
 parity against numpy's Mersenne Twister (a hand-rolled PRNG never reproduces it) - so this checks
 range bounds, shape, and statistical properties (mean/variance within tolerance across a large N)
 instead, a deliberately weaker bar than every other stage's exact-match test.

@@ -1,5 +1,5 @@
 """
-docs/momentum-array-layer.md's Rust-matmul-backed follow-on: `layer_momentum_apply_accumulated_gradient`,
+docs/design-docs/array-siblings/momentum-array-layer.md's Rust-matmul-backed follow-on: `layer_momentum_apply_accumulated_gradient`,
 one fused Rust call for the whole momentum update rule, checked against
 `indrajala_ml.model.momentum_array_layer.MomentumArrayLayer` - the actual production reference
 this function replaces - the same treatment `test_adam_fused_layer_ops.py`/
