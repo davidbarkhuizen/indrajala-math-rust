@@ -28,7 +28,15 @@ def test_exp_matches_numpy_across_a_random_sweep_including_the_overflow_boundary
     actual = _to_list(exp(Array(z_values)))
 
     for actual_value, expected_value in zip(actual, expected):
-        assert actual_value == pytest.approx(float(expected_value), abs=1e-9)
+        # plain pytest.approx (no abs= override), matching test_exp_preserves_shape_for_2d_arrays
+        # below: a fixed abs=1e-9 tolerance is meaningless once exp(z) reaches large finite
+        # magnitudes (this sweep's own z values run up to the ~709 overflow boundary, giving
+        # outputs as large as ~1e307) - float64 itself can't represent differences anywhere near
+        # that fine at that scale (one ULP is already >>1e-9), so a fixed-abs comparison would
+        # fail on ordinary 1-ULP disagreement between Rust's f64::exp and numpy's own exp, not a
+        # real correctness bug. pytest.approx's default combined rel/abs tolerance scales with
+        # magnitude and still easily catches a genuine algorithmic error.
+        assert actual_value == pytest.approx(float(expected_value))
 
 
 def test_exp_saturates_to_infinity_for_large_negative_z_matching_sigmoids_own_limit():
