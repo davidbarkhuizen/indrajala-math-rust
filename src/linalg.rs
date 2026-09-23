@@ -18,8 +18,8 @@ fn available_parallelism_cached() -> usize {
 }
 
 /// The three matmul shape combinations `ArrayLayer`'s own formulas actually use - matrix @
-/// vector (`self.W @ x`), vector @ matrix (the interface subset's own "1D x 2D" case, not
-/// exercised by the current class design but part of its documented contract), and matrix @
+/// vector (`self.W @ x`), vector @ matrix (`self.W.T @ self.delta`, computed as `delta @ W` by
+/// `fused.rs::layer_downstream` on every single-example backward step), and matrix @
 /// matrix (`X @ self.W.T`, `next_layer.delta_batch @ next_layer.W`,
 /// `self.delta_batch.T @ input_activation_batch`). All three cases are SIMD-accelerated. The
 /// matrix@vector case matters most: it's this codebase's actual `batch_size=1` production path
