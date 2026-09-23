@@ -4,10 +4,11 @@ use pyo3::prelude::*;
 use crate::array::{RustArray, Shape};
 use crate::linalg::matmul;
 
-/// Convolution ops, one Rust call per `ConvArrayLayer` method (indrajala-ml's
-/// `indrajala_ml/model/conv_array_layer.py`), batch-only: the Python layer wraps a single example
-/// as a batch of one. `RustArray` stays 1D/2D, so every tensor crosses the boundary as a matrix
-/// and the 4D views exist only as index arithmetic here:
+/// Convolution and max pooling ops, one Rust call per `ConvArrayLayer`/`MaxPoolArrayLayer` method
+/// (indrajala-ml's `indrajala_ml/model/conv_array_layer.py`/`max_pool_array_layer.py`),
+/// batch-only: the Python layer wraps a single example as a batch of one. `RustArray` stays
+/// 1D/2D, so every tensor crosses the boundary as a matrix and the 4D views exist only as index
+/// arithmetic here:
 ///
 /// - activations and deltas are `(N, C*H*W)`, channel-major (flat index `c*H*W + r*W + col`);
 /// - the kernel matrix `W` is `(channel_count, C*k*k)`, each row in (channel, kernel row, kernel
@@ -15,8 +16,9 @@ use crate::linalg::matmul;
 /// - the cached im2col columns are `(N*P, C*k*k)`, `P = out_height * out_width`, row `n*P + p`
 ///   with `p` in row-major output order, columns in `W`-row order.
 ///
-/// Every reduction goes through `linalg::matmul`, so the summation order is that file's one fixed
-/// grouping - machine-independent, and within `rtol` of numpy rather than bit-identical to it.
+/// Every conv reduction goes through `linalg::matmul`, so the summation order is that file's one
+/// fixed grouping - machine-independent, and within `rtol` of numpy rather than bit-identical to
+/// it. Pooling does no arithmetic beyond the scatter-add, so it matches numpy exactly.
 
 /// The shape arithmetic for one conv or pool layer, built once by the Python layer and passed to
 /// every call. Pooling uses it with `kernel_size = pool_size`.
@@ -281,4 +283,86 @@ pub fn conv_accumulate_gradient_batch(
         .map(|(channel, &gb)| gb + by_channel.data[channel * n * p..(channel + 1) * n * p].iter().sum::<f64>())
         .collect();
     Ok((new_grad_w, RustArray::from_vector(new_grad_b)))
+}
+
+/// `MaxPoolArrayLayer.forward_batch`: each channel pooled independently over `kernel_size`-square
+/// windows. Returns `(A, argmax)`, both `(N, C*out_height*out_width)` channel-major. `argmax`
+/// holds each window's winning slot, numbered row-major `(pr, pc)`, as an `f64`: the values are
+/// small exact integers, and it avoids a separate integer array type. The scan uses strict `>`,
+/// so the first maximal slot wins, as with `np.argmax` and `PoolUnit`.
+#[pyfunction]
+pub fn max_pool_forward_batch(x: &RustArray, geometry: &ConvGeometry) -> PyResult<(RustArray, RustArray)> {
+    let g = geometry;
+    let n = require_matrix(x, None, g.input_size, "max_pool_forward_batch X")?;
+    let k = g.kernel_size;
+    let size = g.input_channels * g.positions;
+
+    let mut a = vec![0.0; n * size];
+    let mut argmax = vec![0.0; n * size];
+    for example in 0..n {
+        let input = &x.data[example * g.input_size..(example + 1) * g.input_size];
+        for c in 0..g.input_channels {
+            for out_row in 0..g.out_height {
+                for out_col in 0..g.out_width {
+                    let mut best_slot = 0;
+                    let mut best_value = input[g.input_index(c, out_row, out_col, 0, 0)];
+                    for slot in 1..k * k {
+                        let value = input[g.input_index(c, out_row, out_col, slot / k, slot % k)];
+                        if value > best_value {
+                            best_value = value;
+                            best_slot = slot;
+                        }
+                    }
+                    let out = example * size + c * g.positions + out_row * g.out_width + out_col;
+                    a[out] = best_value;
+                    argmax[out] = best_slot as f64;
+                }
+            }
+        }
+    }
+    Ok((RustArray::from_matrix(a, n, size), RustArray::from_matrix(argmax, n, size)))
+}
+
+/// `MaxPoolArrayLayer._downstream`: each window's delta goes to its winning input by scatter-add,
+/// so an input that wins several overlapping windows receives all their deltas. The loop runs
+/// slot outside window, so each input accumulates in the same order as numpy's one-slice-add-
+/// per-slot loop; no matmul is involved, so the result is bit-identical to numpy's.
+#[pyfunction]
+pub fn max_pool_downstream_batch(
+    delta_batch: &RustArray,
+    argmax: &RustArray,
+    geometry: &ConvGeometry,
+) -> PyResult<RustArray> {
+    let g = geometry;
+    let k = g.kernel_size;
+    let size = g.input_channels * g.positions;
+    let n = require_matrix(delta_batch, None, size, "max_pool_downstream_batch delta_batch")?;
+    require_matrix(argmax, Some(n), size, "max_pool_downstream_batch argmax")?;
+    let slot_count = (k * k) as f64;
+    let is_slot = |v: f64| v >= 0.0 && v < slot_count && v.fract() == 0.0;
+    if let Some(bad) = argmax.data.iter().find(|&&v| !is_slot(v)) {
+        return Err(PyValueError::new_err(format!(
+            "max_pool_downstream_batch: argmax entries must be slot indices in 0..{}, got {bad}",
+            k * k
+        )));
+    }
+
+    let mut dx = vec![0.0; n * g.input_size];
+    for example in 0..n {
+        let out = &mut dx[example * g.input_size..(example + 1) * g.input_size];
+        for slot in 0..k * k {
+            for c in 0..g.input_channels {
+                for out_row in 0..g.out_height {
+                    for out_col in 0..g.out_width {
+                        let window = example * size + c * g.positions + out_row * g.out_width + out_col;
+                        if argmax.data[window] as usize == slot {
+                            let input = g.input_index(c, out_row, out_col, slot / k, slot % k);
+                            out[input] += delta_batch.data[window];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(RustArray::from_matrix(dx, n, g.input_size))
 }
