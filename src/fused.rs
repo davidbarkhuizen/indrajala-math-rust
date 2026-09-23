@@ -2,7 +2,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::array::{RustArray, Shape};
-use crate::linalg::matmul;
+use crate::linalg::{matmul, matmul_nt};
 use crate::ops::same_shape_elementwise;
 use crate::random::draw_bernoulli_mask;
 use crate::ufuncs::{array_softmax, sum_axis0};
@@ -41,9 +41,12 @@ fn linear_preactivation(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult
 
 /// `X @ self.W.T + self.b`, `X` 2D (`batch, input_size`) - the batched analogue of
 /// `linear_preactivation` above, shared the same way by every `layer_*forward_batch`.
+///
+/// `matmul_nt` reads `W` row by row, so `W.T` is never copied (the copy was 266 of 326 µs at 32
+/// x 5408, batch 1). Each row of `X @ W.T` is the same `dot_product` calls as `W @ x`, so row `i`
+/// here is bit-identical to `linear_preactivation(w, X[i], b)`.
 fn linear_preactivation_batch(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
-    let w_t = w.transpose();
-    let z = matmul(x, &w_t)?;
+    let z = matmul_nt(x, w)?;
     z.combine_with_array(b, |a, bv| a + bv, "add")
 }
 
