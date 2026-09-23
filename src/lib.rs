@@ -16,14 +16,14 @@ use conv::{
 };
 use fused::{
     layer_accumulate_gradient, layer_accumulate_gradient_batch,
-    layer_adam_apply_accumulated_gradient, layer_apply_accumulated_gradient,
-    layer_downstream, layer_downstream_batch, layer_dropout_forward, layer_dropout_forward_batch,
+    layer_adam_apply_accumulated_gradient, layer_apply_accumulated_gradient, layer_downstream,
+    layer_downstream_batch, layer_dropout_forward, layer_dropout_forward_batch,
     layer_dropout_hidden_delta, layer_dropout_hidden_delta_batch, layer_forward,
     layer_forward_batch, layer_hidden_delta, layer_hidden_delta_batch,
     layer_l2_apply_accumulated_gradient, layer_momentum_apply_accumulated_gradient,
     layer_output_delta, layer_relu_forward, layer_relu_forward_batch, layer_relu_hidden_delta,
-    layer_relu_hidden_delta_batch, layer_softmax_forward, layer_softmax_forward_batch,
-    layer_softmax_output_delta,
+    layer_relu_hidden_delta_batch, layer_sgd_step, layer_softmax_forward,
+    layer_softmax_forward_batch, layer_softmax_output_delta,
 };
 use linalg::outer;
 use mnist::decode_mnist_pixels;
@@ -58,6 +58,7 @@ fn indrajala_math_rust(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(layer_accumulate_gradient, m)?)?;
     m.add_function(wrap_pyfunction!(layer_accumulate_gradient_batch, m)?)?;
     m.add_function(wrap_pyfunction!(layer_apply_accumulated_gradient, m)?)?;
+    m.add_function(wrap_pyfunction!(layer_sgd_step, m)?)?;
     m.add_function(wrap_pyfunction!(layer_adam_apply_accumulated_gradient, m)?)?;
     m.add_function(wrap_pyfunction!(layer_l2_apply_accumulated_gradient, m)?)?;
     m.add_function(wrap_pyfunction!(layer_momentum_apply_accumulated_gradient, m)?)?;

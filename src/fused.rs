@@ -252,6 +252,64 @@ pub fn layer_apply_accumulated_gradient(
     Ok((new_w, new_b))
 }
 
+/// One single-example plain-SGD step: `layer_accumulate_gradient` into fresh zero accumulators,
+/// then `layer_apply_accumulated_gradient` with `batch_size=1`, in one pass and one allocation
+/// per parameter. `RustArrayNetworkBase.learn` runs exactly that pair on every layer, and apply
+/// resets the accumulators, so at batch size 1 they are always fresh. Computes `w - lr * (0.0 +
+/// delta[i] * x[j])`: the `0.0 +` is the add into the zero accumulator, kept on purpose. It turns
+/// a `-0.0` product into `+0.0`, which changes the result where `w` is `-0.0`, so dropping it
+/// would break bit-identity with the pair it replaces.
+#[pyfunction]
+pub fn layer_sgd_step(
+    w: &RustArray,
+    b: &RustArray,
+    delta: &RustArray,
+    input_activation: &RustArray,
+    learning_rate: f64,
+) -> PyResult<(RustArray, RustArray)> {
+    let (m, n) = match (delta.shape, input_activation.shape) {
+        (Shape::Vector(m), Shape::Vector(n)) => (m, n),
+        (d_shape, x_shape) => {
+            return Err(PyValueError::new_err(format!(
+                "layer_sgd_step requires 1D delta and input_activation, got shapes {:?} and {:?}",
+                d_shape, x_shape
+            )))
+        }
+    };
+    if w.shape != Shape::Matrix(m, n) || b.shape != Shape::Vector(m) {
+        return Err(PyValueError::new_err(format!(
+            "layer_sgd_step requires W of shape {:?} and b of shape {:?}, got {:?} and {:?}",
+            Shape::Matrix(m, n),
+            Shape::Vector(m),
+            w.shape,
+            b.shape
+        )));
+    }
+    // layer_apply_accumulated_gradient's scale, learning_rate / batch_size, is exactly
+    // learning_rate at batch_size=1
+    let scale = learning_rate;
+    let x = &input_activation.data;
+    let mut w_data = Vec::with_capacity(m * n);
+    for (w_row, &d) in w.data.chunks_exact(n.max(1)).zip(delta.data.iter()) {
+        w_data.extend(
+            w_row
+                .iter()
+                .zip(x.iter())
+                .map(|(&wv, &xj)| wv - scale * (0.0 + d * xj)),
+        );
+    }
+    let b_data = b
+        .data
+        .iter()
+        .zip(delta.data.iter())
+        .map(|(&bv, &d)| bv - scale * (0.0 + d))
+        .collect();
+    Ok((
+        RustArray::from_matrix(w_data, m, n),
+        RustArray::from_vector(b_data),
+    ))
+}
+
 /// `AdamArrayLayer.apply_accumulated_gradient`: the Adam (Kingma & Ba, 2014) update rule, as one
 /// fused call per parameter (`W` or `b`) instead of composing it from several `Array` operators.
 /// Shape-agnostic like `layer_apply_accumulated_gradient`
