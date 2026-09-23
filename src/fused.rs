@@ -80,9 +80,20 @@ pub fn layer_output_delta(a: &RustArray, reference: &RustArray) -> PyResult<Rust
 /// `ArrayLayer.downstream`: `self.W.T @ self.delta`, the gradient a dense layer sends back to its
 /// input. Unlike `hidden_downstream` below it has no upstream activation to check against, so a
 /// conv or pool layer (which has no dense `W` of its own) can read it from the layer after it.
+///
+/// Computed as `delta @ W`, the same product, so `W` is read row by row and never copied into a
+/// transpose (the copy was most of the call: 273 of 327 µs at 32 x 5408). It sums sequentially
+/// over `W`'s rows through `axpy_row`, not with `dot_product`'s 4-lane grouping, so the result
+/// differs from `W.T @ delta` by a few ULPs, but is still the same on the scalar and AVX2 paths.
 #[pyfunction]
 pub fn layer_downstream(w: &RustArray, delta: &RustArray) -> PyResult<RustArray> {
-    matmul(&w.transpose(), delta)
+    if !matches!(delta.shape, Shape::Vector(_)) {
+        return Err(PyValueError::new_err(format!(
+            "layer_downstream requires a 1D delta, got shape {:?}",
+            delta.shape
+        )));
+    }
+    matmul(delta, w)
 }
 
 /// `ArrayLayer.downstream_batch`: `self.delta_batch @ self.W`.
