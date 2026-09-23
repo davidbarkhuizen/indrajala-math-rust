@@ -159,14 +159,37 @@ def test_conv_forward_batch_matches_the_brute_force_definition(shape):
     np.testing.assert_array_equal(_np(cols), expected_cols)
 
 
-@pytest.mark.parametrize("shape", SHAPES)
-@pytest.mark.parametrize("n", [1, BATCH_SIZE])
+# (shape, N) beyond SHAPES x (1, BATCH_SIZE) for the forward's matmul_narrow kernel: output
+# channel counts that hit each of its paths (16-wide blocks, 4-wide blocks, the scalar tail, and
+# mixes), a 28x28 input at N = 128 (over matmul's 4M-flop threading threshold), and fan_in 800 x
+# 48 channels (W.T 300 KB, over matmul's 256 KB blocking threshold)
+FORWARD_EXTRA_CASES = [
+    ((6, 6, 1, 3, 1, 1), 2),
+    ((6, 6, 2, 3, 5, 1), 2),
+    ((6, 6, 2, 3, 16, 1), 2),
+    ((6, 6, 2, 3, 21, 1), 2),
+    ((6, 6, 2, 3, 35, 1), 2),
+    ((28, 28, 1, 3, 8, 1), 1),
+    ((28, 28, 1, 3, 8, 1), 128),
+    ((8, 8, 32, 5, 48, 1), 2),
+    ((13, 13, 8, 3, 32, 1), 32),
+]
+
+
+@pytest.mark.parametrize(
+    "shape, n", [(shape, n) for shape in SHAPES for n in (1, BATCH_SIZE)] + FORWARD_EXTRA_CASES
+)
 def test_conv_forward_batch_is_relu_of_the_matmul_scatter_exactly(shape, n):
-    # A is relu(Z) with the ReLU applied during the scatter, and no Z is kept. Rebuild the old
-    # two-pass result from its parts - the crate's own matmul (Array @) on the returned cols,
-    # the b add, the channel-major scatter, then np.maximum - and require the same bits
-    W, b, X, _delta = _random_case(5, shape)
-    X = X[:n]
+    # A is relu(Z) with the ReLU applied during the scatter, and no Z is kept. Rebuild that from
+    # its parts - the crate's own matmul (Array @) on the returned cols, the b add, the
+    # channel-major scatter, then np.maximum - and require the same bits. The op computes cols @
+    # W.T with matmul_narrow, so this is also its exact check against matmul
+    rng = np.random.default_rng(5)
+    height, width, channels, k, channel_count, _s = shape
+    W = rng.uniform(-1.0, 1.0, size=(channel_count, channels * k * k))
+    b = rng.uniform(-0.5, 0.5, size=channel_count)
+    X = rng.uniform(-1.0, 1.0, size=(n, channels * height * width))
+    X[rng.random(X.shape) < 0.1] = 0.0
     g = _geometry(shape)
     A, cols = conv_forward_batch(Array(W.tolist()), Array(X.tolist()), Array(b.tolist()), g)
 
