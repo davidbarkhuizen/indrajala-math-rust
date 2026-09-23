@@ -16,9 +16,16 @@ jobs:
           python-version: "3.11"
       - name: Cargo check
         run: cargo check --release
-      - name: Install Python deps
-        run: pip install maturin pytest numpy
+      - name: Create venv and install Python deps
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install maturin pytest numpy
       - name: Build extension
-        run: maturin develop --release
+        run: |
+          source .venv/bin/activate
+          maturin develop --release
       - name: Run tests
-        run: pytest tests/
+        run: |
+          source .venv/bin/activate
+          pytest tests/
