@@ -161,15 +161,17 @@ fn deltas_by_channel(delta: &RustArray, n: usize, o: usize, p: usize) -> RustArr
 }
 
 /// `ConvArrayLayer.forward_batch`: im2col, `cols @ W.T` with `matmul`, then a scatter into
-/// channel-major `(N, O*P)` adding `b`. Returns `(Z, A, cols)`: `A = relu(Z)`, and `cols` is kept
-/// by the caller for `conv_accumulate_gradient_batch`, as `ConvArrayLayer._cols` is.
+/// channel-major `(N, O*P)` that adds `b` and applies the ReLU in the same pass. Returns `(A,
+/// cols)`: `cols` is kept by the caller for `conv_accumulate_gradient_batch`, as
+/// `ConvArrayLayer._cols` is. The pre-activation `Z` is never stored: nothing in the backward
+/// pass reads it (`array_relu_mask` masks on `A`).
 #[pyfunction]
 pub fn conv_forward_batch(
     w: &RustArray,
     x: &RustArray,
     b: &RustArray,
     geometry: &ConvGeometry,
-) -> PyResult<(RustArray, RustArray, RustArray)> {
+) -> PyResult<(RustArray, RustArray)> {
     let o = channel_count(w, geometry, "conv_forward_batch")?;
     if b.shape != Shape::Vector(o) {
         return Err(PyValueError::new_err(format!(
@@ -201,21 +203,16 @@ pub fn conv_forward_batch(
     let cols = RustArray::from_matrix(cols, n * p, fan_in);
 
     let by_position = matmul(&cols, &w.transpose())?; // (N*P, O)
-    let mut z = vec![0.0; n * o * p];
+    let mut a = vec![0.0; n * o * p];
     for example in 0..n {
         for position in 0..p {
             let src = &by_position.data[(example * p + position) * o..][..o];
             for channel in 0..o {
-                z[(example * o + channel) * p + position] = src[channel] + b.data[channel];
+                a[(example * o + channel) * p + position] = (src[channel] + b.data[channel]).max(0.0);
             }
         }
     }
-    let a = z.iter().map(|&v| v.max(0.0)).collect();
-    Ok((
-        RustArray::from_matrix(z, n, o * p),
-        RustArray::from_matrix(a, n, o * p),
-        cols,
-    ))
+    Ok((RustArray::from_matrix(a, n, o * p), cols))
 }
 
 /// `ConvArrayLayer._downstream`: `dcols = D @ W` with `matmul`, `D` the deltas regrouped to
