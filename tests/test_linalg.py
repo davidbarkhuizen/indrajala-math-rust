@@ -11,7 +11,14 @@ import struct
 import numpy as np
 import pytest
 
-from indrajala_math_rust import Array, layer_accumulate_gradient, outer, sum_axis0
+from indrajala_math_rust import (
+    Array,
+    layer_accumulate_gradient,
+    layer_apply_accumulated_gradient,
+    layer_sgd_step,
+    outer,
+    sum_axis0,
+)
 
 
 def _to_numpy(arr):
@@ -208,3 +215,51 @@ def test_layer_accumulate_gradient_rejects_mismatched_shapes(delta_shape, x_shap
         layer_accumulate_gradient(
             Array.zeros(delta_shape), Array.zeros(x_shape), Array.zeros(grad_w_shape), Array.zeros(3)
         )
+
+
+def _bits(values):
+    return [struct.pack("<d", v) for v in values]
+
+
+def _sgd_step_inputs(rng, m, n):
+    delta = Array(_vector_with_special_values(rng, m))
+    x = Array(_vector_with_special_values(rng, n))
+    w = Array([_vector_with_special_values(rng, n) for _ in range(m)])
+    b = Array(_vector_with_special_values(rng, m))
+    return w, b, delta, x
+
+
+@pytest.mark.parametrize("seed", range(20))
+@pytest.mark.parametrize("learning_rate", [0.5, 0.1, 1e-3, 3.0])
+def test_layer_sgd_step_is_bit_identical_to_accumulate_into_zeros_then_apply(seed, learning_rate):
+    rng = random.Random(seed)
+    m, n = rng.randint(1, 40), rng.randint(1, 70)
+    w, b, delta, x = _sgd_step_inputs(rng, m, n)
+
+    new_w, new_b = layer_sgd_step(w, b, delta, x, learning_rate)
+
+    grad_w, grad_b = layer_accumulate_gradient(delta, x, Array.zeros((m, n)), Array.zeros(m))
+    expected_w, expected_b = layer_apply_accumulated_gradient(w, b, grad_w, grad_b, learning_rate, 1)
+    assert [_bits(row) for row in new_w.tolist()] == [_bits(row) for row in expected_w.tolist()]
+    assert _bits(new_b.tolist()) == _bits(expected_b.tolist())
+
+
+def test_layer_sgd_step_inputs_reach_the_signed_zero_case():
+    # a -0.0 weight with a -0.0 product stays -0.0 with the 0.0 + (-0.0 - lr * +0.0), but would
+    # become +0.0 without it (-0.0 - lr * -0.0). _vector_with_special_values draws -0.0 often
+    # enough that the bit-identity test above hits this case, so it would catch the 0.0 + being
+    # dropped
+    w, b, delta, x = Array([[-0.0, -0.0]]), Array([-0.0]), Array([-0.0]), Array([1.0, 0.0])
+    new_w, new_b = layer_sgd_step(w, b, delta, x, 0.5)
+    assert _bits(new_w.tolist()[0]) == _bits([-0.0, -0.0])
+    assert _bits(new_b.tolist()) == _bits([-0.0])
+    assert _bits([-0.0 - 0.5 * (-0.0 * 1.0)]) == _bits([0.0])
+
+
+@pytest.mark.parametrize(
+    "w_shape, b_shape, delta_shape, x_shape",
+    [((3, 4), 3, (3, 1), 4), ((3, 4), 3, 3, (4, 1)), ((4, 3), 3, 3, 4), ((3, 4), 4, 3, 4), (12, 3, 3, 4)],
+)
+def test_layer_sgd_step_rejects_mismatched_shapes(w_shape, b_shape, delta_shape, x_shape):
+    with pytest.raises(ValueError):
+        layer_sgd_step(Array.zeros(w_shape), Array.zeros(b_shape), Array.zeros(delta_shape), Array.zeros(x_shape), 0.5)
