@@ -20,8 +20,8 @@ fn available_parallelism_cached() -> usize {
 /// The three matmul shape combinations `ArrayLayer`'s own formulas actually use - matrix @
 /// vector (`self.W @ x`), vector @ matrix (`self.W.T @ self.delta`, computed as `delta @ W` by
 /// `fused.rs::layer_downstream` on every single-example backward step), and matrix @
-/// matrix (`X @ self.W.T`, `next_layer.delta_batch @ next_layer.W`,
-/// `self.delta_batch.T @ input_activation_batch`). All three cases are SIMD-accelerated. The
+/// matrix (`next_layer.delta_batch @ next_layer.W`, `self.delta_batch.T @ input_activation_batch`;
+/// `X @ self.W.T` is `matmul_nt` below). All three cases are SIMD-accelerated. The
 /// matrix@vector case matters most: it's this codebase's actual `batch_size=1` production path
 /// (`fused.rs::layer_forward`/`layer_hidden_delta` call it on every `learn()` step), accounting
 /// for ~97% of a fused forward call's cost at the real `dimension=784, hidden=16` shape - without
@@ -169,6 +169,19 @@ unsafe fn dot_product_avx2_fma(a: &[f64], b: &[f64]) -> f64 {
 /// once behind a `OnceLock` and read only when there's already enough work to justify the
 /// question.
 fn matmul_2d(a_data: &[f64], b_data: &[f64], out: &mut [f64], r1: usize, c1: usize, c2: usize) {
+    for_each_row_range(out, r1, c2, r1 * c1 * c2, |chunk, row_start, row_end| {
+        matmul_2d_row_range(a_data, b_data, chunk, row_start, row_end, c1, c2);
+    });
+}
+
+/// The threading decision `matmul_2d`'s doc comment above describes, shared with `matmul_nt`:
+/// calls `compute(chunk, row_start, row_end)` once on the whole `rows x cols` output, or once per
+/// thread on disjoint row ranges once `total_flops` clears the threshold. Each call owns
+/// complete output rows, so the split can't change any output's value.
+fn for_each_row_range<F>(out: &mut [f64], rows: usize, cols: usize, total_flops: usize, compute: F)
+where
+    F: Fn(&mut [f64], usize, usize) + Sync,
+{
     const THREADING_THRESHOLD_FLOPS: usize = 4_000_000;
     const MAX_THREADS: usize = 8;
     // No rows-per-thread floor is applied here (e.g. requiring >=32 rows/thread): although an
@@ -179,32 +192,61 @@ fn matmul_2d(a_data: &[f64], b_data: &[f64], out: &mut [f64], r1: usize, c1: usi
     // reproducibly across multiple runs - the isolated shape's regression does not generalize to
     // the composite workload it's actually part of.
 
-    let total_flops = r1 * c1 * c2;
     if total_flops < THREADING_THRESHOLD_FLOPS {
-        matmul_2d_row_range(a_data, b_data, out, 0, r1, c1, c2);
+        compute(out, 0, rows);
         return;
     }
 
-    let thread_count = available_parallelism_cached().min(MAX_THREADS).min(r1);
+    let thread_count = available_parallelism_cached().min(MAX_THREADS).min(rows);
     if thread_count <= 1 {
-        matmul_2d_row_range(a_data, b_data, out, 0, r1, c1, c2);
+        compute(out, 0, rows);
         return;
     }
 
-    let rows_per_thread = r1.div_ceil(thread_count);
+    let rows_per_thread = rows.div_ceil(thread_count);
+    let compute = &compute;
     std::thread::scope(|scope| {
         let mut remaining_out = out;
         let mut row_start = 0;
-        while row_start < r1 {
-            let row_end = (row_start + rows_per_thread).min(r1);
-            let (chunk, rest) = remaining_out.split_at_mut((row_end - row_start) * c2);
+        while row_start < rows {
+            let row_end = (row_start + rows_per_thread).min(rows);
+            let (chunk, rest) = remaining_out.split_at_mut((row_end - row_start) * cols);
             remaining_out = rest;
-            scope.spawn(move || {
-                matmul_2d_row_range(a_data, b_data, chunk, row_start, row_end, c1, c2);
-            });
+            scope.spawn(move || compute(chunk, row_start, row_end));
             row_start = row_end;
         }
     });
+}
+
+/// `a @ b.T` for `a` (`M, K`) and `b` (`N, K`), without materializing `b.T`: `out[m, n] =
+/// dot_product(a[m], b[n])`, both rows contiguous. That is exactly the matrix @ vector case's
+/// `matmul(b, a[m])` for each row `m`, so row `m` of the result is bit-identical to it, and a
+/// batched forward agrees exactly with the single-example one. Threaded over `M` rows like
+/// `matmul_2d`.
+pub(crate) fn matmul_nt(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
+    let (Shape::Matrix(m, k), Shape::Matrix(n, b_k)) = (a.shape, b.shape) else {
+        return Err(PyValueError::new_err(format!(
+            "matmul_nt requires two 2D arrays, got shapes {:?} and {:?}",
+            a.shape, b.shape
+        )));
+    };
+    if k != b_k {
+        return Err(PyValueError::new_err(format!(
+            "cannot compute a @ b.T for shapes {:?} and {:?}",
+            a.shape, b.shape
+        )));
+    }
+    let mut out = vec![0.0; m * n];
+    for_each_row_range(&mut out, m, n, m * k * n, |chunk, row_start, row_end| {
+        for row in row_start..row_end {
+            let a_row = &a.data[row * k..(row + 1) * k];
+            let out_row = &mut chunk[(row - row_start) * n..(row - row_start + 1) * n];
+            for (col, out_value) in out_row.iter_mut().enumerate() {
+                *out_value = dot_product(&b.data[col * k..(col + 1) * k], a_row);
+            }
+        }
+    });
+    Ok(RustArray::from_matrix(out, m, n))
 }
 
 /// Computes output rows `[row_start, row_end)` into `out_chunk` (row `row_start` maps to
