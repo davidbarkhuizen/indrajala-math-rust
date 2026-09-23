@@ -176,6 +176,32 @@ def test_conv_forward_batch_is_relu_of_the_matmul_scatter_exactly(shape, n):
 
 
 @pytest.mark.parametrize("shape", SHAPES)
+def test_a_vector_operand_is_one_example_with_the_same_bits(shape):
+    # every op given one example as a 1D vector returns exactly the (1, size) call's result,
+    # flattened, with its per-example outputs as vectors; cols stays (P, C*k*k)
+    W, b, X, delta = _random_case(7, shape)
+    W, b, g = Array(W.tolist()), Array(b.tolist()), _geometry(shape)
+    x, d = X[0].tolist(), delta[0].tolist()
+
+    A_row, cols_row = conv_forward_batch(W, Array([x]), b, g)
+    A_vec, cols_vec = conv_forward_batch(W, Array(x), b, g)
+    assert A_vec.shape == (A_row.shape[1],)
+    assert A_vec.tolist() == A_row.tolist()[0]
+    assert cols_vec.shape == cols_row.shape == (g.positions, g.fan_in)
+    assert cols_vec.tolist() == cols_row.tolist()
+
+    dX_row = conv_downstream_batch(W, Array([d]), g)
+    dX_vec = conv_downstream_batch(W, Array(d), g)
+    assert dX_vec.shape == (g.input_size,)
+    assert dX_vec.tolist() == dX_row.tolist()[0]
+
+    grad_W0, grad_b0 = Array(np.full(W.shape, 0.25).tolist()), Array(np.full(len(b.tolist()), -0.5).tolist())
+    row = conv_accumulate_gradient_batch(Array([d]), cols_row, grad_W0, grad_b0, g)
+    vec = conv_accumulate_gradient_batch(Array(d), cols_vec, grad_W0, grad_b0, g)
+    assert [r.tolist() for r in vec] == [r.tolist() for r in row]
+
+
+@pytest.mark.parametrize("shape", SHAPES)
 def test_conv_downstream_batch_matches_the_brute_force_definition(shape):
     W, _b, _X, delta = _random_case(1, shape)
     dX = conv_downstream_batch(Array(W.tolist()), Array(delta.tolist()), _geometry(shape))
@@ -221,7 +247,11 @@ def test_conv_ops_reject_mismatched_shapes():
     with pytest.raises(ValueError):
         conv_forward_batch(W, X, Array.zeros(3), g)  # b length != channel_count
     with pytest.raises(ValueError):
-        conv_forward_batch(W, Array.zeros(25), b, g)  # a single example is passed as (1, n)
+        conv_forward_batch(W, Array.zeros(24), b, g)  # a single-example vector of the wrong length
+    with pytest.raises(ValueError):
+        conv_downstream_batch(W, Array.zeros(17), g)
+    with pytest.raises(ValueError):
+        conv_accumulate_gradient_batch(Array.zeros(18), Array.zeros((18, 9)), W, b, g)  # one example: P = 9 cols rows
     with pytest.raises(ValueError):
         conv_downstream_batch(W, Array.zeros((3, 17)), g)  # delta columns != channel_count * P
     with pytest.raises(ValueError):

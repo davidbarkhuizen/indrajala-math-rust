@@ -5,12 +5,15 @@ use crate::array::{RustArray, Shape};
 use crate::linalg::matmul;
 
 /// Convolution and max pooling ops, one Rust call per `ConvArrayLayer`/`MaxPoolArrayLayer` method
-/// (indrajala-ml's `indrajala_ml/model/conv_array_layer.py`/`max_pool_array_layer.py`),
-/// batch-only: the Python layer wraps a single example as a batch of one. `RustArray` stays
-/// 1D/2D, so every tensor crosses the boundary as a matrix and the 4D views exist only as index
-/// arithmetic here:
+/// (indrajala-ml's `indrajala_ml/model/conv_array_layer.py`/`max_pool_array_layer.py`). The ops
+/// are batch ops, but each per-example operand may also be a 1D vector, meaning N = 1, and the
+/// per-example outputs then come back as vectors too: the single-example layer methods pass
+/// their arrays straight through, with no `(1, n)` reshape (which copies). A `(1, n)` matrix and
+/// an `n` vector hold the same flat buffer, so the two forms give the same values bit for bit.
+/// `RustArray` stays 1D/2D, and the 4D views exist only as index arithmetic here:
 ///
-/// - activations and deltas are `(N, C*H*W)`, channel-major (flat index `c*H*W + r*W + col`);
+/// - activations and deltas are `(N, C*H*W)` (or one `C*H*W` vector), channel-major (flat index
+///   `c*H*W + r*W + col`);
 /// - the kernel matrix `W` is `(channel_count, C*k*k)`, each row in (channel, kernel row, kernel
 ///   col) order;
 /// - the cached im2col columns are `(N*P, C*k*k)`, `P = out_height * out_width`, row `n*P + p`
@@ -119,6 +122,27 @@ pub(crate) fn require_matrix(arr: &RustArray, rows: Option<usize>, cols: usize, 
     }
 }
 
+/// A per-example operand's example count: `(N, cols)`, or a vector of length `cols` as N = 1. The
+/// flag says it was a vector, so the op returns its per-example outputs in the same rank.
+fn require_batch(arr: &RustArray, cols: usize, context: &str) -> PyResult<(usize, bool)> {
+    match arr.shape {
+        Shape::Vector(len) if len == cols => Ok((1, true)),
+        Shape::Matrix(rows, c) if c == cols => Ok((rows, false)),
+        shape => Err(PyValueError::new_err(format!(
+            "{context}: expected a matrix of shape (N, {cols}) or a vector of length {cols}, got {shape:?}"
+        ))),
+    }
+}
+
+/// Per-example output data, `n` rows of `cols`, in the rank the batch input came in.
+fn batch_output(data: Vec<f64>, n: usize, cols: usize, is_vector: bool) -> RustArray {
+    if is_vector {
+        RustArray::from_vector(data)
+    } else {
+        RustArray::from_matrix(data, n, cols)
+    }
+}
+
 /// `W`'s row count (the output channel count), after checking its columns match the geometry's
 /// kernel fan-in.
 fn channel_count(w: &RustArray, geometry: &ConvGeometry, context: &str) -> PyResult<usize> {
@@ -162,7 +186,7 @@ fn deltas_by_channel(delta: &RustArray, n: usize, o: usize, p: usize) -> RustArr
 
 /// `ConvArrayLayer.forward_batch`: im2col, `cols @ W.T` with `matmul`, then a scatter into
 /// channel-major `(N, O*P)` that adds `b` and applies the ReLU in the same pass. Returns `(A,
-/// cols)`: `cols` is kept by the caller for `conv_accumulate_gradient_batch`, as
+/// cols)`, `A` a vector when `X` is one, `cols` always `(N*P, C*k*k)`: `cols` is kept by the caller for `conv_accumulate_gradient_batch`, as
 /// `ConvArrayLayer._cols` is. The pre-activation `Z` is never stored: nothing in the backward
 /// pass reads it (`array_relu_mask` masks on `A`).
 #[pyfunction]
@@ -179,7 +203,7 @@ pub fn conv_forward_batch(
             b.shape
         )));
     }
-    let n = require_matrix(x, None, geometry.input_size, "conv_forward_batch X")?;
+    let (n, is_vector) = require_batch(x, geometry.input_size, "conv_forward_batch X")?;
     let g = geometry;
     let (p, k, fan_in) = (g.positions, g.kernel_size, g.fan_in);
 
@@ -212,19 +236,19 @@ pub fn conv_forward_batch(
             }
         }
     }
-    Ok((RustArray::from_matrix(a, n, o * p), cols))
+    Ok((batch_output(a, n, o * p, is_vector), cols))
 }
 
 /// `ConvArrayLayer._downstream`: `dcols = D @ W` with `matmul`, `D` the deltas regrouped to
 /// `(N*P, O)`, then col2im as a scatter-add. The loop runs kernel offset `(kr, kc)` outside
 /// output position, so each input accumulates its contributions in the same order as numpy's
-/// one-slice-add-per-offset loop.
+/// one-slice-add-per-offset loop. `dX` is a vector when `delta_batch` is one.
 #[pyfunction]
 pub fn conv_downstream_batch(w: &RustArray, delta_batch: &RustArray, geometry: &ConvGeometry) -> PyResult<RustArray> {
     let o = channel_count(w, geometry, "conv_downstream_batch")?;
     let g = geometry;
     let (p, k, fan_in) = (g.positions, g.kernel_size, g.fan_in);
-    let n = require_matrix(delta_batch, None, o * p, "conv_downstream_batch delta_batch")?;
+    let (n, is_vector) = require_batch(delta_batch, o * p, "conv_downstream_batch delta_batch")?;
 
     let dcols = matmul(&deltas_by_position(delta_batch, n, o, p), w)?; // (N*P, C*k*k)
     let mut dx = vec![0.0; n * g.input_size];
@@ -245,12 +269,13 @@ pub fn conv_downstream_batch(w: &RustArray, delta_batch: &RustArray, geometry: &
             }
         }
     }
-    Ok(RustArray::from_matrix(dx, n, g.input_size))
+    Ok(batch_output(dx, n, g.input_size, is_vector))
 }
 
 /// `ConvArrayLayer._accumulate`: `grad_W += D @ cols` with `matmul`, `D` the deltas regrouped to
 /// `(O, N*P)`, and `grad_b += ` each channel's delta sum over every example and position. Returns
-/// the updated pair for the caller to rebind, as `layer_accumulate_gradient_batch` does.
+/// the updated pair for the caller to rebind, as `layer_accumulate_gradient_batch` does. A vector
+/// `delta_batch` is one example, whose `cols` has `P` rows.
 #[pyfunction]
 pub fn conv_accumulate_gradient_batch(
     delta_batch: &RustArray,
@@ -267,7 +292,7 @@ pub fn conv_accumulate_gradient_batch(
         )));
     }
     let p = geometry.positions;
-    let n = require_matrix(delta_batch, None, o * p, "conv_accumulate_gradient_batch delta_batch")?;
+    let (n, _) = require_batch(delta_batch, o * p, "conv_accumulate_gradient_batch delta_batch")?;
     require_matrix(cols, Some(n * p), geometry.fan_in, "conv_accumulate_gradient_batch cols")?;
 
     let by_channel = deltas_by_channel(delta_batch, n, o, p); // (O, N*P)
@@ -283,14 +308,15 @@ pub fn conv_accumulate_gradient_batch(
 }
 
 /// `MaxPoolArrayLayer.forward_batch`: each channel pooled independently over `kernel_size`-square
-/// windows. Returns `(A, argmax)`, both `(N, C*out_height*out_width)` channel-major. `argmax`
+/// windows. Returns `(A, argmax)`, both `(N, C*out_height*out_width)` channel-major, or both
+/// vectors when `X` is one. `argmax`
 /// holds each window's winning slot, numbered row-major `(pr, pc)`, as an `f64`: the values are
 /// small exact integers, and it avoids a separate integer array type. The scan uses strict `>`,
 /// so the first maximal slot wins, as with `np.argmax` and `PoolUnit`.
 #[pyfunction]
 pub fn max_pool_forward_batch(x: &RustArray, geometry: &ConvGeometry) -> PyResult<(RustArray, RustArray)> {
     let g = geometry;
-    let n = require_matrix(x, None, g.input_size, "max_pool_forward_batch X")?;
+    let (n, is_vector) = require_batch(x, g.input_size, "max_pool_forward_batch X")?;
     let k = g.kernel_size;
     let size = g.input_channels * g.positions;
 
@@ -317,13 +343,14 @@ pub fn max_pool_forward_batch(x: &RustArray, geometry: &ConvGeometry) -> PyResul
             }
         }
     }
-    Ok((RustArray::from_matrix(a, n, size), RustArray::from_matrix(argmax, n, size)))
+    Ok((batch_output(a, n, size, is_vector), batch_output(argmax, n, size, is_vector)))
 }
 
 /// `MaxPoolArrayLayer._downstream`: each window's delta goes to its winning input by scatter-add,
 /// so an input that wins several overlapping windows receives all their deltas. The loop runs
 /// slot outside window, so each input accumulates in the same order as numpy's one-slice-add-
-/// per-slot loop; no matmul is involved, so the result is bit-identical to numpy's.
+/// per-slot loop; no matmul is involved, so the result is bit-identical to numpy's. `delta_batch`
+/// and `argmax` must have the same rank; `dX` has it too.
 #[pyfunction]
 pub fn max_pool_downstream_batch(
     delta_batch: &RustArray,
@@ -333,8 +360,13 @@ pub fn max_pool_downstream_batch(
     let g = geometry;
     let k = g.kernel_size;
     let size = g.input_channels * g.positions;
-    let n = require_matrix(delta_batch, None, size, "max_pool_downstream_batch delta_batch")?;
-    require_matrix(argmax, Some(n), size, "max_pool_downstream_batch argmax")?;
+    let (n, is_vector) = require_batch(delta_batch, size, "max_pool_downstream_batch delta_batch")?;
+    if require_batch(argmax, size, "max_pool_downstream_batch argmax")? != (n, is_vector) {
+        return Err(PyValueError::new_err(format!(
+            "max_pool_downstream_batch: argmax must have delta_batch's shape {:?}, got {:?}",
+            delta_batch.shape, argmax.shape
+        )));
+    }
     let slot_count = (k * k) as f64;
     let is_slot = |v: f64| v >= 0.0 && v < slot_count && v.fract() == 0.0;
     if let Some(bad) = argmax.data.iter().find(|&&v| !is_slot(v)) {
@@ -361,5 +393,5 @@ pub fn max_pool_downstream_batch(
             }
         }
     }
-    Ok(RustArray::from_matrix(dx, n, g.input_size))
+    Ok(batch_output(dx, n, g.input_size, is_vector))
 }
