@@ -77,6 +77,20 @@ pub fn layer_output_delta(a: &RustArray, reference: &RustArray) -> PyResult<Rust
     })
 }
 
+/// `ArrayLayer.downstream`: `self.W.T @ self.delta`, the gradient a dense layer sends back to its
+/// input. Unlike `hidden_downstream` below it has no upstream activation to check against, so a
+/// conv or pool layer (which has no dense `W` of its own) can read it from the layer after it.
+#[pyfunction]
+pub fn layer_downstream(w: &RustArray, delta: &RustArray) -> PyResult<RustArray> {
+    matmul(&w.transpose(), delta)
+}
+
+/// `ArrayLayer.downstream_batch`: `self.delta_batch @ self.W`.
+#[pyfunction]
+pub fn layer_downstream_batch(w: &RustArray, delta_batch: &RustArray) -> PyResult<RustArray> {
+    matmul(delta_batch, w)
+}
+
 /// `next_layer.W.T @ next_layer.delta`, single-example (`next_delta`/`a` both 1D), shape-checked
 /// against `a` - the downstream term shared by every `layer_*hidden_delta` below (plain sigmoid,
 /// ReLU, dropout); each differs only in what elementwise formula it applies on top, not in how
@@ -87,7 +101,7 @@ fn hidden_downstream(
     a: &RustArray,
     context: &str,
 ) -> PyResult<RustArray> {
-    let downstream = matmul(&next_w.transpose(), next_delta)?;
+    let downstream = layer_downstream(next_w, next_delta)?;
     require_same_shape(&downstream, a, context)?;
     Ok(downstream)
 }
@@ -101,7 +115,7 @@ fn hidden_downstream_batch(
     a_batch: &RustArray,
     context: &str,
 ) -> PyResult<RustArray> {
-    let downstream = matmul(next_delta_batch, next_w)?;
+    let downstream = layer_downstream_batch(next_w, next_delta_batch)?;
     require_same_shape(&downstream, a_batch, context)?;
     Ok(downstream)
 }

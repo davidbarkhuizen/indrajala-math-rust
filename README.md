@@ -23,10 +23,10 @@ pytest tests/
 Always build with `--release`; a debug build is much slower. CI (`.github/workflows/ci.yml`) runs
 the same steps, plus `cargo check --release`, on every push and PR to `main`.
 
-`tests/` (~200 tests, under a second) checks each op against numpy and needs nothing from
+`tests/` (~250 tests, under a second) checks each op against numpy and needs nothing from
 indrajala-ml. The tests that check the fused layer ops against indrajala-ml's numpy reference
-classes live in indrajala-ml's own `tests/`, so a change to `src/fused.rs` should also be tested
-there: in an indrajala-ml checkout, point `rust/` at the new commit, then
+classes live in indrajala-ml's own `tests/`, so a change to `src/fused.rs` or `src/conv.rs` should
+also be tested there: in an indrajala-ml checkout, point `rust/` at the new commit, then
 `./cli build-rust && ./cli test`.
 
 ## Layout
@@ -40,8 +40,11 @@ there: in an indrajala-ml checkout, point `rust/` at the new commit, then
 | `src/ufuncs.rs` | `exp`, `sum_axis0`, `argmax`, `array_relu`, `array_relu_mask`, `array_softmax` |
 | `src/random.rs` | `uniform`, `bernoulli_mask`: unseeded hand-rolled xorshift128+, so not reproducible against numpy |
 | `src/mnist.rs` | `decode_mnist_pixels`: raw MNIST records to normalised pixels |
-| `src/fused.rs` | `layer_*`: one call per `ArrayLayer` method (forward, deltas, gradient accumulate/apply), single-example and `_batch` |
+| `src/fused.rs` | `layer_*`: one call per `ArrayLayer` method (forward, deltas, downstream, gradient accumulate/apply), single-example and `_batch` |
+| `src/conv.rs` | `ConvGeometry`; `conv_*_batch`: one call per `ConvArrayLayer` method (forward, downstream, gradient accumulate), batch-only |
 
 Each `layer_*` function in `src/fused.rs` mirrors a method of indrajala-ml's
 `indrajala_ml/model/array_layer.py` or one of its ReLU/softmax/dropout/Adam/L2/momentum variants,
-and must stay numerically identical to it.
+and must stay numerically identical to it. Likewise each `conv_*` function in `src/conv.rs` mirrors
+a method of `indrajala_ml/model/conv_array_layer.py`. Conv tensors cross the boundary as matrices
+(`Array` stays 1D/2D); `src/conv.rs`'s module comment gives the layouts.
