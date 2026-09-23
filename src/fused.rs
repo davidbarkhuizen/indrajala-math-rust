@@ -1,8 +1,8 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-use crate::array::RustArray;
-use crate::linalg::{matmul, outer};
+use crate::array::{RustArray, Shape};
+use crate::linalg::matmul;
 use crate::ops::same_shape_elementwise;
 use crate::random::draw_bernoulli_mask;
 use crate::ufuncs::{array_softmax, sum_axis0};
@@ -174,8 +174,32 @@ pub fn layer_accumulate_gradient(
     grad_w: &RustArray,
     grad_b: &RustArray,
 ) -> PyResult<(RustArray, RustArray)> {
-    let outer_product = outer(delta, input_activation)?;
-    let new_grad_w = grad_w.combine_with_array(&outer_product, |g, o| g + o, "add")?;
+    let (m, n) = match (delta.shape, input_activation.shape) {
+        (Shape::Vector(m), Shape::Vector(n)) => (m, n),
+        (d_shape, x_shape) => {
+            return Err(PyValueError::new_err(format!(
+                "layer_accumulate_gradient requires 1D delta and input_activation, got shapes {:?} and {:?}",
+                d_shape, x_shape
+            )))
+        }
+    };
+    if grad_w.shape != Shape::Matrix(m, n) {
+        return Err(PyValueError::new_err(format!(
+            "layer_accumulate_gradient requires grad_w of shape {:?}, got {:?}",
+            Shape::Matrix(m, n),
+            grad_w.shape
+        )));
+    }
+    // One pass and one allocation, instead of building outer(delta, x) and then adding it. A
+    // plain multiply then add, not mul_add: two roundings, the same as the product and the sum
+    // done separately, so the result is bit-identical to grad_w + outer(delta, x). LLVM
+    // vectorizes the inner loop as separate multiplies and adds, which keeps both roundings.
+    let x = &input_activation.data;
+    let mut data = Vec::with_capacity(m * n);
+    for (grad_w_row, &d) in grad_w.data.chunks_exact(n.max(1)).zip(delta.data.iter()) {
+        data.extend(grad_w_row.iter().zip(x.iter()).map(|(&g, &xj)| g + d * xj));
+    }
+    let new_grad_w = RustArray::from_matrix(data, m, n);
     let new_grad_b = grad_b.combine_with_array(delta, |g, d| g + d, "add")?;
     Ok((new_grad_w, new_grad_b))
 }

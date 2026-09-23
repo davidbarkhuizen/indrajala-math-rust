@@ -6,11 +6,12 @@ strictly stronger check than a two-way Rust-vs-numpy comparison alone.
 """
 
 import random
+import struct
 
 import numpy as np
 import pytest
 
-from indrajala_math_rust import Array, outer, sum_axis0
+from indrajala_math_rust import Array, layer_accumulate_gradient, outer, sum_axis0
 
 
 def _to_numpy(arr):
@@ -159,3 +160,51 @@ def test_accumulate_gradient_formula_matches_numpy():
     expected = np.outer(np.array(delta_data), np.array(input_activation_data))
 
     assert _to_numpy(grad_w) == pytest.approx(expected)
+
+
+_SPECIAL_VALUES = [0.0, -0.0, 5e-324, -5e-324, 2.2250738585072014e-308 / 3, 1e300, -1e-300]
+
+
+def _vector_with_special_values(rng, n):
+    return [rng.choice(_SPECIAL_VALUES) if rng.random() < 0.3 else rng.uniform(-3.0, 3.0) for _ in range(n)]
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_layer_accumulate_gradient_is_bit_identical_to_grad_w_plus_outer(seed):
+    # the one-pass op against the two-pass composition it replaced, compared exactly (not
+    # approx): same bits, including signed zeros and subnormals, in delta, x and grad_w
+    rng = random.Random(seed)
+    m, n = rng.randint(1, 40), rng.randint(1, 70)
+    delta = Array(_vector_with_special_values(rng, m))
+    x = Array(_vector_with_special_values(rng, n))
+    grad_w = Array([_vector_with_special_values(rng, n) for _ in range(m)])
+    grad_b = Array(_vector_with_special_values(rng, m))
+
+    new_grad_w, new_grad_b = layer_accumulate_gradient(delta, x, grad_w, grad_b)
+
+    expected_w = (grad_w + outer(delta, x)).tolist()
+    assert [[struct.pack("<d", v) for v in row] for row in new_grad_w.tolist()] == [
+        [struct.pack("<d", v) for v in row] for row in expected_w
+    ]
+    assert [struct.pack("<d", v) for v in new_grad_b.tolist()] == [
+        struct.pack("<d", v) for v in (grad_b + delta).tolist()
+    ]
+
+
+def test_layer_accumulate_gradient_matches_numpy():
+    rng = random.Random(7)
+    delta, x = _random_vector(rng, 32), _random_vector(rng, 5408)
+    grad_w = _random_matrix(rng, 32, 5408)
+    new_grad_w, _ = layer_accumulate_gradient(Array(delta), Array(x), Array(grad_w), Array.zeros(32))
+    assert np.array_equal(np.array(new_grad_w.tolist()), np.array(grad_w) + np.outer(delta, x))
+
+
+@pytest.mark.parametrize(
+    "delta_shape, x_shape, grad_w_shape",
+    [((3, 1), 4, (3, 4)), (3, (4, 1), (3, 4)), (3, 4, (4, 3)), (3, 4, 4), (3, 4, 12)],
+)
+def test_layer_accumulate_gradient_rejects_mismatched_shapes(delta_shape, x_shape, grad_w_shape):
+    with pytest.raises(ValueError):
+        layer_accumulate_gradient(
+            Array.zeros(delta_shape), Array.zeros(x_shape), Array.zeros(grad_w_shape), Array.zeros(3)
+        )
