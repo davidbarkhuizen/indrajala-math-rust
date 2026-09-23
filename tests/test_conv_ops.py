@@ -140,11 +140,10 @@ def test_geometry_is_frozen():
 @pytest.mark.parametrize("shape", SHAPES)
 def test_conv_forward_batch_matches_the_brute_force_definition(shape):
     W, b, X, _delta = _random_case(0, shape)
-    Z, A, cols = conv_forward_batch(Array(W.tolist()), Array(X.tolist()), Array(b.tolist()), _geometry(shape))
+    A, cols = conv_forward_batch(Array(W.tolist()), Array(X.tolist()), Array(b.tolist()), _geometry(shape))
 
-    expected_Z = _reference_forward(W, X, b, shape)
-    np.testing.assert_allclose(_np(Z), expected_Z, rtol=1e-12, atol=1e-14)
-    np.testing.assert_array_equal(_np(A), np.maximum(0.0, _np(Z)))
+    expected_A = np.maximum(0.0, _reference_forward(W, X, b, shape))
+    np.testing.assert_allclose(_np(A), expected_A, rtol=1e-12, atol=1e-14)
 
     # cols: row n*P + p in row-major output order, columns in W-row order - a pure copy of the
     # inputs each receptive field reads, so exactly equal
@@ -158,6 +157,22 @@ def test_conv_forward_batch_matches_the_brute_force_definition(shape):
                 n, c, in_row, in_col
             ]
     np.testing.assert_array_equal(_np(cols), expected_cols)
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize("n", [1, BATCH_SIZE])
+def test_conv_forward_batch_is_relu_of_the_matmul_scatter_exactly(shape, n):
+    # A is relu(Z) with the ReLU applied during the scatter, and no Z is kept. Rebuild the old
+    # two-pass result from its parts - the crate's own matmul (Array @) on the returned cols,
+    # the b add, the channel-major scatter, then np.maximum - and require the same bits
+    W, b, X, _delta = _random_case(5, shape)
+    X = X[:n]
+    g = _geometry(shape)
+    A, cols = conv_forward_batch(Array(W.tolist()), Array(X.tolist()), Array(b.tolist()), g)
+
+    by_position = _np(cols @ Array(W.T.tolist()))  # (N*P, O), the same matmul call
+    Z = (by_position + b).reshape(n, g.positions, len(b)).transpose(0, 2, 1).reshape(n, -1)
+    assert _np(A).tolist() == np.maximum(0.0, Z).tolist()
 
 
 @pytest.mark.parametrize("shape", SHAPES)
@@ -182,7 +197,7 @@ def test_conv_downstream_batch_gives_unread_inputs_exactly_zero_gradient():
 def test_conv_accumulate_gradient_batch_matches_the_brute_force_definition(shape):
     W, b, X, delta = _random_case(3, shape)
     g = _geometry(shape)
-    _Z, _A, cols = conv_forward_batch(Array(W.tolist()), Array(X.tolist()), Array(b.tolist()), g)
+    _A, cols = conv_forward_batch(Array(W.tolist()), Array(X.tolist()), Array(b.tolist()), g)
 
     rng = np.random.default_rng(4)
     grad_W0 = rng.uniform(-1.0, 1.0, size=W.shape)
