@@ -249,6 +249,104 @@ pub(crate) fn matmul_nt(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
     Ok(RustArray::from_matrix(out, m, n))
 }
 
+/// `a @ b` for `a` (`M, K`) and a narrow `b` (`K, N`, `N` a few dozen at most), bit-identical to
+/// `matmul`'s matrix @ matrix case: every output is the same FMA chain, `k` increasing from 0.0,
+/// with `a[m, k]` as the multiplier, as `axpy_row` computes it. `matmul_2d_row_range` loads and
+/// stores the whole output row once per `k`, which dominates when the row is only a few
+/// `f64`s wide (conv forward's `cols @ W.T`, `N` = the output channel count, measured 2-3x
+/// slower). This keeps each output row's running sums in registers across all of `k` and stores
+/// them once. Threaded over `M` rows like `matmul_2d`, which doesn't change any output's value.
+pub(crate) fn matmul_narrow(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
+    let (Shape::Matrix(m, k), Shape::Matrix(b_k, n)) = (a.shape, b.shape) else {
+        return Err(shape_error(a.shape, b.shape));
+    };
+    if k != b_k {
+        return Err(shape_error(a.shape, b.shape));
+    }
+    let mut out = vec![0.0; m * n];
+    for_each_row_range(&mut out, m, n, m * k * n, |chunk, row_start, row_end| {
+        narrow_row_range(&a.data, &b.data, chunk, row_start, row_end, k, n);
+    });
+    Ok(RustArray::from_matrix(out, m, n))
+}
+
+fn narrow_row_range(a_data: &[f64], b_data: &[f64], out_chunk: &mut [f64], row_start: usize, row_end: usize, k: usize, n: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            unsafe { narrow_row_range_avx2_fma(a_data, b_data, out_chunk, row_start, row_end, k, n) };
+            return;
+        }
+    }
+    narrow_row_range_scalar(a_data, b_data, out_chunk, row_start, row_end, k, n);
+}
+
+fn narrow_row_range_scalar(a_data: &[f64], b_data: &[f64], out_chunk: &mut [f64], row_start: usize, row_end: usize, k: usize, n: usize) {
+    for row in row_start..row_end {
+        let a_row = &a_data[row * k..(row + 1) * k];
+        let out_row = &mut out_chunk[(row - row_start) * n..(row - row_start + 1) * n];
+        for (col, out_value) in out_row.iter_mut().enumerate() {
+            let mut sum = 0.0f64;
+            for (kk, &a_value) in a_row.iter().enumerate() {
+                sum = a_value.mul_add(b_data[kk * n + col], sum);
+            }
+            *out_value = sum;
+        }
+    }
+}
+
+/// AVX2+FMA path: output columns in blocks of 16 (four 4-lane accumulators), then 4, then a
+/// scalar tail, each block running all of `k` before it is stored. Lane `j`'s accumulator is
+/// exactly `narrow_row_range_scalar`'s `sum` for that column. Safety: only called after
+/// `narrow_row_range`'s runtime feature check; every pointer offset stays inside `a_row`, `b`'s
+/// `k x n` data, or `out_row`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn narrow_row_range_avx2_fma(a_data: &[f64], b_data: &[f64], out_chunk: &mut [f64], row_start: usize, row_end: usize, k: usize, n: usize) {
+    use std::arch::x86_64::{_mm256_fmadd_pd, _mm256_loadu_pd, _mm256_set1_pd, _mm256_setzero_pd, _mm256_storeu_pd};
+
+    let b_ptr = b_data.as_ptr();
+    for row in row_start..row_end {
+        let a_row = &a_data[row * k..(row + 1) * k];
+        let out_row = &mut out_chunk[(row - row_start) * n..(row - row_start + 1) * n];
+        let out_ptr = out_row.as_mut_ptr();
+        let mut col = 0;
+        while col + 16 <= n {
+            let (mut acc0, mut acc1, mut acc2, mut acc3) =
+                (_mm256_setzero_pd(), _mm256_setzero_pd(), _mm256_setzero_pd(), _mm256_setzero_pd());
+            for (kk, &a_value) in a_row.iter().enumerate() {
+                let a_vec = _mm256_set1_pd(a_value);
+                let b_row = b_ptr.add(kk * n + col);
+                acc0 = _mm256_fmadd_pd(a_vec, _mm256_loadu_pd(b_row), acc0);
+                acc1 = _mm256_fmadd_pd(a_vec, _mm256_loadu_pd(b_row.add(4)), acc1);
+                acc2 = _mm256_fmadd_pd(a_vec, _mm256_loadu_pd(b_row.add(8)), acc2);
+                acc3 = _mm256_fmadd_pd(a_vec, _mm256_loadu_pd(b_row.add(12)), acc3);
+            }
+            _mm256_storeu_pd(out_ptr.add(col), acc0);
+            _mm256_storeu_pd(out_ptr.add(col + 4), acc1);
+            _mm256_storeu_pd(out_ptr.add(col + 8), acc2);
+            _mm256_storeu_pd(out_ptr.add(col + 12), acc3);
+            col += 16;
+        }
+        while col + 4 <= n {
+            let mut acc = _mm256_setzero_pd();
+            for (kk, &a_value) in a_row.iter().enumerate() {
+                acc = _mm256_fmadd_pd(_mm256_set1_pd(a_value), _mm256_loadu_pd(b_ptr.add(kk * n + col)), acc);
+            }
+            _mm256_storeu_pd(out_ptr.add(col), acc);
+            col += 4;
+        }
+        while col < n {
+            let mut sum = 0.0f64;
+            for (kk, &a_value) in a_row.iter().enumerate() {
+                sum = a_value.mul_add(*b_ptr.add(kk * n + col), sum);
+            }
+            *out_ptr.add(col) = sum;
+            col += 1;
+        }
+    }
+}
+
 /// Computes output rows `[row_start, row_end)` into `out_chunk` (row `row_start` maps to
 /// `out_chunk[0..c2]`) - the single-threaded and per-thread code path share this, so blocking's
 /// own size-gating logic (below) is written once, not duplicated between them.

@@ -2,7 +2,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::array::{RustArray, Shape};
-use crate::linalg::matmul;
+use crate::linalg::{matmul, matmul_narrow};
 
 /// Convolution and max pooling ops, one Rust call per `ConvArrayLayer`/`MaxPoolArrayLayer` method
 /// (indrajala-ml's `indrajala_ml/model/conv_array_layer.py`/`max_pool_array_layer.py`). The ops
@@ -19,8 +19,8 @@ use crate::linalg::matmul;
 /// - the cached im2col columns are `(N*P, C*k*k)`, `P = out_height * out_width`, row `n*P + p`
 ///   with `p` in row-major output order, columns in `W`-row order.
 ///
-/// Every conv reduction goes through `linalg::matmul`, so the summation order is that file's one
-/// fixed grouping - machine-independent, and within `rtol` of numpy rather than bit-identical to
+/// Every conv reduction goes through `linalg::matmul` (or `matmul_narrow`, which gives the same
+/// bits), so the summation order is that file's one fixed grouping - machine-independent, and within `rtol` of numpy rather than bit-identical to
 /// it. Pooling does no arithmetic beyond the scatter-add, so it matches numpy exactly.
 
 /// The shape arithmetic for one conv or pool layer, built once by the Python layer and passed to
@@ -184,7 +184,8 @@ fn deltas_by_channel(delta: &RustArray, n: usize, o: usize, p: usize) -> RustArr
     RustArray::from_matrix(out, o, n * p)
 }
 
-/// `ConvArrayLayer.forward_batch`: im2col, `cols @ W.T` with `matmul`, then a scatter into
+/// `ConvArrayLayer.forward_batch`: im2col, `cols @ W.T` with `matmul_narrow` (the same bits as
+/// `matmul`, faster for `O`-wide output rows), then a scatter into
 /// channel-major `(N, O*P)` that adds `b` and applies the ReLU in the same pass. Returns `(A,
 /// cols)`, `A` a vector when `X` is one, `cols` always `(N*P, C*k*k)`: `cols` is kept by the caller for `conv_accumulate_gradient_batch`, as
 /// `ConvArrayLayer._cols` is. The pre-activation `Z` is never stored: nothing in the backward
@@ -226,7 +227,7 @@ pub fn conv_forward_batch(
     }
     let cols = RustArray::from_matrix(cols, n * p, fan_in);
 
-    let by_position = matmul(&cols, &w.transpose())?; // (N*P, O)
+    let by_position = matmul_narrow(&cols, &w.transpose())?; // (N*P, O)
     let mut a = vec![0.0; n * o * p];
     for example in 0..n {
         for position in 0..p {
