@@ -80,6 +80,25 @@ def test_max_pool_ops_match_the_brute_force_definition(shape, tie_heavy):
     np.testing.assert_allclose(_np(dX), expected_dX, rtol=0, atol=1e-15)
 
 
+@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize("tie_heavy", [False, True])
+def test_a_vector_operand_is_one_example_with_the_same_bits(shape, tie_heavy):
+    rng = np.random.default_rng(3)
+    x, g = _inputs(rng, shape, tie_heavy)[0].tolist(), _geometry(shape)
+
+    A_row, argmax_row = max_pool_forward_batch(Array([x]), g)
+    d = rng.uniform(-1.0, 1.0, size=A_row.shape[1]).tolist()
+    A_vec, argmax_vec = max_pool_forward_batch(Array(x), g)
+    assert A_vec.shape == argmax_vec.shape == (A_row.shape[1],)
+    assert A_vec.tolist() == A_row.tolist()[0]
+    assert argmax_vec.tolist() == argmax_row.tolist()[0]
+
+    dX_row = max_pool_downstream_batch(Array([d]), argmax_row, g)
+    dX_vec = max_pool_downstream_batch(Array(d), argmax_vec, g)
+    assert dX_vec.shape == (g.input_size,)
+    assert dX_vec.tolist() == dX_row.tolist()[0]
+
+
 def test_ties_resolve_to_the_first_slot():
     g = ConvGeometry(2, 4, 1, 2, 2)  # two 2x2 windows side by side
     # left window all zero; right window a partial tie between slots 1 and 2 (row-major)
@@ -108,7 +127,13 @@ def test_max_pool_ops_reject_mismatched_shapes_and_bad_argmax():
     with pytest.raises(ValueError):
         max_pool_forward_batch(Array.zeros((2, 15)), g)
     with pytest.raises(ValueError):
-        max_pool_forward_batch(Array.zeros(16), g)
+        max_pool_forward_batch(Array.zeros(15), g)  # a single-example vector of the wrong length
+    with pytest.raises(ValueError):
+        max_pool_downstream_batch(Array.zeros(5), Array.zeros(5), g)
+    with pytest.raises(ValueError):
+        max_pool_downstream_batch(Array.zeros(4), Array.zeros((1, 4)), g)  # mixed ranks
+    with pytest.raises(ValueError):
+        max_pool_downstream_batch(Array.zeros((1, 4)), Array.zeros(4), g)
     with pytest.raises(ValueError):
         max_pool_downstream_batch(Array.zeros((2, 5)), Array.zeros((2, 5)), g)
     with pytest.raises(ValueError):
