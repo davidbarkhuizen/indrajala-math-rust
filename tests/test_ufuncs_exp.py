@@ -10,7 +10,7 @@ import random
 import numpy as np
 import pytest
 
-from indrajala_ml_array import Array, exp
+from indrajala_math_rust import Array, exp
 
 
 def _to_list(arr):

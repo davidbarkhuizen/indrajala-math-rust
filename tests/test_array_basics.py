@@ -5,7 +5,7 @@ The Python<->Rust round-trip works for construction, shape, single-element read/
 
 import pytest
 
-from indrajala_ml_array import Array
+from indrajala_math_rust import Array
 
 
 def test_construct_1d_from_flat_list_and_read_back():

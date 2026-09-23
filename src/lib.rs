@@ -32,7 +32,7 @@ fn ping() -> PyResult<String> {
 }
 
 #[pymodule]
-fn indrajala_ml_array(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+fn indrajala_math_rust(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ping, m)?)?;
     m.add_function(wrap_pyfunction!(exp, m)?)?;
     m.add_function(wrap_pyfunction!(outer, m)?)?;

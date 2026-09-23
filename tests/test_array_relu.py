@@ -9,7 +9,7 @@ import random
 import numpy as np
 import pytest
 
-from indrajala_ml_array import Array, array_relu, array_relu_mask
+from indrajala_math_rust import Array, array_relu, array_relu_mask
 
 
 def _to_flat_list(arr):

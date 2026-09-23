@@ -8,7 +8,7 @@ import random
 import numpy as np
 import pytest
 
-from indrajala_ml_array import Array, argmax
+from indrajala_math_rust import Array, argmax
 
 
 @pytest.mark.parametrize("seed", range(20))

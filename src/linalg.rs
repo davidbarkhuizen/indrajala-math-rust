@@ -345,7 +345,7 @@ impl RustArray {
 }
 
 /// The full pairwise-product matrix of two 1D vectors - `accumulate_gradient`'s own
-/// `np.outer(delta, input_layer.a)`. Exposed as a free function (`indrajala_ml_array.outer(a, b)`),
+/// `np.outer(delta, input_layer.a)`. Exposed as a free function (`indrajala_math_rust.outer(a, b)`),
 /// matching `np.outer`'s own call style rather than an operator.
 #[pyfunction]
 pub fn outer(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {

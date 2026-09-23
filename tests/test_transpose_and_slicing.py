@@ -6,7 +6,7 @@ convention right" discipline the convolutional layer's own hot-pixel test uses.
 
 import pytest
 
-from indrajala_ml_array import Array
+from indrajala_math_rust import Array
 
 
 def test_transpose_of_1d_is_a_no_op():
