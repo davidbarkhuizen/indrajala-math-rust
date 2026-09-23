@@ -145,7 +145,7 @@ fn batch_output(data: Vec<f64>, n: usize, cols: usize, is_vector: bool) -> RustA
 
 /// `W`'s row count (the output channel count), after checking its columns match the geometry's
 /// kernel fan-in.
-fn channel_count(w: &RustArray, geometry: &ConvGeometry, context: &str) -> PyResult<usize> {
+pub(crate) fn channel_count(w: &RustArray, geometry: &ConvGeometry, context: &str) -> PyResult<usize> {
     match w.shape {
         Shape::Matrix(rows, cols) if cols == geometry.fan_in => Ok(rows),
         shape => Err(PyValueError::new_err(format!(
@@ -157,7 +157,7 @@ fn channel_count(w: &RustArray, geometry: &ConvGeometry, context: &str) -> PyRes
 
 /// `(N, O*P)` channel-major deltas to `(N*P, O)` - one row per output position, the layout
 /// `cols @ W.T` produced them in.
-fn deltas_by_position(delta: &RustArray, n: usize, o: usize, p: usize) -> RustArray {
+pub(crate) fn deltas_by_position(delta: &RustArray, n: usize, o: usize, p: usize) -> RustArray {
     let mut out = vec![0.0; n * p * o];
     for example in 0..n {
         for channel in 0..o {

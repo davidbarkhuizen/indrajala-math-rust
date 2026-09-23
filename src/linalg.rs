@@ -178,7 +178,7 @@ fn matmul_2d(a_data: &[f64], b_data: &[f64], out: &mut [f64], r1: usize, c1: usi
 /// calls `compute(chunk, row_start, row_end)` once on the whole `rows x cols` output, or once per
 /// thread on disjoint row ranges once `total_flops` clears the threshold. Each call owns
 /// complete output rows, so the split can't change any output's value.
-fn for_each_row_range<F>(out: &mut [f64], rows: usize, cols: usize, total_flops: usize, compute: F)
+pub(crate) fn for_each_row_range<F>(out: &mut [f64], rows: usize, cols: usize, total_flops: usize, compute: F)
 where
     F: Fn(&mut [f64], usize, usize) + Sync,
 {

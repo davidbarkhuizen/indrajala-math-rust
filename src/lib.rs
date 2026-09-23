@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 
 mod array;
 mod conv;
+mod conv_proto;
 mod fused;
 mod linalg;
 mod mnist;
@@ -76,6 +77,11 @@ fn indrajala_math_rust(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(layer_downstream, m)?)?;
     m.add_function(wrap_pyfunction!(layer_downstream_batch, m)?)?;
     m.add_function(wrap_pyfunction!(conv_forward_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(conv_proto::proto_conv_forward_c1, m)?)?;
+    m.add_function(wrap_pyfunction!(conv_proto::proto_conv_forward_c2, m)?)?;
+    m.add_function(wrap_pyfunction!(conv_proto::proto_conv_forward_c2_direct, m)?)?;
+    m.add_function(wrap_pyfunction!(conv_proto::proto_conv_accumulate_c1_copy, m)?)?;
+    m.add_function(wrap_pyfunction!(conv_proto::proto_conv_accumulate_c1_tn, m)?)?;
     m.add_function(wrap_pyfunction!(conv_downstream_batch, m)?)?;
     m.add_function(wrap_pyfunction!(conv_accumulate_gradient_batch, m)?)?;
     m.add_function(wrap_pyfunction!(max_pool_forward_batch, m)?)?;
