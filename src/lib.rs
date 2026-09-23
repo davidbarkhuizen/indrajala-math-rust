@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 mod array;
+mod conv;
 mod fused;
 mod linalg;
 mod mnist;
@@ -9,15 +10,19 @@ mod random;
 mod ufuncs;
 
 use array::RustArray;
+use conv::{
+    conv_accumulate_gradient_batch, conv_downstream_batch, conv_forward_batch, ConvGeometry,
+};
 use fused::{
     layer_accumulate_gradient, layer_accumulate_gradient_batch,
     layer_adam_apply_accumulated_gradient, layer_apply_accumulated_gradient,
-    layer_dropout_forward, layer_dropout_forward_batch, layer_dropout_hidden_delta,
-    layer_dropout_hidden_delta_batch, layer_forward, layer_forward_batch, layer_hidden_delta,
-    layer_hidden_delta_batch, layer_l2_apply_accumulated_gradient,
-    layer_momentum_apply_accumulated_gradient, layer_output_delta, layer_relu_forward,
-    layer_relu_forward_batch, layer_relu_hidden_delta, layer_relu_hidden_delta_batch,
-    layer_softmax_forward, layer_softmax_forward_batch, layer_softmax_output_delta,
+    layer_downstream, layer_downstream_batch, layer_dropout_forward, layer_dropout_forward_batch,
+    layer_dropout_hidden_delta, layer_dropout_hidden_delta_batch, layer_forward,
+    layer_forward_batch, layer_hidden_delta, layer_hidden_delta_batch,
+    layer_l2_apply_accumulated_gradient, layer_momentum_apply_accumulated_gradient,
+    layer_output_delta, layer_relu_forward, layer_relu_forward_batch, layer_relu_hidden_delta,
+    layer_relu_hidden_delta_batch, layer_softmax_forward, layer_softmax_forward_batch,
+    layer_softmax_output_delta,
 };
 use linalg::outer;
 use mnist::decode_mnist_pixels;
@@ -66,6 +71,12 @@ fn indrajala_math_rust(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(layer_dropout_forward_batch, m)?)?;
     m.add_function(wrap_pyfunction!(layer_dropout_hidden_delta, m)?)?;
     m.add_function(wrap_pyfunction!(layer_dropout_hidden_delta_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(layer_downstream, m)?)?;
+    m.add_function(wrap_pyfunction!(layer_downstream_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(conv_forward_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(conv_downstream_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(conv_accumulate_gradient_batch, m)?)?;
     m.add_class::<RustArray>()?;
+    m.add_class::<ConvGeometry>()?;
     Ok(())
 }
