@@ -1,6 +1,6 @@
 """
-docs/design-docs/adam/adam-array-layer.md's Rust-matmul-backed follow-on: `layer_adam_apply_accumulated_gradient`,
-one fused Rust call for the whole Adam (Kingma & Ba, 2014) update rule per parameter, checked
+`layer_adam_apply_accumulated_gradient` is one fused Rust call for the whole Adam (Kingma & Ba,
+2014) update rule per parameter, checked
 against `indrajala_ml.model.adam_array_layer.AdamArrayLayer` - the actual production reference
 this function replaces - the same treatment `test_fused_layer_ops.py` gives every non-Adam fused
 op.

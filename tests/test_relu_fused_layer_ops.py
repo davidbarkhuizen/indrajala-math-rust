@@ -1,7 +1,7 @@
 """
-docs/design-docs/array-siblings/relu-array-layer.md's Rust-matmul-backed follow-on: layer_relu_forward/
-layer_relu_forward_batch/layer_relu_hidden_delta/layer_relu_hidden_delta_batch, one fused Rust
-call per ReLUArrayLayer method, checked against indrajala_ml.model.relu_array_layer.ReLUArrayLayer
+layer_relu_forward/layer_relu_forward_batch/layer_relu_hidden_delta/layer_relu_hidden_delta_batch,
+one fused Rust call per ReLUArrayLayer method, checked against
+indrajala_ml.model.relu_array_layer.ReLUArrayLayer
 - the actual production reference these functions replace - the same treatment
 test_fused_layer_ops.py gives every plain (non-activation-changing) fused op.
 """

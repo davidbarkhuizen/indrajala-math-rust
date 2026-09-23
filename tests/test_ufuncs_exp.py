@@ -1,6 +1,6 @@
 """
-PR 4's own claim, per docs/architecture/rust-array-core.md: exp's overflow behavior (does Rust's f64::exp
-saturate to infinity for large arguments the same way numpy's np.exp does) - checked with the
+exp's overflow behavior (does Rust's f64::exp saturate to infinity for large arguments the same
+way numpy's np.exp does) - checked with the
 same large-z overflow-boundary sweep tests/test_array_layer.py already runs for sigmoid, applied
 directly to exp before sigmoid itself is ever built on top of it here.
 """

@@ -1,11 +1,9 @@
 """
-docs/design-docs/array-siblings/dropout-array-layer.md's Rust-matmul-backed follow-on: bernoulli_mask/draw_bernoulli_mask,
-this crate's first genuinely new RNG primitive since uniform() (random.rs) - a fresh category, not
-a mechanical fused-arithmetic port (see that document's "design"/"risks and open questions").
-Checked directly against numpy's own np.random.random(shape) >= drop_probability formula before
-DropoutRustArrayLayer/layer_dropout_forward are ever built on top of it here - the same "prove the
-primitive against numpy before building the layer" discipline array_relu/array_softmax already
-established. Like uniform() (test_random_uniform.py), bit-identical parity against numpy's own
+bernoulli_mask/draw_bernoulli_mask is an RNG primitive, a fresh category from the mechanical
+fused-arithmetic ops elsewhere in this crate. Checked directly against numpy's own
+np.random.random(shape) >= drop_probability formula before DropoutRustArrayLayer/
+layer_dropout_forward ever rely on it, the same "prove the primitive against numpy before
+building the layer" discipline array_relu/array_softmax follow. Like uniform() (test_random_uniform.py), bit-identical parity against numpy's own
 Mersenne Twister stream isn't achievable with a hand-rolled generator - this checks range/shape and
 statistical keep-rate instead, not per-draw equality.
 """

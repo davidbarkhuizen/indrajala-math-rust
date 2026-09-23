@@ -1,9 +1,9 @@
 """
-PR 9's own claim, per docs/architecture/rust-array-core.md: not new functionality - a single, consolidated
-sweep through every operation in docs/architecture/numpy-interface-subset.md's own table, checked against real
-numpy (three-way, against a pure-Python reference too, where one exists independent of numpy
-itself) in one auditable file, rather than something someone has to reassemble from PRs 1-8's
-scattered per-stage test files to answer "has the whole subset actually been checked."
+Not new functionality - a single, consolidated sweep through every operation in this crate's
+numpy interface subset, checked against real numpy (three-way, against a pure-Python reference
+too, where one exists independent of numpy itself) in one auditable file, rather than something
+someone has to reassemble from each operation's own scattered test file to answer "has the whole
+subset actually been checked."
 
 Every operation below already has its own dedicated, more detailed test file (test_array_basics,
 test_transpose_and_slicing, test_array_ops, test_ufuncs_exp, test_linalg, test_ufuncs_argmax,
@@ -122,8 +122,8 @@ def test_full_subset_sweep_against_numpy(seed):
 
 
 def test_uniform_is_excluded_from_bit_identical_parity_by_design():
-    # the one documented exception - see docs/architecture/rust-array-core.md's own "PR 7": statistical
-    # plausibility only, not per-draw equality against numpy's Mersenne Twister.
+    # the one documented exception: statistical plausibility only, not per-draw equality
+    # against numpy's Mersenne Twister.
     draws = uniform(-1.0, 1.0, 2000)
     values = [draws[i] for i in range(2000)]
     assert all(-1.0 <= value < 1.0 for value in values)

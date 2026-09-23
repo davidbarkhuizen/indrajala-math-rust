@@ -25,8 +25,7 @@ use random::{bernoulli_mask, uniform};
 use ufuncs::{argmax, array_relu, array_relu_mask, array_softmax, exp, sum_axis0};
 
 /// Proves the PyO3/maturin toolchain works end to end - importable and callable from Python,
-/// nothing array-specific yet. See docs/architecture/rust-array-core.md's "PR 0" for why this stage exists
-/// on its own before any real array type is built.
+/// nothing array-specific.
 #[pyfunction]
 fn ping() -> PyResult<String> {
     Ok("pong".to_string())

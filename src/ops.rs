@@ -26,8 +26,8 @@ fn scalar_elementwise(a: &[f64], scalar: f64, op: impl Fn(f64, f64) -> f64) -> V
 }
 
 /// Broadcasts `vector` (length `cols`) across every row of a `rows x cols` matrix - the one
-/// broadcasting case docs/architecture/numpy-interface-subset.md's table names alongside plain same-shape
-/// elementwise addition (`X @ self.W.T + self.b`).
+/// broadcasting case this core needs, alongside plain same-shape elementwise addition
+/// (`X @ self.W.T + self.b`).
 fn broadcast_row(
     matrix: &[f64],
     rows: usize,
@@ -154,9 +154,9 @@ impl RustArray {
         Ok(())
     }
 
-    /// See docs/architecture/rust-array-core.md's "PR 3": not required for correctness (Python falls back to
-    /// `self = self.__sub__(other)` when `__isub__` is absent), implemented anyway to avoid an
-    /// unnecessary allocation on every `apply_accumulated_gradient` call (`self.W -= ...`).
+    /// Not required for correctness (Python falls back to `self = self.__sub__(other)` when
+    /// `__isub__` is absent), implemented anyway to avoid an unnecessary allocation on every
+    /// `apply_accumulated_gradient` call (`self.W -= ...`).
     fn __isub__(&mut self, other: &PyAny) -> PyResult<()> {
         let result = self.__sub__(other)?;
         self.data = result.data;

@@ -21,13 +21,11 @@ fn available_parallelism_cached() -> usize {
 /// vector (`self.W @ x`), vector @ matrix (the interface subset's own "1D x 2D" case, not
 /// exercised by the current class design but part of its documented contract), and matrix @
 /// matrix (`X @ self.W.T`, `next_layer.delta_batch @ next_layer.W`,
-/// `self.delta_batch.T @ input_activation_batch`). All three cases are SIMD-accelerated - see
-/// docs/architecture/rust-array-core.md's own "status" for the measured results and
-/// docs/research/research-and-analysis.md for why the matrix@vector case (this codebase's actual
-/// `batch_size=1` production path - `fused.rs::layer_forward`/`layer_hidden_delta` call it on
-/// every `learn()` step) turned out to matter contrary to this comment's own earlier claim that
-/// it didn't (2026-09-16 measurement: ~97% of a fused forward call's cost at the real
-/// `dimension=784, hidden=16` shape, ~3.5x slower than numpy before this fix).
+/// `self.delta_batch.T @ input_activation_batch`). All three cases are SIMD-accelerated. The
+/// matrix@vector case matters most: it's this codebase's actual `batch_size=1` production path
+/// (`fused.rs::layer_forward`/`layer_hidden_delta` call it on every `learn()` step), accounting
+/// for ~97% of a fused forward call's cost at the real `dimension=784, hidden=16` shape - without
+/// SIMD acceleration it runs ~3.5x slower than numpy at that shape.
 pub(crate) fn matmul(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
     match (a.shape, b.shape) {
         (Shape::Matrix(rows, cols), Shape::Vector(n)) => {
@@ -78,14 +76,12 @@ pub(crate) fn matmul(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
 /// interleaved partial sums (lane `j` accumulates indices `j, j+4, j+8, ...`), combined pairwise
 /// at the end - and uses that *same* grouping in both the scalar fallback and the AVX2 path,
 /// which is what actually matters: a training run's result must not depend on which machine
-/// happens to run it. Verified bit-identical between the two paths the same way axpy_row's own
-/// AVX2 addition was (docs/research/research-and-analysis.md) - exact IEEE-754 bit-pattern comparison,
-/// not just `pytest.approx`. This does change the *value* matmul produces from what a naive
-/// sequential sum gave before this change (last-few-ULPs noise, same category as numpy's own
-/// internal reduction order already not matching Python's sequential sum - see
-/// docs/architecture/vectorized-array-classes.md's "summation-order rounding" - not a new risk category, and
-/// every parity check against numpy/the pure-Python reference already tolerates it via rtol, not
-/// exact equality).
+/// happens to run it. Verified bit-identical between the two paths via exact IEEE-754
+/// bit-pattern comparison, not just `pytest.approx`. This grouping differs in value from a naive
+/// left-to-right sequential sum by last-few-ULPs noise - the same category of divergence as
+/// numpy's own internal reduction order already not matching Python's sequential sum, not a new
+/// risk category, and every parity check against numpy/the pure-Python reference already
+/// tolerates it via rtol, not exact equality.
 #[inline]
 fn dot_product(a: &[f64], b: &[f64]) -> f64 {
     #[cfg(target_arch = "x86_64")]
@@ -154,14 +150,13 @@ unsafe fn dot_product_avx2_fma(a: &[f64], b: &[f64]) -> f64 {
     dot_product_tail(a, b, i, combine_lanes(lanes))
 }
 
-/// Threaded row-splitting on top of the size-gated blocking below (docs/architecture/rust-production-cutover.md's
-/// follow-on optimization work, matmul batch>=32 gap). Splits the output's row range across
+/// Threaded row-splitting on top of the size-gated blocking below. Splits the output's row range across
 /// `std::thread::scope` workers - safe without `'static` data (each worker borrows `a_data`/
 /// `b_data` read-only and writes into its own disjoint slice of `out`, via `split_at_mut`) - only
 /// once there's enough total work to plausibly amortize thread spawn overhead.
 /// `THREADING_THRESHOLD_FLOPS` is a coarse, deliberately conservative floor (a fraction of a
 /// millisecond's worth of naive-loop work), not a tuned constant - measured directly against this
-/// codebase's own matmul shapes before being trusted (see research-and-analysis.md). Splitting by
+/// codebase's own matmul shapes before being trusted. Splitting by
 /// row (not by `k` or `col`) needs no cross-thread reduction: each worker owns complete output
 /// rows end to end, so results are bit-identical to the single-threaded path regardless of thread
 /// count or scheduling - summation order per output row is unaffected by which thread computes it.
@@ -176,15 +171,13 @@ unsafe fn dot_product_avx2_fma(a: &[f64], b: &[f64]) -> f64 {
 fn matmul_2d(a_data: &[f64], b_data: &[f64], out: &mut [f64], r1: usize, c1: usize, c2: usize) {
     const THREADING_THRESHOLD_FLOPS: usize = 4_000_000;
     const MAX_THREADS: usize = 8;
-    // A rows-per-thread floor (e.g. requiring >=32 rows/thread) looked like the right refinement
-    // after an isolated microbenchmark of one small-`r1` shape (`(10,512)@(512,784)`) showed
-    // unrestricted threading as a slight regression there - but measured against this codebase's
-    // actual target metric (a full mini-batch training step, not one matmul in isolation), that
-    // "fix" made the real number *worse* (batch_size=512's ratio went from a 0.98x-1.25x range
-    // back up to 1.24x-1.79x), reproducibly across multiple runs. Not adopted - a lesson in this
-    // codebase's own "measure, don't assume" standard applying to a refinement of a previous
-    // measurement too, not just the first cut: the isolated shape's own regression turned out not
-    // to generalize to the composite workload it's actually part of.
+    // No rows-per-thread floor is applied here (e.g. requiring >=32 rows/thread): although an
+    // isolated microbenchmark of one small-`r1` shape (`(10,512)@(512,784)`) shows unrestricted
+    // threading as a slight regression there, measured against the actual target metric (a full
+    // mini-batch training step, not one matmul in isolation), adding such a floor makes the real
+    // number *worse* (batch_size=512's ratio goes from a 0.98x-1.25x range to 1.24x-1.79x),
+    // reproducibly across multiple runs - the isolated shape's regression does not generalize to
+    // the composite workload it's actually part of.
 
     let total_flops = r1 * c1 * c2;
     if total_flops < THREADING_THRESHOLD_FLOPS {
@@ -218,11 +211,10 @@ fn matmul_2d(a_data: &[f64], b_data: &[f64], out: &mut [f64], r1: usize, c1: usi
 /// `out_chunk[0..c2]`) - the single-threaded and per-thread code path share this, so blocking's
 /// own size-gating logic (below) is written once, not duplicated between them.
 ///
-/// `row -> k -> col`, not `row -> col -> k` (phase 0a): accumulates into a whole output row at a
+/// `row -> k -> col`, not `row -> col -> k`: accumulates into a whole output row at a
 /// time, reading both `a` and `b` row-contiguously.
 ///
-/// Blocked over `row` and `k` when `b` is big enough for it to matter
-/// (docs/architecture/rust-production-cutover.md's follow-on optimization work): without blocking, every
+/// Blocked over `row` and `k` when `b` is big enough for it to matter: without blocking, every
 /// output row re-streams the *entire* `b` matrix once (`k` ranges over all of `c1`), so if `b`
 /// doesn't fit in cache, `b` gets re-fetched from memory once per output row. Blocking caps how
 /// much of `b` needs to stay resident at once (one `K_BLOCK`-row slab) and reuses it across
@@ -285,12 +277,10 @@ fn matmul_2d_row_range(
 /// shared by the blocked and unblocked loops above (and, transitively, by every thread). Fused
 /// multiply-add (one rounding, not two) on *every* path - scalar fallback and AVX2 alike - via
 /// `f64::mul_add`/`_mm256_fmadd_pd`, so this call produces the same bits whether or not the
-/// running machine has AVX2, matching the bit-identical invariant this file's
-/// blocking/threading already hold to (2026-09-16, explicit SIMD intrinsics work: see
-/// docs/research/research-and-analysis.md). A plain `_mm256_mul_pd` + `_mm256_add_pd` pair would vectorize
-/// fine but round twice per element like the old `+=` loop did, silently reintroducing a
-/// bit-level divergence between this path and any non-AVX2 fallback - FMA is the only way to keep
-/// both the speed and the invariant.
+/// running machine has AVX2, matching the bit-identical invariant this file's blocking/threading
+/// hold to. A plain `_mm256_mul_pd` + `_mm256_add_pd` pair would vectorize fine but round twice
+/// per element instead of once, silently reintroducing a bit-level divergence between this path
+/// and any non-AVX2 fallback - FMA is the only way to keep both the speed and the invariant.
 #[inline]
 fn axpy_row(out_row: &mut [f64], a_value: f64, b_row: &[f64]) {
     #[cfg(target_arch = "x86_64")]

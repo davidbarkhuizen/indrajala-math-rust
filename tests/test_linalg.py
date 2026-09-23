@@ -1,6 +1,6 @@
 """
-PR 5's own claim, per docs/architecture/rust-array-core.md: matmul (as Array's __matmul__, matching every real
-call site's own `@` syntax), outer, and sum_axis0 - checked three ways (Rust, numpy, and a
+matmul (as Array's __matmul__, matching every real call site's own `@` syntax), outer, and
+sum_axis0 - checked three ways (Rust, numpy, and a
 hand-written pure-Python reference loop matching BackpropNode's own per-node sum() formula), a
 strictly stronger check than a two-way Rust-vs-numpy comparison alone.
 """

@@ -1,10 +1,7 @@
 """
-docs/design-docs/array-siblings/relu-array-layer.md stage 2: array_relu/array_relu_mask, this crate's first genuinely new
-ufunc since np.maximum/np.where were named as deferred in docs/architecture/numpy-interface-subset.md's
-"explicitly not required" section. Checked directly against numpy's own np.maximum/masking
-formulas before ReLUArrayLayer itself is ever built on top of them here - the same "prove the
-primitive against numpy before building the layer" discipline test_ufuncs_exp.py's own exp
-check already established.
+array_relu/array_relu_mask. Checked directly against numpy's own np.maximum/masking formulas
+before ReLUArrayLayer relies on them, the same "prove the primitive against numpy before
+building the layer" discipline test_ufuncs_exp.py's own exp check follows.
 """
 
 import random

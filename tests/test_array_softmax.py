@@ -1,9 +1,8 @@
 """
-docs/design-docs/array-siblings/softmax-array-layer.md stage 2: array_softmax, this crate's row-wise softmax-normalization
-primitive - checked directly against a hand-written numpy reference formula (numpy itself has no
-built-in softmax) before any softmax array-based class is ever built on top of it, the same
-"prove the primitive against numpy before building the layer" discipline test_array_relu.py's own
-array_relu check already established.
+array_softmax, this crate's row-wise softmax-normalization primitive - checked directly against a
+hand-written numpy reference formula (numpy itself has no built-in softmax) before any
+softmax array-based class relies on it, the same "prove the primitive against numpy before
+building the layer" discipline test_array_relu.py's own array_relu check follows.
 """
 
 import numpy as np
@@ -47,9 +46,8 @@ def test_array_softmax_sums_to_one_for_a_1d_vector():
 
 
 def test_array_softmax_matches_numpy_for_large_magnitude_values_without_overflow():
-    # the numerically-adversarial case docs/design-docs/array-siblings/softmax-array-layer.md's "correctness validation"
-    # section calls for: large-magnitude z values, confirming the max-shift trick avoids the
-    # overflow a naive exp(z)/sum(exp(z)) would hit
+    # the numerically-adversarial case: large-magnitude z values, confirming the max-shift
+    # trick avoids the overflow a naive exp(z)/sum(exp(z)) would hit
     z = np.array([1000.0, 1001.0, 999.0, -1000.0])
     expected = _numpy_softmax_1d(z)
     actual = _to_flat_list(array_softmax(Array(z.tolist())))

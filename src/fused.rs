@@ -7,13 +7,12 @@ use crate::ops::same_shape_elementwise;
 use crate::random::draw_bernoulli_mask;
 use crate::ufuncs::{array_softmax, sum_axis0};
 
-/// docs/architecture/rust-production-cutover.md's phase 0b: one Rust function per `ArrayLayer` method,
-/// doing the entire computation in one call instead of composing it from several separate
-/// `Array` operator/ufunc calls in Python - each of those crosses the Python/Rust boundary and
-/// allocates a new `Array`, which is cause 1 of that document's "the decisive finding" (call
-/// count, not per-call cost, dominates at this crate's naive-matmul stage). Every function here
-/// mirrors one `indrajala_ml/model/array_layer.py` method's formula exactly - see that file for
-/// the reference this crate is being checked against.
+/// One Rust function per `ArrayLayer` method, doing the entire computation in one call instead
+/// of composing it from several separate `Array` operator/ufunc calls in Python - each of those
+/// crosses the Python/Rust boundary and allocates a new `Array`, and call count (not per-call
+/// cost) dominates this crate's matmul-bound cost. Every function here mirrors one
+/// `indrajala_ml/model/array_layer.py` method's formula exactly - see that file for the
+/// reference this crate is checked against.
 
 fn require_same_shape(a: &RustArray, b: &RustArray, context: &str) -> PyResult<()> {
     if a.shape != b.shape {
@@ -215,9 +214,9 @@ pub fn layer_apply_accumulated_gradient(
     Ok((new_w, new_b))
 }
 
-/// `AdamArrayLayer.apply_accumulated_gradient`: the Adam (Kingma & Ba, 2014) update rule - see
-/// docs/design-docs/adam/adam-array-layer.md - as one fused call per parameter (`W` or `b`) instead of composing
-/// it from several `Array` operators. Shape-agnostic like `layer_apply_accumulated_gradient`
+/// `AdamArrayLayer.apply_accumulated_gradient`: the Adam (Kingma & Ba, 2014) update rule, as one
+/// fused call per parameter (`W` or `b`) instead of composing it from several `Array` operators.
+/// Shape-agnostic like `layer_apply_accumulated_gradient`
 /// above, so this one helper covers both the `W`/`grad_W`/`m_W`/`v_W` (2D) and `b`/`grad_b`/`m_b`/
 /// `v_b` (1D) cases. `t` is the step count *after* incrementing - mirrors
 /// `AdamArrayLayer._t += 1` happening before the bias-correction terms are computed, so the
@@ -335,8 +334,8 @@ pub fn layer_adam_apply_accumulated_gradient(
 }
 
 /// `L2ArrayLayer.apply_accumulated_gradient`: `W -= learning_rate * (grad_W / batch_size +
-/// l2_lambda * W); b -= learning_rate * grad_b / batch_size` (bias unregularized) - see
-/// docs/design-docs/array-siblings/l2-array-layer.md. No persistent per-parameter state at all (unlike
+/// l2_lambda * W); b -= learning_rate * grad_b / batch_size` (bias unregularized). No persistent
+/// per-parameter state at all (unlike
 /// `layer_adam_apply_accumulated_gradient`/`layer_momentum_apply_accumulated_gradient`), so this
 /// takes only `W`/`b`/`grad_W`/`grad_b` plus the scalar `l2_lambda` - the simplest fused op in
 /// this round.
@@ -372,8 +371,8 @@ pub fn layer_l2_apply_accumulated_gradient(
 }
 
 /// `MomentumArrayLayer.apply_accumulated_gradient`: `delta = learning_rate * grad / batch_size +
-/// momentum * prev_delta; param -= delta` - see docs/design-docs/array-siblings/momentum-array-layer.md. One previous-delta
-/// array per parameter tensor, shape-agnostic like `layer_apply_accumulated_gradient` (covers
+/// momentum * prev_delta; param -= delta`. One previous-delta array per parameter tensor,
+/// shape-agnostic like `layer_apply_accumulated_gradient` (covers
 /// both the `W`/`grad_W`/`prev_delta_W` (2D) and `b`/`grad_b`/`prev_delta_b` (1D) cases via two
 /// calls from the Python caller, the same convention `layer_apply_accumulated_gradient` itself
 /// uses).
@@ -428,10 +427,9 @@ pub fn layer_momentum_apply_accumulated_gradient(
     Ok((new_w, new_b, new_prev_delta_w, new_prev_delta_b))
 }
 
-/// `ReLUArrayLayer.forward`: `max(0, self.W @ x + self.b)`, `x`/`b` both 1D - see
-/// docs/design-docs/array-siblings/relu-array-layer.md. Inlines `array_relu`'s own formula (`ufuncs.rs`) rather than
-/// calling it as a separate op, the same "one Rust call per layer method" discipline every
-/// other `fused.rs` function follows.
+/// `ReLUArrayLayer.forward`: `max(0, self.W @ x + self.b)`, `x`/`b` both 1D. Inlines
+/// `array_relu`'s own formula (`ufuncs.rs`) rather than calling it as a separate op, the same
+/// "one Rust call per layer method" discipline every other `fused.rs` function follows.
 #[pyfunction]
 pub fn layer_relu_forward(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
     let z = linear_preactivation(w, x, b)?;
@@ -495,10 +493,10 @@ pub fn layer_relu_hidden_delta_batch(
     })
 }
 
-/// `SoftmaxArrayLayer.forward`: `array_softmax(self.W @ x + self.b)`, `x`/`b` both 1D - see
-/// docs/design-docs/array-siblings/softmax-array-layer.md. Reuses `array_softmax` (`ufuncs.rs`, stage 2's primitive)
-/// directly rather than inlining its max/sum reduction, unlike ReLU's trivial elementwise
-/// formula - the extra call is Rust-internal, not a second Python/Rust FFI crossing.
+/// `SoftmaxArrayLayer.forward`: `array_softmax(self.W @ x + self.b)`, `x`/`b` both 1D. Reuses
+/// `array_softmax` (`ufuncs.rs`) directly rather than inlining its max/sum reduction, unlike
+/// ReLU's trivial elementwise formula - the extra call is Rust-internal, not a second
+/// Python/Rust FFI crossing.
 #[pyfunction]
 pub fn layer_softmax_forward(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
     Ok(array_softmax(&linear_preactivation(w, x, b)?))
@@ -524,8 +522,8 @@ pub fn layer_softmax_output_delta(a: &RustArray, reference: &RustArray) -> PyRes
 }
 
 /// `DropoutArrayLayer.forward`: `sigmoid(self.W @ x + self.b)`, with a training-time
-/// inverted-dropout mask drawn internally (`random.rs`'s `draw_bernoulli_mask`) - see
-/// docs/design-docs/array-siblings/dropout-array-layer.md. Returns `(a, mask, base_activation)`: `DropoutRustArrayLayer`
+/// inverted-dropout mask drawn internally (`random.rs`'s `draw_bernoulli_mask`). Returns
+/// `(a, mask, base_activation)`: `DropoutRustArrayLayer`
 /// keeps `mask`/`base_activation` around as this layer's own forward-time snapshots for
 /// `layer_dropout_hidden_delta` below, the same role `_mask`/`_base_activation` play on the
 /// numpy-backed `DropoutArrayLayer`. `x`/`b` both 1D; at `training=false` the mask is all-ones
@@ -604,13 +602,12 @@ fn dropout_forward_from_base(
 
 /// `DropoutArrayLayer.compute_hidden_delta`: `(next_layer.W.T @ next_layer.delta) *
 /// base_activation*(1-base_activation) * scale`, where `scale = mask/keep_probability` if
-/// `was_training` else `1.0` - see docs/design-docs/array-siblings/dropout-array-layer.md. `base_activation`/`mask` are the
-/// forward-time snapshots `layer_dropout_forward` returned, not re-derived here; `was_training`
-/// is a forward-time snapshot of `training` too, not a live re-read - mirrors
-/// `DropoutNode.compute_hidden_delta`'s own `_was_training` subtlety (docs/features/dropout.md's
-/// "design"): the caller's own `training` flag is already back to `false` by the time backward
-/// runs, so the rescale must be decided from what `forward` actually did. Single-example
-/// (`next_delta`/`base_activation`/`mask` all 1D).
+/// `was_training` else `1.0`. `base_activation`/`mask` are the forward-time snapshots
+/// `layer_dropout_forward` returned, not re-derived here; `was_training` is a forward-time
+/// snapshot of `training` too, not a live re-read - mirrors `DropoutNode.compute_hidden_delta`'s
+/// own `_was_training` subtlety: the caller's own `training` flag is already back to `false` by
+/// the time backward runs, so the rescale must be decided from what `forward` actually did.
+/// Single-example (`next_delta`/`base_activation`/`mask` all 1D).
 #[pyfunction]
 pub fn layer_dropout_hidden_delta(
     next_w: &RustArray,

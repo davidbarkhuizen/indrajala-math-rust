@@ -2,9 +2,8 @@ use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PySlice;
 
-/// This core only ever needs a 1D vector or a 2D matrix - see docs/architecture/numpy-interface-subset.md's
-/// own "dtype and shape" section for why general N-dimensional machinery is deliberately not
-/// built here.
+/// This core only ever needs a 1D vector or a 2D matrix; general N-dimensional machinery is
+/// deliberately not built here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shape {
     Vector(usize),
@@ -33,9 +32,9 @@ pub(crate) fn parse_shape(shape: &PyAny) -> PyResult<Shape> {
 }
 
 /// One layer's weights/activations/gradients as a flat, row-major f64 buffer plus a shape tag -
-/// the Rust-side counterpart to a real numpy `ndarray` restricted to exactly
-/// docs/architecture/numpy-interface-subset.md's own table. Named `Array`, not `PyArray`, to avoid colliding
-/// with real numpy's own type of that name (see docs/architecture/rust-array-core.md's "crate structure").
+/// the Rust-side counterpart to a real numpy `ndarray`, restricted to the subset of numpy's
+/// interface this codebase actually uses. Named `Array`, not `PyArray`, to avoid colliding with
+/// real numpy's own type of that name.
 #[pyclass(name = "Array")]
 #[derive(Clone)]
 pub struct RustArray {
@@ -61,7 +60,7 @@ impl RustArray {
 impl RustArray {
     /// Mirrors `np.array(data)`: a flat Python list of floats builds a 1D array, a nested list
     /// of same-length lists builds a 2D array - the two shapes this whole core ever needs, no
-    /// more (see docs/architecture/numpy-interface-subset.md's own "construct from data" row).
+    /// more.
     #[new]
     fn new(data: &PyAny) -> PyResult<Self> {
         if let Ok(rows) = data.extract::<Vec<Vec<f64>>>() {
@@ -110,10 +109,9 @@ impl RustArray {
 
     /// `arr[i]` / `arr[i, j]` for single-element reads (two index shapes through the same slot,
     /// matching how Python itself dispatches `arr[i]` vs. `arr[i, j]`), or `arr[:, :-1]` for a
-    /// contiguous 2D slice - the one slicing shape docs/architecture/numpy-interface-subset.md's own table
-    /// requires (`load_mnist_dataset_as_array`'s pixel-vs-label split), not general Python slice
-    /// semantics (step must be 1; no fancy/boolean indexing - see that document's "explicitly not
-    /// required").
+    /// contiguous 2D slice - the one slicing shape this core needs
+    /// (`load_mnist_dataset_as_array`'s pixel-vs-label split), not general Python slice
+    /// semantics: step must be 1, and there is no fancy/boolean indexing.
     fn __getitem__(&self, py: Python<'_>, index: &PyAny) -> PyResult<PyObject> {
         if let Shape::Matrix(rows, cols) = self.shape {
             if let Ok((row_slice, col_slice)) = index.extract::<(&PySlice, &PySlice)>() {
@@ -147,8 +145,7 @@ impl RustArray {
 
     /// The inverse of `Array(nested_list)`/`Array(flat_list)` (see `new` above) - a flat Python
     /// list for a 1D array, a nested list of same-length lists for a 2D array. `save()`/`load()`
-    /// round-trip weights through exactly this pair for JSON serialization
-    /// (`docs/architecture/numpy-interface-subset.md`'s own "Python round-trip" row).
+    /// round-trip weights through exactly this pair for JSON serialization.
     fn tolist(&self, py: Python<'_>) -> PyObject {
         match self.shape {
             Shape::Vector(_) => self.data.clone().into_py(py),
@@ -180,8 +177,8 @@ impl RustArray {
         }
     }
 
-    /// Reinterprets shape without changing data or order, matching `.reshape()`'s own contract
-    /// (docs/architecture/numpy-interface-subset.md). Returns an independent array (a full copy of the data),
+    /// Reinterprets shape without changing data or order, matching `.reshape()`'s own contract.
+    /// Returns an independent array (a full copy of the data),
     /// not a numpy-style view sharing the original buffer - nothing in this core's required
     /// operation set relies on view-aliasing semantics (`load_mnist_dataset_as_array`'s own
     /// reshape-then-slice-then-astype chain already copies at the `.astype` step), so the
@@ -231,8 +228,8 @@ impl RustArray {
 
     /// Resolves a Python slice against an axis of the given length the same way numpy's own
     /// slicing does (negative indices, an omitted stop, etc.), via `PySlice::indices` - but
-    /// rejects any step other than 1, since only contiguous slices are in scope (see
-    /// docs/architecture/numpy-interface-subset.md's "explicitly not required": no fancy or boolean indexing).
+    /// rejects any step other than 1, since only contiguous slices are in scope (no fancy or
+    /// boolean indexing).
     fn resolve_contiguous_range(slice: &PySlice, len: usize) -> PyResult<(usize, usize)> {
         let indices = slice.indices(len as std::os::raw::c_long)?;
         if indices.step != 1 {

@@ -6,15 +6,14 @@ use pyo3::prelude::*;
 use crate::array::{parse_shape, RustArray, Shape};
 
 /// A hand-rolled xorshift128+ generator - a small, well-known public-domain algorithm,
-/// implemented directly rather than pulled from the `rand` crate, matching this crate's own
-/// "hand-build everything, no convenience dependencies" posture (see docs/architecture/rust-array-core.md's
-/// own "crate structure").
+/// implemented directly rather than pulled from the `rand` crate, matching this crate's
+/// "hand-build everything, no convenience dependencies" posture.
 ///
-/// See that document's own "PR 7": this is the one operation in the whole interface subset where
-/// parity with numpy cannot mean bit-identical output - a hand-rolled generator can never
-/// reproduce numpy's Mersenne Twister stream, seeded or not. `randomize()`'s own "same seed ->
-/// same trained weights" regression gate breaks once this backs production, even though every
-/// other operation in this core matches numpy exactly - not a bug, a fact worth stating plainly.
+/// This is the one operation in the whole interface subset where parity with numpy cannot mean
+/// bit-identical output - a hand-rolled generator can never reproduce numpy's Mersenne Twister
+/// stream, seeded or not. `randomize()`'s own "same seed -> same trained weights" regression gate
+/// breaks once this backs production, even though every other operation in this core matches
+/// numpy exactly - not a bug, a fact worth stating plainly.
 struct Xorshift128Plus {
     state0: u64,
     state1: u64,
@@ -88,13 +87,12 @@ pub fn uniform(low: f64, high: f64, shape: &PyAny) -> PyResult<RustArray> {
 
 /// Draws `size` independent inverted-dropout keep/drop entries (1.0 kept, 0.0 dropped), each
 /// `>= drop_probability` against a fresh uniform-in-`[0,1)` draw - exactly
-/// `np.random.random(shape) >= drop_probability`'s own comparison
-/// (`DropoutArrayLayer.forward`, see docs/design-docs/array-siblings/dropout-array-layer.md), just inlined here as a flat
-/// `Vec<f64>` rather than a `RustArray` so `fused.rs`'s `layer_dropout_forward`/
-/// `layer_dropout_forward_batch` can draw a mask internally, in the same Rust call that also
-/// does the matmul/sigmoid, without a second Python/Rust FFI crossing - the same "one Rust call
-/// per layer method" discipline `layer_forward`/`layer_relu_forward` already established. Kept
-/// `pub(crate)` (not a `#[pyfunction]` itself) since `bernoulli_mask` below is the
+/// `np.random.random(shape) >= drop_probability`'s own comparison (`DropoutArrayLayer.forward`),
+/// just inlined here as a flat `Vec<f64>` rather than a `RustArray` so `fused.rs`'s
+/// `layer_dropout_forward`/`layer_dropout_forward_batch` can draw a mask internally, in the same
+/// Rust call that also does the matmul/sigmoid, without a second Python/Rust FFI crossing - the
+/// same "one Rust call per layer method" discipline `layer_forward`/`layer_relu_forward` follow.
+/// Kept `pub(crate)` (not a `#[pyfunction]` itself) since `bernoulli_mask` below is the
 /// Python-visible, independently-testable entry point to this same logic.
 pub(crate) fn draw_bernoulli_mask(drop_probability: f64, size: usize) -> Vec<f64> {
     let mut rng = Xorshift128Plus::new(fresh_seed());
@@ -104,11 +102,10 @@ pub(crate) fn draw_bernoulli_mask(drop_probability: f64, size: usize) -> Vec<f64
 }
 
 /// The standalone, Python-visible counterpart to `draw_bernoulli_mask` above - lets the mask
-/// distribution itself be checked directly (statistically, per this module's own doc comment on
-/// why bit-identical parity isn't achievable), before either `DropoutArrayLayer`'s Rust
-/// counterpart or its fused forward ops are ever built on top of it - the same "prove the
-/// primitive against numpy before building the layer" discipline `array_relu`/`array_softmax`
-/// established for their own stages (`ufuncs.rs`).
+/// distribution itself be checked directly (statistically, since bit-identical parity with numpy
+/// isn't achievable here - see this module's own doc comment), independently of
+/// `DropoutArrayLayer`'s Rust counterpart or its fused forward ops, matching how `array_relu`/
+/// `array_softmax` (`ufuncs.rs`) are each validated against numpy on their own.
 #[pyfunction]
 pub fn bernoulli_mask(drop_probability: f64, shape: &PyAny) -> PyResult<RustArray> {
     let shape = parse_shape(shape)?;

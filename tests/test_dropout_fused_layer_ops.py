@@ -1,14 +1,14 @@
 """
-docs/design-docs/array-siblings/dropout-array-layer.md's Rust-matmul-backed follow-on: layer_dropout_forward/
-layer_dropout_forward_batch/layer_dropout_hidden_delta/layer_dropout_hidden_delta_batch, checked
-against indrajala_ml.model.dropout_array_layer.DropoutArrayLayer - the actual production
-reference these functions replace - the same treatment test_relu_fused_layer_ops.py gives
-ReLUArrayLayer's own fused ops.
+layer_dropout_forward/layer_dropout_forward_batch/layer_dropout_hidden_delta/
+layer_dropout_hidden_delta_batch, checked against
+indrajala_ml.model.dropout_array_layer.DropoutArrayLayer - the actual production reference these
+functions replace - the same treatment test_relu_fused_layer_ops.py gives ReLUArrayLayer's own
+fused ops.
 
 Unlike every other *_fused_layer_ops.py test module, training=True can't be checked for
 bit-identical parity against the numpy-backed reference: this crate's hand-rolled xorshift128+
-generator can never reproduce numpy's Mersenne Twister stream (the same "the RNG exception"
-docs/architecture/rust-array-core.md already documents for uniform()), and here the mask *is* the mechanism
+generator can never reproduce numpy's Mersenne Twister stream (the same RNG-implementation gap
+that rules out bit-identical parity for uniform()), and here the mask *is* the mechanism
 under test, not incidental to it. So training=False (deterministic, no RNG involved at all) is
 checked for exact parity across a random sweep, the same as every other fused op; training=True is
 checked structurally instead - shape, {0.0, 1.0}-valued entries, and that layer_dropout_forward's

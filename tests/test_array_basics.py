@@ -1,7 +1,6 @@
 """
-PR 1's own claim, per docs/architecture/rust-array-core.md: the Python<->Rust round-trip works for
-construction, shape, single-element read/write (both the 1D scalar-index and 2D tuple-index
-shapes), .copy(), and .reshape() - before any arithmetic exists to get wrong.
+The Python<->Rust round-trip works for construction, shape, single-element read/write (both the
+1D scalar-index and 2D tuple-index shapes), .copy(), and .reshape().
 """
 
 import pytest

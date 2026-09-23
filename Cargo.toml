@@ -8,7 +8,7 @@ name = "indrajala_ml_array"
 crate-type = ["cdylib"]
 
 [dependencies]
-# multiple-pymethods: lets each stage of docs/rust-array-core.md's own PR-staged workplan add its
-# own `#[pymethods] impl RustArray` block in its own file (array.rs, ops.rs, linalg.rs, ...)
-# instead of accreting every stage's methods into one growing block in array.rs.
+# multiple-pymethods: lets each source file (array.rs, ops.rs, linalg.rs, ...) add its own
+# `#[pymethods] impl RustArray` block instead of accreting every method into one growing
+# block in array.rs.
 pyo3 = { version = "0.20", features = ["extension-module", "multiple-pymethods"] }

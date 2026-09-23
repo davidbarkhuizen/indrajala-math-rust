@@ -1,6 +1,6 @@
 """
-docs/design-docs/array-siblings/l2-array-layer.md's Rust-matmul-backed follow-on: `layer_l2_apply_accumulated_gradient`,
-one fused Rust call for the whole L2 (weight decay) update rule, checked against
+`layer_l2_apply_accumulated_gradient` is one fused Rust call for the whole L2 (weight decay)
+update rule, checked against
 `indrajala_ml.model.l2_array_layer.L2ArrayLayer` - the actual production reference this
 function replaces - the same treatment `test_adam_fused_layer_ops.py` gives Adam's own fused op.
 """

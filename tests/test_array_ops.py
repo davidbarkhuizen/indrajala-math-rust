@@ -1,9 +1,7 @@
 """
-PR 3's own claim, per docs/architecture/rust-array-core.md: elementwise + - * /, both broadcasting cases
-(vector+vector, matrix+row-vector), and scalar operands - checked against real numpy across a
-randomized sweep, matching the three-way discipline (Rust, numpy, pure Python) this workplan's
-own "numerical parity validation" section calls for, here Rust-vs-numpy since no pure-Python
-elementwise-array reference exists to compare a third way against.
+Elementwise + - * /, both broadcasting cases (vector+vector, matrix+row-vector), and scalar
+operands - checked against real numpy across a randomized sweep, Rust-vs-numpy since no
+pure-Python elementwise-array reference exists to compare a third way against.
 """
 
 import random
