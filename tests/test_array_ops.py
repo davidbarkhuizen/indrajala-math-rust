@@ -9,7 +9,7 @@ import random
 import numpy as np
 import pytest
 
-from indrajala_ml_array import Array
+from indrajala_math_rust import Array
 
 
 def _to_numpy(arr):

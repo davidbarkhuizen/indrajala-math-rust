@@ -10,7 +10,7 @@ statistical keep-rate instead, not per-draw equality.
 
 import statistics
 
-from indrajala_ml_array import bernoulli_mask
+from indrajala_math_rust import bernoulli_mask
 
 
 def test_bernoulli_mask_respects_shape_1d_and_2d():

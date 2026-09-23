@@ -1,10 +1,10 @@
 [package]
-name = "indrajala_ml_array"
+name = "indrajala_math_rust"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "indrajala_ml_array"
+name = "indrajala_math_rust"
 crate-type = ["cdylib"]
 
 [dependencies]

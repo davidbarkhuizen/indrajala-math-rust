@@ -6,7 +6,7 @@ serialization.
 
 import numpy as np
 
-from indrajala_ml_array import Array
+from indrajala_math_rust import Array
 
 
 def test_1d_tolist_round_trip():

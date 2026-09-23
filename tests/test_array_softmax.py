@@ -8,7 +8,7 @@ building the layer" discipline test_array_relu.py's own array_relu check follows
 import numpy as np
 import pytest
 
-from indrajala_ml_array import Array, array_softmax
+from indrajala_math_rust import Array, array_softmax
 
 
 def _numpy_softmax_1d(z: np.ndarray) -> np.ndarray:

@@ -7,7 +7,7 @@ than this crate's other exact-match tests.
 
 import statistics
 
-from indrajala_ml_array import uniform
+from indrajala_math_rust import uniform
 
 
 def test_uniform_respects_shape_1d_and_2d():

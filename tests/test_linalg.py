@@ -10,7 +10,7 @@ import random
 import numpy as np
 import pytest
 
-from indrajala_ml_array import Array, outer, sum_axis0
+from indrajala_math_rust import Array, outer, sum_axis0
 
 
 def _to_numpy(arr):
