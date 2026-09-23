@@ -2,7 +2,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::array::{RustArray, Shape};
-use crate::linalg::matmul;
+use crate::linalg::{axpy_row, matmul};
 
 /// Convolution and max pooling ops, one Rust call per `ConvArrayLayer`/`MaxPoolArrayLayer` method
 /// (indrajala-ml's `indrajala_ml/model/conv_array_layer.py`/`max_pool_array_layer.py`),
@@ -160,6 +160,41 @@ fn deltas_by_channel(delta: &RustArray, n: usize, o: usize, p: usize) -> RustArr
     RustArray::from_matrix(out, o, n * p)
 }
 
+/// Checks `conv_forward_batch`/`conv_infer_batch`'s arguments against the geometry and returns
+/// `(O, N)`: the output channel count and the example count.
+fn forward_dimensions(
+    w: &RustArray,
+    x: &RustArray,
+    b: &RustArray,
+    geometry: &ConvGeometry,
+    context: &str,
+) -> PyResult<(usize, usize)> {
+    let o = channel_count(w, geometry, context)?;
+    if b.shape != Shape::Vector(o) {
+        return Err(PyValueError::new_err(format!(
+            "{context}: b must be a vector of length {o}, got {:?}",
+            b.shape
+        )));
+    }
+    let n = require_matrix(x, None, geometry.input_size, &format!("{context} X"))?;
+    Ok((o, n))
+}
+
+/// Fills `row` (length `C*k*k`) with the inputs output position `(out_row, out_col)` reads from
+/// one example's `C*H*W` `input`, in `W`-row order: one im2col row.
+#[inline]
+fn fill_im2col_row(g: &ConvGeometry, input: &[f64], out_row: usize, out_col: usize, row: &mut [f64]) {
+    let k = g.kernel_size;
+    let mut column = 0;
+    for c in 0..g.input_channels {
+        for kr in 0..k {
+            let start = g.input_index(c, out_row, out_col, kr, 0);
+            row[column..column + k].copy_from_slice(&input[start..start + k]);
+            column += k;
+        }
+    }
+}
+
 /// `ConvArrayLayer.forward_batch`: im2col, `cols @ W.T` with `matmul`, then a scatter into
 /// channel-major `(N, O*P)` that adds `b` and applies the ReLU in the same pass. Returns `(A,
 /// cols)`: `cols` is kept by the caller for `conv_accumulate_gradient_batch`, as
@@ -172,16 +207,9 @@ pub fn conv_forward_batch(
     b: &RustArray,
     geometry: &ConvGeometry,
 ) -> PyResult<(RustArray, RustArray)> {
-    let o = channel_count(w, geometry, "conv_forward_batch")?;
-    if b.shape != Shape::Vector(o) {
-        return Err(PyValueError::new_err(format!(
-            "conv_forward_batch: b must be a vector of length {o}, got {:?}",
-            b.shape
-        )));
-    }
-    let n = require_matrix(x, None, geometry.input_size, "conv_forward_batch X")?;
+    let (o, n) = forward_dimensions(w, x, b, geometry, "conv_forward_batch")?;
     let g = geometry;
-    let (p, k, fan_in) = (g.positions, g.kernel_size, g.fan_in);
+    let (p, fan_in) = (g.positions, g.fan_in);
 
     let mut cols = vec![0.0; n * p * fan_in];
     for example in 0..n {
@@ -189,14 +217,7 @@ pub fn conv_forward_batch(
         for out_row in 0..g.out_height {
             for out_col in 0..g.out_width {
                 let row = &mut cols[(example * p + out_row * g.out_width + out_col) * fan_in..][..fan_in];
-                let mut column = 0;
-                for c in 0..g.input_channels {
-                    for kr in 0..k {
-                        let start = g.input_index(c, out_row, out_col, kr, 0);
-                        row[column..column + k].copy_from_slice(&input[start..start + k]);
-                        column += k;
-                    }
-                }
+                fill_im2col_row(g, input, out_row, out_col, row);
             }
         }
     }
@@ -213,6 +234,41 @@ pub fn conv_forward_batch(
         }
     }
     Ok((RustArray::from_matrix(a, n, o * p), cols))
+}
+
+/// `conv_forward_batch`'s `A` without building `cols`, for forward passes that never reach
+/// `conv_accumulate_gradient_batch` (evaluation). One reused `C*k*k` row holds each output
+/// position's im2col row, and its `O` outputs are `sum_k row[k] * W.T[k]` by `axpy_row`, `k`
+/// increasing from 0.0. That is `matmul_2d_row_range`'s computation of the same row of `cols @
+/// W.T` (its blocking and threading don't change a row's `k` order), so `A` is bit-identical to
+/// `conv_forward_batch`'s.
+#[pyfunction]
+pub fn conv_infer_batch(w: &RustArray, x: &RustArray, b: &RustArray, geometry: &ConvGeometry) -> PyResult<RustArray> {
+    let (o, n) = forward_dimensions(w, x, b, geometry, "conv_infer_batch")?;
+    let g = geometry;
+    let (p, fan_in) = (g.positions, g.fan_in);
+    let w_t = w.transpose(); // (C*k*k, O), matmul's right operand in conv_forward_batch
+
+    let mut row = vec![0.0; fan_in];
+    let mut by_channel = vec![0.0; o];
+    let mut a = vec![0.0; n * o * p];
+    for example in 0..n {
+        let input = &x.data[example * g.input_size..(example + 1) * g.input_size];
+        for out_row in 0..g.out_height {
+            for out_col in 0..g.out_width {
+                fill_im2col_row(g, input, out_row, out_col, &mut row);
+                by_channel.fill(0.0);
+                for (k, &value) in row.iter().enumerate() {
+                    axpy_row(&mut by_channel, value, &w_t.data[k * o..(k + 1) * o]);
+                }
+                let position = out_row * g.out_width + out_col;
+                for channel in 0..o {
+                    a[(example * o + channel) * p + position] = (by_channel[channel] + b.data[channel]).max(0.0);
+                }
+            }
+        }
+    }
+    Ok(RustArray::from_matrix(a, n, o * p))
 }
 
 /// `ConvArrayLayer._downstream`: `dcols = D @ W` with `matmul`, `D` the deltas regrouped to

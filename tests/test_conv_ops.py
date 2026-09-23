@@ -1,5 +1,5 @@
 """
-ConvGeometry and the conv ops (conv_forward_batch, conv_downstream_batch,
+ConvGeometry and the conv ops (conv_forward_batch, conv_infer_batch, conv_downstream_batch,
 conv_accumulate_gradient_batch), plus layer_downstream/layer_downstream_batch. Checked against a
 brute-force numpy reference written from the definition of a 'valid' strided convolution -
 nested loops over example, output position, channel and kernel offset, no im2col - so the check
@@ -19,6 +19,7 @@ from indrajala_math_rust import (
     conv_accumulate_gradient_batch,
     conv_downstream_batch,
     conv_forward_batch,
+    conv_infer_batch,
     layer_downstream,
     layer_downstream_batch,
 )
@@ -175,6 +176,34 @@ def test_conv_forward_batch_is_relu_of_the_matmul_scatter_exactly(shape, n):
     assert _np(A).tolist() == np.maximum(0.0, Z).tolist()
 
 
+# (shape, N) beyond SHAPES for conv_infer_batch, whose bit-identity rests on matmul's blocking and
+# threading not changing a row's k order: 28x28, 8 channels at N = 128 is 6.2M flops, over the 4M
+# threading threshold; fan_in 800 x 48 channels makes W.T 300 KB, over the 256 KB blocking one
+INFER_EXTRA_CASES = [
+    ((28, 28, 1, 3, 8, 1), 1),
+    ((28, 28, 1, 3, 8, 1), 128),
+    ((8, 8, 32, 5, 48, 1), 2),
+    ((13, 13, 8, 3, 16, 2), 5),
+]
+
+
+@pytest.mark.parametrize(
+    "shape, n", [(shape, n) for shape in SHAPES for n in (1, BATCH_SIZE)] + INFER_EXTRA_CASES
+)
+def test_conv_infer_batch_is_conv_forward_batch_a_exactly(shape, n):
+    rng = np.random.default_rng(6)
+    height, width, channels, k, channel_count, _s = shape
+    W = Array(rng.uniform(-1.0, 1.0, size=(channel_count, channels * k * k)).tolist())
+    b = Array(rng.uniform(-0.5, 0.5, size=channel_count).tolist())
+    X = Array(rng.uniform(-1.0, 1.0, size=(n, channels * height * width)).tolist())
+    g = _geometry(shape)
+
+    A, _cols = conv_forward_batch(W, X, b, g)
+    inferred = conv_infer_batch(W, X, b, g)
+    assert inferred.shape == A.shape
+    assert inferred.tolist() == A.tolist()
+
+
 @pytest.mark.parametrize("shape", SHAPES)
 def test_conv_downstream_batch_matches_the_brute_force_definition(shape):
     W, _b, _X, delta = _random_case(1, shape)
@@ -222,6 +251,11 @@ def test_conv_ops_reject_mismatched_shapes():
         conv_forward_batch(W, X, Array.zeros(3), g)  # b length != channel_count
     with pytest.raises(ValueError):
         conv_forward_batch(W, Array.zeros(25), b, g)  # a single example is passed as (1, n)
+    for bad_w, bad_x, bad_b in [(Array.zeros((2, 8)), X, b), (W, Array.zeros((3, 24)), b), (W, X, Array.zeros(3))]:
+        with pytest.raises(ValueError):
+            conv_infer_batch(bad_w, bad_x, bad_b, g)
+    with pytest.raises(ValueError):
+        conv_infer_batch(W, Array.zeros(25), b, g)
     with pytest.raises(ValueError):
         conv_downstream_batch(W, Array.zeros((3, 17)), g)  # delta columns != channel_count * P
     with pytest.raises(ValueError):

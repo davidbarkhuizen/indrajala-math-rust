@@ -324,7 +324,7 @@ fn matmul_2d_row_range(
 /// per element instead of once, silently reintroducing a bit-level divergence between this path
 /// and any non-AVX2 fallback - FMA is the only way to keep both the speed and the invariant.
 #[inline]
-fn axpy_row(out_row: &mut [f64], a_value: f64, b_row: &[f64]) {
+pub(crate) fn axpy_row(out_row: &mut [f64], a_value: f64, b_row: &[f64]) {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {

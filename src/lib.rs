@@ -11,7 +11,7 @@ mod ufuncs;
 
 use array::RustArray;
 use conv::{
-    conv_accumulate_gradient_batch, conv_downstream_batch, conv_forward_batch,
+    conv_accumulate_gradient_batch, conv_downstream_batch, conv_forward_batch, conv_infer_batch,
     max_pool_downstream_batch, max_pool_forward_batch, ConvGeometry,
 };
 use fused::{
@@ -76,6 +76,7 @@ fn indrajala_math_rust(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(layer_downstream, m)?)?;
     m.add_function(wrap_pyfunction!(layer_downstream_batch, m)?)?;
     m.add_function(wrap_pyfunction!(conv_forward_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(conv_infer_batch, m)?)?;
     m.add_function(wrap_pyfunction!(conv_downstream_batch, m)?)?;
     m.add_function(wrap_pyfunction!(conv_accumulate_gradient_batch, m)?)?;
     m.add_function(wrap_pyfunction!(max_pool_forward_batch, m)?)?;
