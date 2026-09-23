@@ -20,8 +20,8 @@ fn available_parallelism_cached() -> usize {
 /// The three matmul shape combinations `ArrayLayer`'s own formulas actually use - matrix @
 /// vector (`self.W @ x`), vector @ matrix (the interface subset's own "1D x 2D" case, not
 /// exercised by the current class design but part of its documented contract), and matrix @
-/// matrix (`X @ self.W.T`, `next_layer.delta_batch @ next_layer.W`,
-/// `self.delta_batch.T @ input_activation_batch`). All three cases are SIMD-accelerated. The
+/// matrix (`X @ self.W.T`, `next_layer.delta_batch @ next_layer.W`; `self.delta_batch.T @
+/// input_activation_batch` goes through `matmul_tn` instead). All three cases are SIMD-accelerated. The
 /// matrix@vector case matters most: it's this codebase's actual `batch_size=1` production path
 /// (`fused.rs::layer_forward`/`layer_hidden_delta` call it on every `learn()` step), accounting
 /// for ~97% of a fused forward call's cost at the real `dimension=784, hidden=16` shape - without
@@ -59,7 +59,7 @@ pub(crate) fn matmul(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
                 return Err(shape_error(a.shape, b.shape));
             }
             let mut out = vec![0.0; r1 * c2];
-            matmul_2d(&a.data, &b.data, &mut out, r1, c1, c2);
+            matmul_2d(&a.data, (c1, 1), &b.data, &mut out, r1, c1, c2);
             Ok(RustArray::from_matrix(out, r1, c2))
         }
         (a_shape, b_shape) => Err(shape_error(a_shape, b_shape)),
@@ -168,7 +168,15 @@ unsafe fn dot_product_avx2_fma(a: &[f64], b: &[f64]) -> f64 {
 /// measured in the tens of microseconds) if queried unconditionally on every dispatch. Cached
 /// once behind a `OnceLock` and read only when there's already enough work to justify the
 /// question.
-fn matmul_2d(a_data: &[f64], b_data: &[f64], out: &mut [f64], r1: usize, c1: usize, c2: usize) {
+fn matmul_2d(
+    a_data: &[f64],
+    a_strides: (usize, usize),
+    b_data: &[f64],
+    out: &mut [f64],
+    r1: usize,
+    c1: usize,
+    c2: usize,
+) {
     const THREADING_THRESHOLD_FLOPS: usize = 4_000_000;
     const MAX_THREADS: usize = 8;
     // No rows-per-thread floor is applied here (e.g. requiring >=32 rows/thread): although an
@@ -181,13 +189,13 @@ fn matmul_2d(a_data: &[f64], b_data: &[f64], out: &mut [f64], r1: usize, c1: usi
 
     let total_flops = r1 * c1 * c2;
     if total_flops < THREADING_THRESHOLD_FLOPS {
-        matmul_2d_row_range(a_data, b_data, out, 0, r1, c1, c2);
+        matmul_2d_row_range(a_data, a_strides, b_data, out, 0, r1, c1, c2);
         return;
     }
 
     let thread_count = available_parallelism_cached().min(MAX_THREADS).min(r1);
     if thread_count <= 1 {
-        matmul_2d_row_range(a_data, b_data, out, 0, r1, c1, c2);
+        matmul_2d_row_range(a_data, a_strides, b_data, out, 0, r1, c1, c2);
         return;
     }
 
@@ -200,7 +208,7 @@ fn matmul_2d(a_data: &[f64], b_data: &[f64], out: &mut [f64], r1: usize, c1: usi
             let (chunk, rest) = remaining_out.split_at_mut((row_end - row_start) * c2);
             remaining_out = rest;
             scope.spawn(move || {
-                matmul_2d_row_range(a_data, b_data, chunk, row_start, row_end, c1, c2);
+                matmul_2d_row_range(a_data, a_strides, b_data, chunk, row_start, row_end, c1, c2);
             });
             row_start = row_end;
         }
@@ -227,8 +235,15 @@ fn matmul_2d(a_data: &[f64], b_data: &[f64], out: &mut [f64], r1: usize, c1: usi
 /// the same summation order per output row (k_block sweeps 0..c1 in increasing order, and k
 /// sweeps increasing within each block, same as the unblocked loop), so results are
 /// bit-identical, not just float64-close, regardless of which path runs.
+///
+/// `a_strides` is `(row_stride, k_stride)`: element `(row, k)` of the logical left operand is
+/// `a_data[row * row_stride + k * k_stride]`. `(c1, 1)` is `a` itself, row-major; `(1, r1)` reads
+/// `a` as the transpose of a row-major `(c1, r1)` matrix, which is how `matmul_tn` avoids copying
+/// the transpose. Only the read of `a` changes, so the summation order, and the bits, are the
+/// same either way.
 fn matmul_2d_row_range(
     a_data: &[f64],
+    a_strides: (usize, usize),
     b_data: &[f64],
     out_chunk: &mut [f64],
     row_start: usize,
@@ -240,12 +255,13 @@ fn matmul_2d_row_range(
     const K_BLOCK: usize = 64;
     const BLOCKING_THRESHOLD_BYTES: usize = 256 * 1024;
     let b_size_bytes = c1 * c2 * std::mem::size_of::<f64>();
+    let (a_row_stride, a_k_stride) = a_strides;
 
     if b_size_bytes <= BLOCKING_THRESHOLD_BYTES {
         for row in row_start..row_end {
             let out_row = &mut out_chunk[(row - row_start) * c2..(row - row_start + 1) * c2];
             for k in 0..c1 {
-                let a_value = a_data[row * c1 + k];
+                let a_value = a_data[row * a_row_stride + k * a_k_stride];
                 let b_row = &b_data[k * c2..(k + 1) * c2];
                 axpy_row(out_row, a_value, b_row);
             }
@@ -262,7 +278,7 @@ fn matmul_2d_row_range(
             for row in row_block_start..row_block_end {
                 let out_row = &mut out_chunk[(row - row_start) * c2..(row - row_start + 1) * c2];
                 for k in k_block_start..k_block_end {
-                    let a_value = a_data[row * c1 + k];
+                    let a_value = a_data[row * a_row_stride + k * a_k_stride];
                     let b_row = &b_data[k * c2..(k + 1) * c2];
                     axpy_row(out_row, a_value, b_row);
                 }
@@ -324,6 +340,24 @@ unsafe fn axpy_row_avx2_fma(out_row: &mut [f64], a_value: f64, b_row: &[f64]) {
     while col < len {
         out_row[col] = a_value.mul_add(b_row[col], out_row[col]);
         col += 1;
+    }
+}
+
+/// `a.T @ b` for `a (K, M)` and `b (K, N)`, without materializing `a.T`: the same `matmul_2d`
+/// (threading, blocking and summation order) as `matmul(&a.transpose(), b)`, reading `a` with
+/// strides instead of copying it, so the result is bit-identical to that. Each output row `i`
+/// accumulates `a[k, i] * b[k, :]` over increasing `k`, as it would from the copied row.
+pub(crate) fn matmul_tn(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
+    match (a.shape, b.shape) {
+        (Shape::Matrix(k, m), Shape::Matrix(k_b, n)) if k == k_b => {
+            let mut out = vec![0.0; m * n];
+            matmul_2d(&a.data, (1, m), &b.data, &mut out, m, k, n);
+            Ok(RustArray::from_matrix(out, m, n))
+        }
+        (a_shape, b_shape) => Err(PyValueError::new_err(format!(
+            "cannot matmul the transpose of shape {:?} with shape {:?}",
+            a_shape, b_shape
+        ))),
     }
 }
 

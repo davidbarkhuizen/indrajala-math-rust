@@ -14,6 +14,7 @@ import pytest
 from indrajala_math_rust import (
     Array,
     layer_accumulate_gradient,
+    layer_accumulate_gradient_batch,
     layer_apply_accumulated_gradient,
     layer_sgd_step,
     outer,
@@ -263,3 +264,72 @@ def test_layer_sgd_step_inputs_reach_the_signed_zero_case():
 def test_layer_sgd_step_rejects_mismatched_shapes(w_shape, b_shape, delta_shape, x_shape):
     with pytest.raises(ValueError):
         layer_sgd_step(Array.zeros(w_shape), Array.zeros(b_shape), Array.zeros(delta_shape), Array.zeros(x_shape), 0.5)
+
+
+# (batch K, output M, input N). matmul_2d threads at K*M*N >= 4M flops and blocks once the
+# (K, N) right operand exceeds 256 KB; these cover each of the four combinations, K = 1, M = 1,
+# N = 1, and sizes that aren't multiples of 4 (AVX2 lanes) or 64 (the row and k blocks).
+_BATCH_GRADIENT_SHAPES = [
+    (1, 1, 1),
+    (1, 30, 784),
+    (32, 1, 784),
+    (7, 5, 3),
+    (32, 30, 784),  # unthreaded, unblocked (dense production shape at batch 32)
+    (10, 500, 1000),  # threaded, unblocked
+    (100, 3, 401),  # unthreaded, blocked
+    (203, 67, 301),  # threaded, blocked, no multiples of 4 or 64
+    (512, 30, 784),  # threaded, blocked (dense production shape at batch 512)
+]
+
+
+@pytest.mark.parametrize("k, m, n", _BATCH_GRADIENT_SHAPES)
+def test_layer_accumulate_gradient_batch_is_bit_identical_to_grad_w_plus_transpose_matmul(k, m, n):
+    # the transpose-free op against the composition it replaced (a copied delta_batch.T, then @),
+    # compared exactly: same summation order per output row, so same bits
+    rng = np.random.default_rng(k * 1_000_003 + m * 1009 + n)
+    delta_batch = Array(rng.uniform(-3.0, 3.0, (k, m)).tolist())
+    x_batch = Array(rng.uniform(-3.0, 3.0, (k, n)).tolist())
+    grad_w = Array(rng.uniform(-3.0, 3.0, (m, n)).tolist())
+    grad_b = Array(rng.uniform(-3.0, 3.0, m).tolist())
+
+    new_grad_w, new_grad_b = layer_accumulate_gradient_batch(delta_batch, x_batch, grad_w, grad_b)
+
+    expected_w = (grad_w + delta_batch.T @ x_batch).tolist()
+    assert [_bits(row) for row in new_grad_w.tolist()] == [_bits(row) for row in expected_w]
+    assert _bits(new_grad_b.tolist()) == _bits((grad_b + sum_axis0(delta_batch)).tolist())
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_layer_accumulate_gradient_batch_is_bit_identical_with_special_values(seed):
+    rng = random.Random(seed)
+    k, m, n = rng.randint(1, 20), rng.randint(1, 40), rng.randint(1, 70)
+    delta_batch = Array([_vector_with_special_values(rng, m) for _ in range(k)])
+    x_batch = Array([_vector_with_special_values(rng, n) for _ in range(k)])
+    grad_w = Array([_vector_with_special_values(rng, n) for _ in range(m)])
+
+    new_grad_w, _ = layer_accumulate_gradient_batch(delta_batch, x_batch, grad_w, Array.zeros(m))
+
+    expected_w = (grad_w + delta_batch.T @ x_batch).tolist()
+    assert [_bits(row) for row in new_grad_w.tolist()] == [_bits(row) for row in expected_w]
+
+
+def test_layer_accumulate_gradient_batch_matches_numpy():
+    rng = np.random.default_rng(11)
+    delta_batch, x_batch = rng.uniform(-3.0, 3.0, (32, 30)), rng.uniform(-3.0, 3.0, (32, 784))
+    grad_w, grad_b = rng.uniform(-3.0, 3.0, (30, 784)), rng.uniform(-3.0, 3.0, 30)
+    new_grad_w, new_grad_b = layer_accumulate_gradient_batch(
+        Array(delta_batch.tolist()), Array(x_batch.tolist()), Array(grad_w.tolist()), Array(grad_b.tolist())
+    )
+    assert np.array(new_grad_w.tolist()) == pytest.approx(grad_w + delta_batch.T @ x_batch)
+    assert np.array(new_grad_b.tolist()) == pytest.approx(grad_b + delta_batch.sum(axis=0))
+
+
+@pytest.mark.parametrize(
+    "delta_shape, x_shape, grad_w_shape",
+    [((4, 3), (5, 2), (3, 2)), (3, (4, 2), (3, 2)), ((4, 3), 2, (3, 2)), ((4, 3), (4, 2), (2, 3))],
+)
+def test_layer_accumulate_gradient_batch_rejects_mismatched_shapes(delta_shape, x_shape, grad_w_shape):
+    with pytest.raises(ValueError):
+        layer_accumulate_gradient_batch(
+            Array.zeros(delta_shape), Array.zeros(x_shape), Array.zeros(grad_w_shape), Array.zeros(3)
+        )
