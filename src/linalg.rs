@@ -40,9 +40,9 @@ pub(crate) fn matmul(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
             if n != rows {
                 return Err(shape_error(a.shape, b.shape));
             }
-            // out[0..cols] = sum_k a[k] * b[k*cols .. (k+1)*cols] - structurally identical to
-            // matmul_2d_row_range's own row-scaling accumulate (one output "row" instead of
-            // many), so it reuses axpy_row directly rather than a bespoke reduction: b's stride
+            // out[0..cols] = sum_k a[k] * b[k*cols .. (k+1)*cols] - the same FMA chain per
+            // output as tiled_row_range's (one output "row" instead of many), so each row of a
+            // matrix @ matrix product has these bits. It uses axpy_row rather than a bespoke reduction: b's stride
             // over k stays row-contiguous, and there's no per-output-element reduction to worry
             // about staying bit-identical across scalar/SIMD (unlike the matrix@vector case
             // above) - out accumulates sequentially over k regardless of which axpy_row path runs.
@@ -213,7 +213,9 @@ unsafe fn dot_product_avx2_fma(a: &[f64], b: &[f64]) -> f64 {
     dot_product_tail(a, b, i, combine_lanes(lanes))
 }
 
-/// Threaded row-splitting on top of the size-gated blocking below. Splits the output's row range across
+/// `tiled_row_range` below in blocks of rows sized so one block of `a` is about 16 KB (1-row
+/// blocks were 2-3x slower where `K` is in the hundreds, e.g. `(32, 512) @ (512, 5408)`), with
+/// threaded row-splitting on top. Splits the output's row range across
 /// `std::thread::scope` workers - safe without `'static` data (each worker borrows `a_data`/
 /// `b_data` read-only and writes into its own disjoint slice of `out`, via `split_at_mut`) - only
 /// once there's enough total work to plausibly amortize thread spawn overhead.
@@ -232,8 +234,10 @@ unsafe fn dot_product_avx2_fma(a: &[f64], b: &[f64]) -> f64 {
 /// once behind a `OnceLock` and read only when there's already enough work to justify the
 /// question.
 fn matmul_2d(a_data: &[f64], b_data: &[f64], out: &mut [f64], r1: usize, c1: usize, c2: usize) {
+    const A_BLOCK_BYTES: usize = 16 * 1024;
+    let rows_per_block = (A_BLOCK_BYTES / (c1 * std::mem::size_of::<f64>()).max(1)).max(1);
     for_each_row_range(out, r1, c2, r1 * c1 * c2, |chunk, row_start, row_end| {
-        matmul_2d_row_range(a_data, b_data, chunk, row_start, row_end, c1, c2);
+        tiled_row_range(a_data, b_data, chunk, row_start, row_end, c1, c2, rows_per_block);
     });
 }
 
@@ -310,13 +314,11 @@ pub(crate) fn matmul_nt(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
     Ok(RustArray::from_matrix(out, m, n))
 }
 
-/// `a @ b` for `a` (`M, K`) and a narrow `b` (`K, N`, `N` a few dozen at most), bit-identical to
-/// `matmul`'s matrix @ matrix case: every output is the same FMA chain, `k` increasing from 0.0,
-/// with `a[m, k]` as the multiplier, as `axpy_row` computes it. `matmul_2d_row_range` loads and
-/// stores the whole output row once per `k`, which dominates when the row is only a few
-/// `f64`s wide (conv forward's `cols @ W.T`, `N` = the output channel count, measured 2-3x
-/// slower). This keeps each output row's running sums in registers across all of `k` and stores
-/// them once. Threaded over `M` rows like `matmul_2d`, which doesn't change any output's value.
+/// `a @ b` for `a` (`M, K`) and a narrow `b` (`K, N`, `N` a few dozen at most), the conv ops'
+/// matmul: the same kernel and bits as `matmul`'s matrix @ matrix case, one row per block. Conv's
+/// `a` is tall (`cols`, `N * P` rows), and the conv shapes measured the same or slower with
+/// `matmul_2d`'s larger row blocks (the conv accumulate at 28x28, N = 512: 35-39 ms against
+/// 30-32 ms). Threaded over `M` rows like `matmul_2d`, which doesn't change any output's value.
 pub(crate) fn matmul_narrow(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
     let (Shape::Matrix(m, k), Shape::Matrix(b_k, n)) = (a.shape, b.shape) else {
         return Err(shape_error(a.shape, b.shape));
@@ -326,23 +328,43 @@ pub(crate) fn matmul_narrow(a: &RustArray, b: &RustArray) -> PyResult<RustArray>
     }
     let mut out = vec![0.0; m * n];
     for_each_row_range(&mut out, m, n, m * k * n, |chunk, row_start, row_end| {
-        narrow_row_range(&a.data, &b.data, chunk, row_start, row_end, k, n);
+        tiled_row_range(&a.data, &b.data, chunk, row_start, row_end, k, n, 1);
     });
     Ok(RustArray::from_matrix(out, m, n))
 }
 
-fn narrow_row_range(a_data: &[f64], b_data: &[f64], out_chunk: &mut [f64], row_start: usize, row_end: usize, k: usize, n: usize) {
+/// Output rows `[row_start, row_end)` of `a @ b` (`a` `M x K`, `b` `K x N`) into `out_chunk`
+/// (row `row_start` maps to `out_chunk[0..n]`). Every output is one FMA chain, `k` increasing
+/// from 0.0, with `a[m, k]` as the multiplier - `axpy_row`'s chain, so the vector @ matrix case
+/// gives each row's bits. The AVX2 path holds a tile of output columns in registers across all
+/// of `k` and stores it once. Accumulating a whole output row per `k` instead, as `axpy_row`
+/// does, loads and stores the row `K` times, which dominated both a narrow row (conv's `N` = 8,
+/// 2-3x slower) and a wide one (a 5408-wide row is 43 KB, past L1).
+///
+/// Blocked over rows: for each block of `rows_per_block` rows, each column tile runs over every
+/// row of the block, so the tile's `K x 16` panel of `b` is read from cache by all of them. The
+/// order of rows and tiles doesn't change any output's value.
+fn tiled_row_range(
+    a_data: &[f64],
+    b_data: &[f64],
+    out_chunk: &mut [f64],
+    row_start: usize,
+    row_end: usize,
+    k: usize,
+    n: usize,
+    rows_per_block: usize,
+) {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-            unsafe { narrow_row_range_avx2_fma(a_data, b_data, out_chunk, row_start, row_end, k, n) };
+            unsafe { tiled_row_range_avx2_fma(a_data, b_data, out_chunk, row_start, row_end, k, n, rows_per_block) };
             return;
         }
     }
-    narrow_row_range_scalar(a_data, b_data, out_chunk, row_start, row_end, k, n);
+    tiled_row_range_scalar(a_data, b_data, out_chunk, row_start, row_end, k, n);
 }
 
-fn narrow_row_range_scalar(a_data: &[f64], b_data: &[f64], out_chunk: &mut [f64], row_start: usize, row_end: usize, k: usize, n: usize) {
+fn tiled_row_range_scalar(a_data: &[f64], b_data: &[f64], out_chunk: &mut [f64], row_start: usize, row_end: usize, k: usize, n: usize) {
     for row in row_start..row_end {
         let a_row = &a_data[row * k..(row + 1) * k];
         let out_row = &mut out_chunk[(row - row_start) * n..(row - row_start + 1) * n];
@@ -356,126 +378,77 @@ fn narrow_row_range_scalar(a_data: &[f64], b_data: &[f64], out_chunk: &mut [f64]
     }
 }
 
-/// AVX2+FMA path: output columns in blocks of 16 (four 4-lane accumulators), then 4, then a
-/// scalar tail, each block running all of `k` before it is stored. Lane `j`'s accumulator is
-/// exactly `narrow_row_range_scalar`'s `sum` for that column. Safety: only called after
-/// `narrow_row_range`'s runtime feature check; every pointer offset stays inside `a_row`, `b`'s
-/// `k x n` data, or `out_row`.
+/// AVX2+FMA path: output columns in tiles of 16 (four 4-lane accumulators), then 4, then a
+/// scalar tail, each tile running all of `k` before it is stored. Lane `j`'s accumulator is
+/// exactly `tiled_row_range_scalar`'s `sum` for that column. Safety: only called after
+/// `tiled_row_range`'s runtime feature check; every pointer offset stays inside `a`'s rows
+/// `row_start..row_end`, `b`'s `k x n` data, or `out_chunk`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn narrow_row_range_avx2_fma(a_data: &[f64], b_data: &[f64], out_chunk: &mut [f64], row_start: usize, row_end: usize, k: usize, n: usize) {
-    use std::arch::x86_64::{_mm256_fmadd_pd, _mm256_loadu_pd, _mm256_set1_pd, _mm256_setzero_pd, _mm256_storeu_pd};
-
-    let b_ptr = b_data.as_ptr();
-    for row in row_start..row_end {
-        let a_row = &a_data[row * k..(row + 1) * k];
-        let out_row = &mut out_chunk[(row - row_start) * n..(row - row_start + 1) * n];
-        let out_ptr = out_row.as_mut_ptr();
-        let mut col = 0;
-        while col + 16 <= n {
-            let (mut acc0, mut acc1, mut acc2, mut acc3) =
-                (_mm256_setzero_pd(), _mm256_setzero_pd(), _mm256_setzero_pd(), _mm256_setzero_pd());
-            for (kk, &a_value) in a_row.iter().enumerate() {
-                let a_vec = _mm256_set1_pd(a_value);
-                let b_row = b_ptr.add(kk * n + col);
-                acc0 = _mm256_fmadd_pd(a_vec, _mm256_loadu_pd(b_row), acc0);
-                acc1 = _mm256_fmadd_pd(a_vec, _mm256_loadu_pd(b_row.add(4)), acc1);
-                acc2 = _mm256_fmadd_pd(a_vec, _mm256_loadu_pd(b_row.add(8)), acc2);
-                acc3 = _mm256_fmadd_pd(a_vec, _mm256_loadu_pd(b_row.add(12)), acc3);
-            }
-            _mm256_storeu_pd(out_ptr.add(col), acc0);
-            _mm256_storeu_pd(out_ptr.add(col + 4), acc1);
-            _mm256_storeu_pd(out_ptr.add(col + 8), acc2);
-            _mm256_storeu_pd(out_ptr.add(col + 12), acc3);
-            col += 16;
-        }
-        while col + 4 <= n {
-            let mut acc = _mm256_setzero_pd();
-            for (kk, &a_value) in a_row.iter().enumerate() {
-                acc = _mm256_fmadd_pd(_mm256_set1_pd(a_value), _mm256_loadu_pd(b_ptr.add(kk * n + col)), acc);
-            }
-            _mm256_storeu_pd(out_ptr.add(col), acc);
-            col += 4;
-        }
-        while col < n {
-            let mut sum = 0.0f64;
-            for (kk, &a_value) in a_row.iter().enumerate() {
-                sum = a_value.mul_add(*b_ptr.add(kk * n + col), sum);
-            }
-            *out_ptr.add(col) = sum;
-            col += 1;
-        }
-    }
-}
-
-/// Computes output rows `[row_start, row_end)` into `out_chunk` (row `row_start` maps to
-/// `out_chunk[0..c2]`) - the single-threaded and per-thread code path share this, so blocking's
-/// own size-gating logic (below) is written once, not duplicated between them.
-///
-/// `row -> k -> col`, not `row -> col -> k`: accumulates into a whole output row at a
-/// time, reading both `a` and `b` row-contiguously.
-///
-/// Blocked over `row` and `k` when `b` is big enough for it to matter: without blocking, every
-/// output row re-streams the *entire* `b` matrix once (`k` ranges over all of `c1`), so if `b`
-/// doesn't fit in cache, `b` gets re-fetched from memory once per output row. Blocking caps how
-/// much of `b` needs to stay resident at once (one `K_BLOCK`-row slab) and reuses it across
-/// `ROW_BLOCK` output rows before moving on. Measured, not assumed: blocking unconditionally was
-/// a *regression* at this codebase's actual small layer sizes (e.g. `dimension=784, hidden=16` -
-/// `b` is only ~100KB, already cache-resident, so the extra block-boundary bookkeeping was pure
-/// overhead - 14% slower), but a genuine 1.3x-2.1x win once `b` exceeds a few hundred KB.
-/// `BLOCKING_THRESHOLD_BYTES` is set comfortably below a typical machine's L2 cache size, so
-/// blocking only engages once there's real cache pressure for it to relieve. Either path produces
-/// the same summation order per output row (k_block sweeps 0..c1 in increasing order, and k
-/// sweeps increasing within each block, same as the unblocked loop), so results are
-/// bit-identical, not just float64-close, regardless of which path runs.
-fn matmul_2d_row_range(
+unsafe fn tiled_row_range_avx2_fma(
     a_data: &[f64],
     b_data: &[f64],
     out_chunk: &mut [f64],
     row_start: usize,
     row_end: usize,
-    c1: usize,
-    c2: usize,
+    k: usize,
+    n: usize,
+    rows_per_block: usize,
 ) {
-    const ROW_BLOCK: usize = 64;
-    const K_BLOCK: usize = 64;
-    const BLOCKING_THRESHOLD_BYTES: usize = 256 * 1024;
-    let b_size_bytes = c1 * c2 * std::mem::size_of::<f64>();
+    use std::arch::x86_64::{_mm256_fmadd_pd, _mm256_loadu_pd, _mm256_set1_pd, _mm256_setzero_pd, _mm256_storeu_pd};
 
-    if b_size_bytes <= BLOCKING_THRESHOLD_BYTES {
-        for row in row_start..row_end {
-            let out_row = &mut out_chunk[(row - row_start) * c2..(row - row_start + 1) * c2];
-            for k in 0..c1 {
-                let a_value = a_data[row * c1 + k];
-                let b_row = &b_data[k * c2..(k + 1) * c2];
-                axpy_row(out_row, a_value, b_row);
-            }
-        }
-        return;
-    }
-
-    let mut row_block_start = row_start;
-    while row_block_start < row_end {
-        let row_block_end = (row_block_start + ROW_BLOCK).min(row_end);
-        let mut k_block_start = 0;
-        while k_block_start < c1 {
-            let k_block_end = (k_block_start + K_BLOCK).min(c1);
-            for row in row_block_start..row_block_end {
-                let out_row = &mut out_chunk[(row - row_start) * c2..(row - row_start + 1) * c2];
-                for k in k_block_start..k_block_end {
-                    let a_value = a_data[row * c1 + k];
-                    let b_row = &b_data[k * c2..(k + 1) * c2];
-                    axpy_row(out_row, a_value, b_row);
+    let b_ptr = b_data.as_ptr();
+    let out_ptr = out_chunk.as_mut_ptr();
+    let mut block_start = row_start;
+    while block_start < row_end {
+        let block_end = (block_start + rows_per_block).min(row_end);
+        let mut col = 0;
+        while col + 16 <= n {
+            for row in block_start..block_end {
+                let (mut acc0, mut acc1, mut acc2, mut acc3) =
+                    (_mm256_setzero_pd(), _mm256_setzero_pd(), _mm256_setzero_pd(), _mm256_setzero_pd());
+                for (kk, &a_value) in a_data[row * k..(row + 1) * k].iter().enumerate() {
+                    let a_vec = _mm256_set1_pd(a_value);
+                    let b_row = b_ptr.add(kk * n + col);
+                    acc0 = _mm256_fmadd_pd(a_vec, _mm256_loadu_pd(b_row), acc0);
+                    acc1 = _mm256_fmadd_pd(a_vec, _mm256_loadu_pd(b_row.add(4)), acc1);
+                    acc2 = _mm256_fmadd_pd(a_vec, _mm256_loadu_pd(b_row.add(8)), acc2);
+                    acc3 = _mm256_fmadd_pd(a_vec, _mm256_loadu_pd(b_row.add(12)), acc3);
                 }
+                let out = out_ptr.add((row - row_start) * n + col);
+                _mm256_storeu_pd(out, acc0);
+                _mm256_storeu_pd(out.add(4), acc1);
+                _mm256_storeu_pd(out.add(8), acc2);
+                _mm256_storeu_pd(out.add(12), acc3);
             }
-            k_block_start = k_block_end;
+            col += 16;
         }
-        row_block_start = row_block_end;
+        while col + 4 <= n {
+            for row in block_start..block_end {
+                let mut acc = _mm256_setzero_pd();
+                for (kk, &a_value) in a_data[row * k..(row + 1) * k].iter().enumerate() {
+                    acc = _mm256_fmadd_pd(_mm256_set1_pd(a_value), _mm256_loadu_pd(b_ptr.add(kk * n + col)), acc);
+                }
+                _mm256_storeu_pd(out_ptr.add((row - row_start) * n + col), acc);
+            }
+            col += 4;
+        }
+        while col < n {
+            for row in block_start..block_end {
+                let mut sum = 0.0f64;
+                for (kk, &a_value) in a_data[row * k..(row + 1) * k].iter().enumerate() {
+                    sum = a_value.mul_add(*b_ptr.add(kk * n + col), sum);
+                }
+                *out_ptr.add((row - row_start) * n + col) = sum;
+            }
+            col += 1;
+        }
+        block_start = block_end;
     }
 }
 
-/// `out_row[i] = a_value * b_row[i] + out_row[i]` for every `i`, the single accumulate step
-/// shared by the blocked and unblocked loops above (and, transitively, by every thread). Fused
+/// `out_row[i] = a_value * b_row[i] + out_row[i]` for every `i`, the vector @ matrix case's
+/// accumulate step, and the FMA chain `tiled_row_range` computes per output. Fused
 /// multiply-add (one rounding, not two) on *every* path - scalar fallback and AVX2 alike - via
 /// `f64::mul_add`/`_mm256_fmadd_pd`, so this call produces the same bits whether or not the
 /// running machine has AVX2, matching the bit-identical invariant this file's blocking/threading

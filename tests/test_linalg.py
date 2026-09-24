@@ -310,3 +310,63 @@ def test_forward_batch_rows_are_the_grouped_dot_product_exactly(m, k):
     X = rng.uniform(-1.0, 1.0, size=(3, k)).tolist()
     expected = [[max(_grouped_dot(row, x), 0.0) for row in W] for x in X]
     assert layer_relu_forward_batch(Array(W), Array(X), Array([0.0] * m)).tolist() == expected
+
+
+def _fma_chain(a_row, b, col):
+    """matmul's matrix @ matrix output [row, col]: an FMA chain over k increasing from 0.0."""
+    total = 0.0
+    for k, a_value in enumerate(a_row):
+        total = _fma(a_value, b[k][col], total)
+    return total
+
+
+# widths hit each of the kernel's column paths: 16-wide tiles, 4-wide tiles, the scalar tail, and
+# mixes of them
+TILE_WIDTHS = (1, 3, 4, 5, 15, 16, 17, 20, 21, 35)
+
+
+@pytest.mark.parametrize("m, k, n", [(m, k, n) for m in (1, 3) for k in (1, 2, 7) for n in TILE_WIDTHS])
+def test_matrix_at_matrix_is_the_fma_chain_exactly(m, k, n):
+    rng = np.random.default_rng(m * 10000 + k * 100 + n)
+    A = rng.uniform(-1.0, 1.0, size=(m, k))
+    A[rng.random(A.shape) < 0.2] = 0.0
+    B = rng.uniform(-1.0, 1.0, size=(k, n)).tolist()
+    expected = [[_fma_chain(a_row, B, col) for col in range(n)] for a_row in A.tolist()]
+    assert (Array(A.tolist()) @ Array(B)).tolist() == expected
+
+
+# (m, k, n) at the sizes the kernel's blocking and threading switch on: the dense layers' batch
+# downstream and accumulate (5408 and 784 wide), over the 4M-flop threading threshold, K large
+# enough that a 16 KB row block is a few rows or less than one row, and a tall narrow product
+BIG_SHAPES = [
+    (8, 32, 5408),
+    (32, 32, 5408),
+    (32, 128, 5408),
+    (30, 512, 784),
+    (512, 30, 784),
+    (10, 512, 784),
+    (5, 3000, 21),
+    (300, 9, 35),
+    (64, 64, 600),
+]
+
+
+@pytest.mark.parametrize("m, k, n", BIG_SHAPES)
+def test_matrix_at_matrix_rows_are_the_vector_at_matrix_product_exactly(m, k, n):
+    # the vector @ matrix case computes the same FMA chain through axpy_row, a separate code path,
+    # so every row of the product must equal it bit for bit
+    rng = np.random.default_rng(m * 10000 + k + n)
+    A = rng.uniform(-1.0, 1.0, size=(m, k))
+    A[rng.random(A.shape) < 0.1] = 0.0
+    B = Array(rng.uniform(-1.0, 1.0, size=(k, n)).tolist())
+    expected = [(Array(a_row) @ B).tolist() for a_row in A.tolist()]
+    assert (Array(A.tolist()) @ B).tolist() == expected
+
+
+@pytest.mark.parametrize("k, n", [(1, 1), (2, 3), (7, 21)])
+def test_vector_at_matrix_is_the_fma_chain_exactly(k, n):
+    # pins the reference the test above compares against
+    rng = np.random.default_rng(k * 100 + n)
+    a = rng.uniform(-1.0, 1.0, size=k).tolist()
+    B = rng.uniform(-1.0, 1.0, size=(k, n)).tolist()
+    assert (Array(a) @ Array(B)).tolist() == [_fma_chain(a, B, col) for col in range(n)]
