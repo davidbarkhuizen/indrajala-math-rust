@@ -5,6 +5,7 @@ hand-written pure-Python reference loop matching BackpropNode's own per-node sum
 strictly stronger check than a two-way Rust-vs-numpy comparison alone.
 """
 
+import os
 import random
 import struct
 from fractions import Fraction
@@ -22,6 +23,7 @@ from indrajala_math_rust import (
     layer_apply_accumulated_gradient,
     layer_relu_forward_batch,
     layer_sgd_step,
+    matmul_threads_for,
     outer,
     set_matmul_threading,
     sum_axis0,
@@ -450,3 +452,39 @@ def test_thread_count_cannot_change_conv_bits(reset_matmul_threading, shape, n):
     unthreaded, threaded = _under_each_thread_count(compute)
     for threads, result in threaded.items():
         assert result == unthreaded, threads
+
+
+# the products the demos thread or used to, (m, k, n): the MNIST conv mini-batch 32's dense tail
+# (5.5M flops), dense MNIST 784 -> 30 at batch 512 (12M), MNIST conv accumulate at N = 512 (8
+# rows, 24.9M) and the conv mini-batch 512's dense tail (88.6M)
+CONV_TAIL_BATCH_32 = (32, 32, 5408)
+DENSE_BATCH_512 = (512, 784, 30)
+CONV_ACCUMULATE_512 = (8, 512 * 676, 9)
+CONV_TAIL_BATCH_512 = (32, 512, 5408)
+
+
+def test_policy_runs_the_conv_mini_batch_32_tail_on_one_thread(reset_matmul_threading):
+    # threading it made the MNIST conv mini-batch 32 epoch 11% slower (stage 0 of the workplan)
+    set_matmul_threading(0, 0)
+    assert matmul_threads_for(*CONV_TAIL_BATCH_32) == 1
+    assert matmul_threads_for(32, 5408, 32) == 1  # its forward, (32, 5408) @ W.T
+
+
+def test_policy_threads_the_batch_512_products_all_or_nothing(reset_matmul_threading):
+    # they gained end to end (or came out even); no 2- or 4-thread middle ground
+    # (the count itself is the machine's parallelism, capped at 8)
+    set_matmul_threading(0, 0)
+    counts = {shape: matmul_threads_for(*shape) for shape in (DENSE_BATCH_512, CONV_ACCUMULATE_512, CONV_TAIL_BATCH_512)}
+    assert len(set(counts.values())) == 1, counts
+    assert 1 <= counts[CONV_TAIL_BATCH_512] <= 8
+    if len(os.sched_getaffinity(0)) >= 2:
+        assert counts[CONV_TAIL_BATCH_512] >= 2
+
+
+def test_policy_override_and_row_cap(reset_matmul_threading):
+    set_matmul_threading(3, 1)
+    assert matmul_threads_for(*CONV_TAIL_BATCH_32) == 3
+    set_matmul_threading(8, 1)
+    assert matmul_threads_for(5, 3000, 21) == 5
+    set_matmul_threading(*UNTHREADED)
+    assert matmul_threads_for(*CONV_TAIL_BATCH_512) == 1
