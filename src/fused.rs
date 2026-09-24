@@ -2,7 +2,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::array::{RustArray, Shape};
-use crate::linalg::{matmul, matmul_nt};
+use crate::linalg::{matmul, matmul_add, matmul_nt};
 use crate::ops::same_shape_elementwise;
 use crate::random::draw_bernoulli_mask;
 use crate::ufuncs::{array_softmax, sum_axis0};
@@ -227,8 +227,8 @@ pub fn layer_accumulate_gradient_batch(
     grad_w: &RustArray,
     grad_b: &RustArray,
 ) -> PyResult<(RustArray, RustArray)> {
-    let grad_w_update = matmul(&delta_batch.transpose(), input_activation_batch)?;
-    let new_grad_w = grad_w.combine_with_array(&grad_w_update, |g, u| g + u, "add")?;
+    // grad_w + delta_batch.T @ X in the product's own store, bit-identical to the separate add
+    let new_grad_w = matmul_add(grad_w, &delta_batch.transpose(), input_activation_batch)?;
     let grad_b_update = sum_axis0(delta_batch)?;
     let new_grad_b = grad_b.combine_with_array(&grad_b_update, |g, u| g + u, "add")?;
     Ok((new_grad_w, new_grad_b))
