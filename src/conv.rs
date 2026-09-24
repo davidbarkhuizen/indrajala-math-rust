@@ -316,38 +316,88 @@ pub fn conv_accumulate_gradient_batch(
 /// vectors when `X` is one. `argmax`
 /// holds each window's winning slot, numbered row-major `(pr, pc)`, as an `f64`: the values are
 /// small exact integers, and it avoids a separate integer array type. The scan uses strict `>`,
-/// so the first maximal slot wins, as with `np.argmax` and `PoolUnit`.
+/// so the first maximal slot wins, as with `np.argmax` and `PoolUnit`. Both kernels scan in that
+/// order; 2x2 windows at stride 2 take a fixed-size one, which runs in about a third of the time.
 #[pyfunction]
 pub fn max_pool_forward_batch(x: &RustArray, geometry: &ConvGeometry) -> PyResult<(RustArray, RustArray)> {
     let g = geometry;
     let (n, is_vector) = require_batch(x, g.input_size, "max_pool_forward_batch X")?;
-    let k = g.kernel_size;
     let size = g.input_channels * g.positions;
+    let plane = g.input_height * g.input_width;
+    let pool_plane = if g.kernel_size == 2 && g.stride == 2 { max_pool_plane_2x2 } else { max_pool_plane };
 
     let mut a = vec![0.0; n * size];
     let mut argmax = vec![0.0; n * size];
-    for example in 0..n {
-        let input = &x.data[example * g.input_size..(example + 1) * g.input_size];
-        for c in 0..g.input_channels {
-            for out_row in 0..g.out_height {
-                for out_col in 0..g.out_width {
-                    let mut best_slot = 0;
-                    let mut best_value = input[g.input_index(c, out_row, out_col, 0, 0)];
-                    for slot in 1..k * k {
-                        let value = input[g.input_index(c, out_row, out_col, slot / k, slot % k)];
-                        if value > best_value {
-                            best_value = value;
-                            best_slot = slot;
-                        }
-                    }
-                    let out = example * size + c * g.positions + out_row * g.out_width + out_col;
-                    a[out] = best_value;
-                    argmax[out] = best_slot as f64;
-                }
-            }
-        }
+    // X's rows are whole examples and each is C planes, so its planes line up with the outputs'
+    for ((channel, a_plane), argmax_plane) in x
+        .data
+        .chunks_exact(plane)
+        .zip(a.chunks_exact_mut(g.positions))
+        .zip(argmax.chunks_exact_mut(g.positions))
+    {
+        pool_plane(channel, g, a_plane, argmax_plane);
     }
     Ok((batch_output(a, n, size, is_vector), batch_output(argmax, n, size, is_vector)))
+}
+
+/// One channel plane of `max_pool_forward_batch`, any window and stride. It walks each window's
+/// rows as slices, counting the slot alongside, so no slot costs a division or a full index.
+fn max_pool_plane(channel: &[f64], g: &ConvGeometry, a: &mut [f64], argmax: &mut [f64]) {
+    let (k, s, w) = (g.kernel_size, g.stride, g.input_width);
+    let mut out = 0;
+    for out_row in 0..g.out_height {
+        let rows = &channel[out_row * s * w..(out_row * s + k - 1) * w + w];
+        for out_col in 0..g.out_width {
+            let col0 = out_col * s;
+            let mut best_value = rows[col0];
+            let mut best_slot = 0;
+            let mut slot = 0;
+            for kr in 0..k {
+                for &value in &rows[kr * w + col0..kr * w + col0 + k] {
+                    if value > best_value {
+                        best_value = value;
+                        best_slot = slot;
+                    }
+                    slot += 1;
+                }
+            }
+            a[out] = best_value;
+            argmax[out] = best_slot as f64;
+            out += 1;
+        }
+    }
+}
+
+/// `max_pool_plane` for 2x2 windows at stride 2: the same scan with the window unrolled.
+fn max_pool_plane_2x2(channel: &[f64], g: &ConvGeometry, a: &mut [f64], argmax: &mut [f64]) {
+    let w = g.input_width;
+    for (out_row, (a_row, argmax_row)) in a
+        .chunks_exact_mut(g.out_width)
+        .zip(argmax.chunks_exact_mut(g.out_width))
+        .enumerate()
+    {
+        let top = &channel[2 * out_row * w..][..w];
+        let bottom = &channel[(2 * out_row + 1) * w..][..w];
+        for out_col in 0..g.out_width {
+            let (v0, v1) = (top[2 * out_col], top[2 * out_col + 1]);
+            let (v2, v3) = (bottom[2 * out_col], bottom[2 * out_col + 1]);
+            let (mut best, mut slot) = (v0, 0.0);
+            if v1 > best {
+                best = v1;
+                slot = 1.0;
+            }
+            if v2 > best {
+                best = v2;
+                slot = 2.0;
+            }
+            if v3 > best {
+                best = v3;
+                slot = 3.0;
+            }
+            a_row[out_col] = best;
+            argmax_row[out_col] = slot;
+        }
+    }
 }
 
 /// `MaxPoolArrayLayer._downstream`: each window's delta goes to its winning input by scatter-add,
