@@ -119,6 +119,23 @@ def test_signed_zero_ties_keep_the_first_slot_and_its_sign(shape):
     np.testing.assert_array_equal(_np(argmax), expected_argmax)
 
 
+@pytest.mark.parametrize("shape", [shape for shape in SHAPES if shape[4] >= shape[3]])
+def test_without_overlap_dX_has_the_reference_bits_signed_zeros_included(shape):
+    # without overlap each input receives at most one delta, stored in one pass; the reference
+    # adds it into a zeroed dX, so a -0.0 delta must come out +0.0 (0.0 + -0.0), not -0.0
+    rng = np.random.default_rng(7)
+    g = _geometry(shape)
+    X = _inputs(rng, shape, tie_heavy=True)
+    delta = rng.choice([-0.0, 0.0, -0.25, 0.5, 1e-300], size=(BATCH_SIZE, shape[2] * g.positions))
+    _, argmax = max_pool_forward_batch(Array(X.tolist()), g)
+    _, expected_argmax, expected_dX = _reference(X, delta, shape)
+    np.testing.assert_array_equal(_np(argmax), expected_argmax)
+
+    dX = max_pool_downstream_batch(Array(delta.tolist()), argmax, g)
+    assert np.signbit(delta).any() and not np.signbit(expected_dX[expected_dX == 0.0]).any()
+    np.testing.assert_array_equal(_np(dX).view(np.int64), expected_dX.view(np.int64))
+
+
 def test_ties_resolve_to_the_first_slot():
     g = ConvGeometry(2, 4, 1, 2, 2)  # two 2x2 windows side by side
     # left window all zero; right window a partial tie between slots 1 and 2 (row-major)
@@ -158,6 +175,11 @@ def test_max_pool_ops_reject_mismatched_shapes_and_bad_argmax():
         max_pool_downstream_batch(Array.zeros((2, 5)), Array.zeros((2, 5)), g)
     with pytest.raises(ValueError):
         max_pool_downstream_batch(Array.zeros((2, 4)), Array.zeros((3, 4)), g)
-    for bad in (4.0, -1.0, 0.5):
-        with pytest.raises(ValueError):
-            max_pool_downstream_batch(Array.zeros((1, 4)), Array([[0.0, 0.0, 0.0, bad]]), g)
+    # the one-pass kernel (stride >= pool) checks as it goes, the overlapping one before it starts;
+    # both reject a bad entry wherever it is, including in a later example
+    overlapping = ConvGeometry(3, 3, 1, 2, 1)  # 4 windows too
+    for geometry in (g, overlapping):
+        for bad in (4.0, -1.0, 0.5, float("nan"), float("inf"), -float("inf")):
+            for argmax in ([[0.0, 0.0, 0.0, bad]], [[0.0, 3.0, 1.0, 2.0], [bad, 0.0, 0.0, 0.0]]):
+                with pytest.raises(ValueError, match="slot indices in 0..4"):
+                    max_pool_downstream_batch(Array.zeros((len(argmax), 4)), Array(argmax), geometry)
