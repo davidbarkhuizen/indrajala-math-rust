@@ -219,10 +219,7 @@ unsafe fn dot_product_avx2_fma(a: &[f64], b: &[f64]) -> f64 {
 /// threaded row-splitting on top. Splits the output's row range across
 /// `std::thread::scope` workers - safe without `'static` data (each worker borrows `a_data`/
 /// `b_data` read-only and writes into its own disjoint slice of `out`, via `split_at_mut`) - only
-/// once there's enough total work to plausibly amortize thread spawn overhead.
-/// `THREADING_THRESHOLD_FLOPS` is a coarse, deliberately conservative floor (a fraction of a
-/// millisecond's worth of naive-loop work), not a tuned constant - measured directly against this
-/// codebase's own matmul shapes before being trusted. Splitting by
+/// once there's enough total work to pay for it (`matmul_thread_count`). Splitting by
 /// row (not by `k` or `col`) needs no cross-thread reduction: each worker owns complete output
 /// rows end to end, so results are bit-identical to the single-threaded path regardless of thread
 /// count or scheduling - summation order per output row is unaffected by which thread computes it.
@@ -256,38 +253,55 @@ pub(crate) fn set_matmul_threading(max_threads: usize, threshold_flops: usize) {
     THRESHOLD_FLOPS_OVERRIDE.store(threshold_flops, Ordering::Relaxed);
 }
 
-/// The threading decision `matmul_2d`'s doc comment above describes, shared with `matmul_nt`:
-/// calls `compute(chunk, row_start, row_end)` once on the whole `rows x cols` output, or once per
-/// thread on disjoint row ranges once `total_flops` clears the threshold. Each call owns
-/// complete output rows, so the split can't change any output's value.
-fn for_each_row_range<F>(out: &mut [f64], rows: usize, cols: usize, total_flops: usize, compute: F)
-where
-    F: Fn(&mut [f64], usize, usize) + Sync,
-{
-    const THREADING_THRESHOLD_FLOPS: usize = 4_000_000;
+/// How many threads `for_each_row_range` uses for a `rows`-row product of `total_flops`: 1 below
+/// the threshold, otherwise `min(available_parallelism, 8, rows)`, all or nothing. Measured on
+/// this laptop (4 cores / 8 threads), not portable:
+///
+/// - 8M is where 8 threads start to beat 1 for `matmul_2d` and `matmul_nt` in isolation. The
+///   old 4M threaded the MNIST conv mini-batch 32's dense tail (`32 x 5408`, 5.5M flops), which
+///   made that epoch 11% slower: in training the other cores idle between calls, so every
+///   threaded call starts on cold, clocked-down cores.
+/// - Every product at or above 8M in the demos gained end to end at batch 512 (conv's 24.9M
+///   ops and the 88.6M dense tail), or came out even (dense MNIST's 12M).
+/// - No 2 or 4 threads: 2 never beat 1 up to 64M, and 4 only marginally beat 1 where 8 beat both.
+///
+/// No rows-per-thread floor either: products with few output rows and a long `k` gain the most
+/// (conv's accumulate, 8 rows, halves on 8 threads at N = 512). With a floor of 32 rows per
+/// thread, the MNIST conv mini-batch 512 epoch took 1.03-1.12 s against 0.84-0.88.
+fn matmul_thread_count(rows: usize, total_flops: usize) -> usize {
+    const THREADING_THRESHOLD_FLOPS: usize = 8_000_000;
     const MAX_THREADS: usize = 8;
-    // No rows-per-thread floor is applied here (e.g. requiring >=32 rows/thread): although an
-    // isolated microbenchmark of one small-`r1` shape (`(10,512)@(512,784)`) shows unrestricted
-    // threading as a slight regression there, measured against the actual target metric (a full
-    // mini-batch training step, not one matmul in isolation), adding such a floor makes the real
-    // number *worse* (batch_size=512's ratio goes from a 0.98x-1.25x range to 1.24x-1.79x),
-    // reproducibly across multiple runs - the isolated shape's regression does not generalize to
-    // the composite workload it's actually part of.
 
     let threshold = match THRESHOLD_FLOPS_OVERRIDE.load(Ordering::Relaxed) {
         0 => THREADING_THRESHOLD_FLOPS,
         overridden => overridden,
     };
     if total_flops < threshold {
-        compute(out, 0, rows);
-        return;
+        return 1;
     }
-
     let max_threads = match MAX_THREADS_OVERRIDE.load(Ordering::Relaxed) {
         0 => available_parallelism_cached().min(MAX_THREADS),
         overridden => overridden,
     };
-    let thread_count = max_threads.min(rows);
+    max_threads.min(rows).max(1)
+}
+
+/// Test hook: the thread count the threaded matmuls would use for an `m x k @ k x n` product,
+/// under the current policy and override, so a policy change shows up as a test failure.
+#[pyfunction]
+pub(crate) fn matmul_threads_for(m: usize, k: usize, n: usize) -> usize {
+    matmul_thread_count(m, m * k * n)
+}
+
+/// The threading decision `matmul_thread_count` makes, shared by `matmul_2d`, `matmul_nt` and
+/// `matmul_narrow`: calls `compute(chunk, row_start, row_end)` once on the whole `rows x cols`
+/// output, or once per thread on disjoint row ranges. Each call owns complete output rows, so
+/// the split can't change any output's value.
+fn for_each_row_range<F>(out: &mut [f64], rows: usize, cols: usize, total_flops: usize, compute: F)
+where
+    F: Fn(&mut [f64], usize, usize) + Sync,
+{
+    let thread_count = matmul_thread_count(rows, total_flops);
     if thread_count <= 1 {
         compute(out, 0, rows);
         return;
