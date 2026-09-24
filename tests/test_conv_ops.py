@@ -165,7 +165,8 @@ def test_conv_forward_batch_matches_the_brute_force_definition(shape):
 # runs one example at a time on one thread: output channel counts that hit each of its paths
 # (16-wide blocks, 4-wide blocks, the scalar tail, and mixes), a 28x28 input at N = 256, fan_in
 # 800 x 48 channels (many 16-wide blocks), and 13x13x8 x 32 at N = 32. The last two batch sizes
-# are over the threading threshold for a whole-batch product, the forward's before candidate 4
+# are over the threading threshold for a whole-batch product, as the forward's was when it
+# ran over the whole batch
 FORWARD_EXTRA_CASES = [
     ((6, 6, 1, 3, 1, 1), 2),
     ((6, 6, 2, 3, 5, 1), 2),
