@@ -86,7 +86,7 @@ pub fn layer_output_delta(a: &RustArray, reference: &RustArray) -> PyResult<Rust
 ///
 /// Computed as `delta @ W`, the same product, so `W` is read row by row and never copied into a
 /// transpose (the copy was most of the call: 273 of 327 µs at 32 x 5408). It sums sequentially
-/// over `W`'s rows through `axpy_row`, not with `dot_product`'s 4-lane grouping, so the result
+/// over `W`'s rows (`matmul`'s tiled kernel, as a one-row product), not with `dot_product`'s 4-lane grouping, so the result
 /// differs from `W.T @ delta` by a few ULPs, but is still the same on the scalar and AVX2 paths.
 #[pyfunction]
 pub fn layer_downstream(w: &RustArray, delta: &RustArray) -> PyResult<RustArray> {

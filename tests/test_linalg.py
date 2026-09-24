@@ -379,8 +379,8 @@ BIG_SHAPES = [
 
 @pytest.mark.parametrize("m, k, n", BIG_SHAPES)
 def test_matrix_at_matrix_rows_are_the_vector_at_matrix_product_exactly(m, k, n):
-    # the vector @ matrix case computes the same FMA chain through axpy_row, a separate code path,
-    # so every row of the product must equal it bit for bit
+    # the vector @ matrix case runs the same kernel as a one-row product, so every row of a
+    # blocked, threaded product must equal it bit for bit
     rng = np.random.default_rng(m * 10000 + k + n)
     A = rng.uniform(-1.0, 1.0, size=(m, k))
     A[rng.random(A.shape) < 0.1] = 0.0
@@ -389,13 +389,28 @@ def test_matrix_at_matrix_rows_are_the_vector_at_matrix_product_exactly(m, k, n)
     assert (Array(A.tolist()) @ B).tolist() == expected
 
 
-@pytest.mark.parametrize("k, n", [(1, 1), (2, 3), (7, 21)])
+def _fma_chain_row(a, B):
+    """_fma_chain for every column of a vector @ matrix product, one pass over B's rows."""
+    out = [0.0] * len(B[0])
+    for a_value, b_row in zip(a, B):
+        out = [_fma(a_value, b_value, total) for b_value, total in zip(b_row, out)]
+    return out
+
+
+# every column path at a few k, and the dense layers' single-example downstream shapes (the conv
+# tail's 32 x 5408, 30 x 784, dense MNIST's 10 x 30), which the tests above only compare with the
+# matrix @ matrix case, the same kernel
+@pytest.mark.parametrize(
+    "k, n", [(k, n) for k in (1, 2, 7) for n in TILE_WIDTHS] + [(32, 5408), (30, 784), (10, 30)]
+)
 def test_vector_at_matrix_is_the_fma_chain_exactly(k, n):
     # pins the reference the test above compares against
     rng = np.random.default_rng(k * 100 + n)
-    a = rng.uniform(-1.0, 1.0, size=k).tolist()
+    a = rng.uniform(-1.0, 1.0, size=k)
+    a[rng.random(k) < 0.1] = 0.0
+    a = a.tolist()
     B = rng.uniform(-1.0, 1.0, size=(k, n)).tolist()
-    assert (Array(a) @ Array(B)).tolist() == [_fma_chain(a, B, col) for col in range(n)]
+    assert (Array(a) @ Array(B)).tolist() == _fma_chain_row(a, B)
 
 
 # thread counts that give even and uneven row blocks, and more threads than rows at (5, 3000, 21)
