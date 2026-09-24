@@ -41,16 +41,12 @@ pub(crate) fn matmul(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
             if n != rows {
                 return Err(shape_error(a.shape, b.shape));
             }
-            // out[0..cols] = sum_k a[k] * b[k*cols .. (k+1)*cols] - the same FMA chain per
-            // output as tiled_row_range's (one output "row" instead of many), so each row of a
-            // matrix @ matrix product has these bits. It uses axpy_row rather than a bespoke reduction: b's stride
-            // over k stays row-contiguous, and there's no per-output-element reduction to worry
-            // about staying bit-identical across scalar/SIMD (unlike the matrix@vector case
-            // above) - out accumulates sequentially over k regardless of which axpy_row path runs.
+            // a one-row matrix @ matrix product: the same kernel and FMA chain per output, so
+            // each row of a matrix @ matrix product has these bits. Accumulating the whole output
+            // row per k instead (one load/FMA/store pass over it per row of b) took 43-52 us at
+            // 32 x 5408, where the tiled kernel's registers took 21-22.
             let mut out = vec![0.0; cols];
-            for k in 0..rows {
-                axpy_row(&mut out, a.data[k], &b.data[k * cols..(k + 1) * cols]);
-            }
+            tiled_row_range(&a.data, &b.data, &mut out, 0, 1, rows, cols, 1);
             Ok(RustArray::from_vector(out))
         }
         (Shape::Matrix(r1, c1), Shape::Matrix(r2, c2)) => {
@@ -66,8 +62,8 @@ pub(crate) fn matmul(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
 }
 
 /// `sum(a[i] * b[i] for i in 0..a.len())` - the matrix@vector case's per-row reduction. Unlike
-/// `axpy_row` (which vectorizes across the *output* dimension while keeping the reduction over
-/// `k` strictly sequential, so its result is bit-identical regardless of which path runs), a
+/// `tiled_row_range` (which vectorizes across the *output* dimension while keeping the reduction
+/// over `k` strictly sequential, so its result is bit-identical regardless of which path runs), a
 /// dot product's reduction dimension *is* the vectorized dimension - there is no way to sum 4
 /// lanes in parallel and then combine them into a single scalar that's also bit-identical to a
 /// naive left-to-right sequential sum (float64 addition isn't associative; a different grouping
@@ -194,7 +190,7 @@ fn dot_product_scalar(a: &[f64], b: &[f64]) -> f64 {
 /// lane `j`'s running sum is exactly `dot_product_scalar`'s `lanes[j]`, since a per-lane FMA and
 /// `f64::mul_add` compute the same IEEE-754 fused multiply-add. Safety: only ever called after
 /// `dot_product`'s runtime `is_x86_feature_detected!` check, same discipline as
-/// `axpy_row_avx2_fma` above.
+/// `tiled_row_range_avx2_fma` below.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot_product_avx2_fma(a: &[f64], b: &[f64]) -> f64 {
@@ -466,10 +462,10 @@ pub(crate) fn matmul_narrow(a: &RustArray, b: &RustArray) -> PyResult<RustArray>
 
 /// Output rows `[row_start, row_end)` of `a @ b` (`a` `M x K`, `b` `K x N`) into `out_chunk`
 /// (row `row_start` maps to `out_chunk[0..n]`). Every output is one FMA chain, `k` increasing
-/// from 0.0, with `a[m, k]` as the multiplier - `axpy_row`'s chain, so the vector @ matrix case
-/// gives each row's bits. The AVX2 path holds a tile of output columns in registers across all
-/// of `k` and stores it once. Accumulating a whole output row per `k` instead, as `axpy_row`
-/// does, loads and stores the row `K` times, which dominated both a narrow row (conv's `N` = 8,
+/// from 0.0, with `a[m, k]` as the multiplier; the vector @ matrix case is the one-row product.
+/// The AVX2 path holds a tile of output columns in registers across all of `k` and stores it
+/// once. Accumulating a whole output row per `k` instead, as the vector @ matrix case did before
+/// it came here, loads and stores the row `K` times, which dominated both a narrow row (conv's `N` = 8,
 /// 2-3x slower) and a wide one (a 5408-wide row is 43 KB, past L1).
 ///
 /// Blocked over rows: for each block of `rows_per_block` rows, each column tile runs over every
@@ -575,60 +571,6 @@ unsafe fn tiled_row_range_avx2_fma(
             col += 1;
         }
         block_start = block_end;
-    }
-}
-
-/// `out_row[i] = a_value * b_row[i] + out_row[i]` for every `i`, the vector @ matrix case's
-/// accumulate step, and the FMA chain `tiled_row_range` computes per output. Fused
-/// multiply-add (one rounding, not two) on *every* path - scalar fallback and AVX2 alike - via
-/// `f64::mul_add`/`_mm256_fmadd_pd`, so this call produces the same bits whether or not the
-/// running machine has AVX2, matching the bit-identical invariant this file's blocking/threading
-/// hold to. A plain `_mm256_mul_pd` + `_mm256_add_pd` pair would vectorize fine but round twice
-/// per element instead of once, silently reintroducing a bit-level divergence between this path
-/// and any non-AVX2 fallback - FMA is the only way to keep both the speed and the invariant.
-#[inline]
-fn axpy_row(out_row: &mut [f64], a_value: f64, b_row: &[f64]) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-            unsafe { axpy_row_avx2_fma(out_row, a_value, b_row) };
-            return;
-        }
-    }
-    axpy_row_scalar(out_row, a_value, b_row);
-}
-
-#[inline]
-fn axpy_row_scalar(out_row: &mut [f64], a_value: f64, b_row: &[f64]) {
-    for col in 0..out_row.len() {
-        out_row[col] = a_value.mul_add(b_row[col], out_row[col]);
-    }
-}
-
-/// AVX2+FMA path: 4 `f64` lanes per instruction. Safety: only ever called after
-/// `axpy_row`'s runtime `is_x86_feature_detected!` check confirms both features are present -
-/// `#[target_feature]` functions are unsafe to call directly because the compiler can't itself
-/// prove that precondition. Uses unaligned loads/stores (`out_row`/`b_row` are arbitrary slices
-/// into a larger buffer, not independently aligned) and a scalar `mul_add` tail for the
-/// `c2 % 4` remainder, so the result matches `axpy_row_scalar` bit for bit regardless of `c2`.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn axpy_row_avx2_fma(out_row: &mut [f64], a_value: f64, b_row: &[f64]) {
-    use std::arch::x86_64::{_mm256_fmadd_pd, _mm256_loadu_pd, _mm256_set1_pd, _mm256_storeu_pd};
-
-    let len = out_row.len();
-    let a_vec = _mm256_set1_pd(a_value);
-    let mut col = 0;
-    while col + 4 <= len {
-        let b_vec = _mm256_loadu_pd(b_row.as_ptr().add(col));
-        let acc_vec = _mm256_loadu_pd(out_row.as_ptr().add(col));
-        let result = _mm256_fmadd_pd(a_vec, b_vec, acc_vec);
-        _mm256_storeu_pd(out_row.as_mut_ptr().add(col), result);
-        col += 4;
-    }
-    while col < len {
-        out_row[col] = a_value.mul_add(b_row[col], out_row[col]);
-        col += 1;
     }
 }
 
