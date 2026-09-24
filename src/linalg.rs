@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 use pyo3::exceptions::PyValueError;
@@ -241,6 +242,20 @@ fn matmul_2d(a_data: &[f64], b_data: &[f64], out: &mut [f64], r1: usize, c1: usi
     });
 }
 
+static MAX_THREADS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
+static THRESHOLD_FLOPS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
+
+/// Test/benchmark hook: max threads (0 = default) and threshold in flops (0 = default) for every
+/// threaded matmul (`matmul_2d`, `matmul_nt`, `matmul_narrow`), process-wide until reset with
+/// `(0, 0)`. An overridden thread count isn't capped at the machine's parallelism, so a test can
+/// run 8 threads anywhere. Can't change any output's value; that is what the tests check. A
+/// function, not an env var, so one run can sweep settings.
+#[pyfunction]
+pub(crate) fn set_matmul_threading(max_threads: usize, threshold_flops: usize) {
+    MAX_THREADS_OVERRIDE.store(max_threads, Ordering::Relaxed);
+    THRESHOLD_FLOPS_OVERRIDE.store(threshold_flops, Ordering::Relaxed);
+}
+
 /// The threading decision `matmul_2d`'s doc comment above describes, shared with `matmul_nt`:
 /// calls `compute(chunk, row_start, row_end)` once on the whole `rows x cols` output, or once per
 /// thread on disjoint row ranges once `total_flops` clears the threshold. Each call owns
@@ -259,12 +274,20 @@ where
     // reproducibly across multiple runs - the isolated shape's regression does not generalize to
     // the composite workload it's actually part of.
 
-    if total_flops < THREADING_THRESHOLD_FLOPS {
+    let threshold = match THRESHOLD_FLOPS_OVERRIDE.load(Ordering::Relaxed) {
+        0 => THREADING_THRESHOLD_FLOPS,
+        overridden => overridden,
+    };
+    if total_flops < threshold {
         compute(out, 0, rows);
         return;
     }
 
-    let thread_count = available_parallelism_cached().min(MAX_THREADS).min(rows);
+    let max_threads = match MAX_THREADS_OVERRIDE.load(Ordering::Relaxed) {
+        0 => available_parallelism_cached().min(MAX_THREADS),
+        overridden => overridden,
+    };
+    let thread_count = max_threads.min(rows);
     if thread_count <= 1 {
         compute(out, 0, rows);
         return;

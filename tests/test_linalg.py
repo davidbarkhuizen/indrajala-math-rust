@@ -14,11 +14,16 @@ import pytest
 
 from indrajala_math_rust import (
     Array,
+    ConvGeometry,
+    conv_accumulate_gradient_batch,
+    conv_downstream_batch,
+    conv_forward_batch,
     layer_accumulate_gradient,
     layer_apply_accumulated_gradient,
     layer_relu_forward_batch,
     layer_sgd_step,
     outer,
+    set_matmul_threading,
     sum_axis0,
 )
 
@@ -370,3 +375,78 @@ def test_vector_at_matrix_is_the_fma_chain_exactly(k, n):
     a = rng.uniform(-1.0, 1.0, size=k).tolist()
     B = rng.uniform(-1.0, 1.0, size=(k, n)).tolist()
     assert (Array(a) @ Array(B)).tolist() == [_fma_chain(a, B, col) for col in range(n)]
+
+
+# thread counts that give even and uneven row blocks, and more threads than rows at (5, 3000, 21)
+THREAD_COUNTS = [2, 3, 5, 8]
+UNTHREADED = (1, 2**62)
+
+
+@pytest.fixture
+def reset_matmul_threading():
+    yield
+    set_matmul_threading(0, 0)
+
+
+def _under_each_thread_count(compute):
+    # compute() unthreaded, then with every thread count at threshold 1 so even small products
+    # split; returns the unthreaded result and each threaded one
+    set_matmul_threading(*UNTHREADED)
+    unthreaded = compute()
+    threaded = {}
+    for threads in THREAD_COUNTS:
+        set_matmul_threading(threads, 1)
+        threaded[threads] = compute()
+    return unthreaded, threaded
+
+
+@pytest.mark.parametrize("m, k, n", BIG_SHAPES)
+def test_thread_count_cannot_change_matmul_bits(reset_matmul_threading, m, k, n):
+    rng = np.random.default_rng(m * 10000 + k + n)
+    A = Array(rng.uniform(-1.0, 1.0, size=(m, k)).tolist())
+    B = Array(rng.uniform(-1.0, 1.0, size=(k, n)).tolist())
+    unthreaded, threaded = _under_each_thread_count(lambda: (A @ B).tolist())
+    for threads, result in threaded.items():
+        assert result == unthreaded, threads
+
+
+@pytest.mark.parametrize("m, k, n", BIG_SHAPES)
+def test_thread_count_cannot_change_matmul_nt_bits(reset_matmul_threading, m, k, n):
+    # X (m, k) @ W.T for W (n, k), through layer_relu_forward_batch as the grouped-dot test above
+    rng = np.random.default_rng(m * 10000 + k + n + 1)
+    W = Array(rng.uniform(-1.0, 1.0, size=(n, k)).tolist())
+    X = Array(rng.uniform(-1.0, 1.0, size=(m, k)).tolist())
+    b = Array(rng.uniform(-1.0, 1.0, size=n).tolist())
+    unthreaded, threaded = _under_each_thread_count(lambda: layer_relu_forward_batch(W, X, b).tolist())
+    for threads, result in threaded.items():
+        assert result == unthreaded, threads
+
+
+# (input_height, input_width, input_channels, kernel_size, channel_count, stride), batch size:
+# MNIST's first conv layer, and a stride-2 multi-channel layer with an odd row count
+CONV_CASES = [((28, 28, 1, 3, 32, 1), 4), ((9, 7, 3, 3, 5, 2), 3)]
+
+
+@pytest.mark.parametrize("shape, n", CONV_CASES)
+def test_thread_count_cannot_change_conv_bits(reset_matmul_threading, shape, n):
+    # matmul_narrow through all three conv ops: forward (cols @ W.T), downstream (D @ W) and
+    # accumulate (D @ cols)
+    height, width, channels, kernel_size, channel_count, stride = shape
+    g = ConvGeometry(height, width, channels, kernel_size, stride)
+    rng = np.random.default_rng(height * 100 + n)
+    W = Array(rng.uniform(-1.0, 1.0, size=(channel_count, g.fan_in)).tolist())
+    X = Array(rng.uniform(-1.0, 1.0, size=(n, g.input_size)).tolist())
+    b = Array(rng.uniform(-1.0, 1.0, size=channel_count).tolist())
+    delta = Array(rng.uniform(-1.0, 1.0, size=(n, channel_count * g.positions)).tolist())
+    grad_W0 = Array(np.zeros((channel_count, g.fan_in)).tolist())
+    grad_b0 = Array(np.zeros(channel_count).tolist())
+
+    def compute():
+        A, cols = conv_forward_batch(W, X, b, g)
+        dX = conv_downstream_batch(W, delta, g)
+        grad_W, grad_b = conv_accumulate_gradient_batch(delta, cols, grad_W0.copy(), grad_b0.copy(), g)
+        return [A.tolist(), dX.tolist(), grad_W.tolist(), grad_b.tolist()]
+
+    unthreaded, threaded = _under_each_thread_count(compute)
+    for threads, result in threaded.items():
+        assert result == unthreaded, threads
