@@ -21,6 +21,8 @@ from indrajala_math_rust import (
     conv_forward_batch,
     layer_downstream,
     layer_downstream_batch,
+    matmul_threads_for,
+    set_matmul_threading,
 )
 
 # (input_height, input_width, input_channels, kernel_size, channel_count, stride): 1/2/3 input
@@ -161,8 +163,8 @@ def test_conv_forward_batch_matches_the_brute_force_definition(shape):
 
 # (shape, N) beyond SHAPES x (1, BATCH_SIZE) for the forward's matmul_narrow kernel: output
 # channel counts that hit each of its paths (16-wide blocks, 4-wide blocks, the scalar tail, and
-# mixes), a 28x28 input at N = 128 (over matmul's 4M-flop threading threshold), and fan_in 800 x
-# 48 channels (W.T 300 KB, over matmul's 256 KB blocking threshold)
+# mixes), a 28x28 input at N = 256 (over the 8M-flop threading threshold), fan_in 800 x 48
+# channels (many 16-wide blocks), and 13x13x8 x 32 at N = 32 (threaded too)
 FORWARD_EXTRA_CASES = [
     ((6, 6, 1, 3, 1, 1), 2),
     ((6, 6, 2, 3, 5, 1), 2),
@@ -170,7 +172,7 @@ FORWARD_EXTRA_CASES = [
     ((6, 6, 2, 3, 21, 1), 2),
     ((6, 6, 2, 3, 35, 1), 2),
     ((28, 28, 1, 3, 8, 1), 1),
-    ((28, 28, 1, 3, 8, 1), 128),
+    ((28, 28, 1, 3, 8, 1), 256),
     ((8, 8, 32, 5, 48, 1), 2),
     ((13, 13, 8, 3, 32, 1), 32),
 ]
@@ -226,19 +228,37 @@ def test_a_vector_operand_is_one_example_with_the_same_bits(shape):
 
 # (shape, N) beyond SHAPES x (1, BATCH_SIZE) for the backward ops' matmul_narrow calls, whose
 # output rows are fan_in wide: 9 (4-wide blocks and a tail), 12 (4-wide blocks only), 18 (a
-# 16-wide block and a tail) and 72 (16- and 4-wide blocks); fan_in 800 (many 16-wide blocks, and
-# cols over matmul's 256 KB blocking threshold); a 28x28 input at N = 128 (downstream over the
-# 4M-flop threading threshold); and 13x13x8 x 32 at N = 32 (both threaded)
+# 16-wide block and a tail) and 72 (16- and 4-wide blocks); fan_in 800 (many 16-wide blocks); a
+# 28x28 input at N = 256 and 13x13x8 x 32 at N = 32 (downstream and accumulate over the 8M-flop
+# threading threshold)
 BACKWARD_EXTRA_CASES = [
     ((6, 6, 1, 3, 3, 1), 2),
     ((6, 6, 3, 2, 5, 1), 2),
     ((6, 6, 2, 3, 4, 1), 2),
     ((13, 13, 8, 3, 8, 1), 3),
     ((8, 8, 32, 5, 6, 1), 2),
-    ((28, 28, 1, 3, 8, 1), 128),
+    ((28, 28, 1, 3, 8, 1), 256),
     ((13, 13, 8, 3, 32, 1), 32),
 ]
 
+
+THREADED_CASES = [((28, 28, 1, 3, 8, 1), 256), ((13, 13, 8, 3, 32, 1), 32)]
+
+
+def test_the_threaded_cases_are_over_the_threading_threshold():
+    # every conv op's matmul_narrow product at these cases splits across threads at the default
+    # threshold (8 threads allowed on any machine), so a threshold change can't silently drop them
+    set_matmul_threading(8, 0)
+    try:
+        for shape, n in THREADED_CASES:
+            assert (shape, n) in FORWARD_EXTRA_CASES and (shape, n) in BACKWARD_EXTRA_CASES
+            g = _geometry(shape)
+            rows, channel_count = n * g.positions, shape[4]
+            assert matmul_threads_for(rows, g.fan_in, channel_count) == 8  # forward
+            assert matmul_threads_for(rows, channel_count, g.fan_in) == 8  # downstream
+            assert matmul_threads_for(channel_count, rows, g.fan_in) == 8  # accumulate
+    finally:
+        set_matmul_threading(0, 0)
 
 def _backward_case(seed, shape, n):
     rng = np.random.default_rng(seed)
