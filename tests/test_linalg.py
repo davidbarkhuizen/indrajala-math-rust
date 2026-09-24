@@ -7,6 +7,7 @@ strictly stronger check than a two-way Rust-vs-numpy comparison alone.
 
 import random
 import struct
+from fractions import Fraction
 
 import numpy as np
 import pytest
@@ -15,6 +16,7 @@ from indrajala_math_rust import (
     Array,
     layer_accumulate_gradient,
     layer_apply_accumulated_gradient,
+    layer_relu_forward_batch,
     layer_sgd_step,
     outer,
     sum_axis0,
@@ -263,3 +265,48 @@ def test_layer_sgd_step_inputs_reach_the_signed_zero_case():
 def test_layer_sgd_step_rejects_mismatched_shapes(w_shape, b_shape, delta_shape, x_shape):
     with pytest.raises(ValueError):
         layer_sgd_step(Array.zeros(w_shape), Array.zeros(b_shape), Array.zeros(delta_shape), Array.zeros(x_shape), 0.5)
+
+
+def _fma(a, b, c):
+    # a * b + c with one rounding: exact in Fraction, then int / int true division, which CPython
+    # rounds correctly
+    return float(Fraction(a) * Fraction(b) + Fraction(c))
+
+
+def _grouped_dot(a, b):
+    """linalg.rs's dot_product grouping: lane j accumulates indices j, j+4, ... by FMA, the lanes
+    combine as (l0 + l1) + (l2 + l3), and the k % 4 tail continues sequentially by FMA."""
+    lanes = [0.0] * 4
+    i = 0
+    while i + 4 <= len(a):
+        for j in range(4):
+            lanes[j] = _fma(a[i + j], b[i + j], lanes[j])
+        i += 4
+    total = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3])
+    for t in range(i, len(a)):
+        total = _fma(a[t], b[t], total)
+    return total
+
+
+# row counts 1-19 cover every mix of the 8-, 4- and 2-row blocks and a single leftover row;
+# widths cover k < 4, k % 4 == 0 and every nonzero k % 4
+DOT_SHAPES = [(m, k) for m in range(1, 20) for k in (1, 3, 4, 9, 14, 64)] + [(30, 784), (32, 203)]
+
+
+@pytest.mark.parametrize("m, k", DOT_SHAPES)
+def test_matrix_at_vector_is_the_grouped_dot_product_exactly(m, k):
+    rng = np.random.default_rng(m * 1000 + k)
+    W = rng.uniform(-1.0, 1.0, size=(m, k)).tolist()
+    x = rng.uniform(-1.0, 1.0, size=k).tolist()
+    assert (Array(W) @ Array(x)).tolist() == [_grouped_dot(row, x) for row in W]
+
+
+@pytest.mark.parametrize("m, k", DOT_SHAPES[::3] + [(30, 784)])
+def test_forward_batch_rows_are_the_grouped_dot_product_exactly(m, k):
+    # X @ W.T (matmul_nt) through layer_relu_forward_batch with b = 0, which returns max(z, 0):
+    # every positive z must equal the grouping bit for bit, and every other entry is 0
+    rng = np.random.default_rng(m * 1000 + k + 1)
+    W = rng.uniform(-1.0, 1.0, size=(m, k)).tolist()
+    X = rng.uniform(-1.0, 1.0, size=(3, k)).tolist()
+    expected = [[max(_grouped_dot(row, x), 0.0) for row in W] for x in X]
+    assert layer_relu_forward_batch(Array(W), Array(X), Array([0.0] * m)).tolist() == expected

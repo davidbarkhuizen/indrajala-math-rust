@@ -33,9 +33,7 @@ pub(crate) fn matmul(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
                 return Err(shape_error(a.shape, b.shape));
             }
             let mut out = vec![0.0; rows];
-            for row in 0..rows {
-                out[row] = dot_product(&a.data[row * cols..(row + 1) * cols], &b.data);
-            }
+            dot_products_into(&a.data, cols, &b.data, &mut out);
             Ok(RustArray::from_vector(out))
         }
         (Shape::Vector(n), Shape::Matrix(rows, cols)) => {
@@ -91,6 +89,71 @@ fn dot_product(a: &[f64], b: &[f64]) -> f64 {
         }
     }
     dot_product_scalar(a, b)
+}
+
+/// `out[r] = dot_product(rows[r], v)` for each of the `out.len()` rows of `rows` (row-major, `k`
+/// wide), bit for bit. `dot_product`'s one accumulator makes every FMA wait on the one before it
+/// (a latency chain of `k / 4` dependent FMAs), so a lone matrix @ vector runs at a fraction of
+/// FMA throughput. This runs several rows against `v` at once, each row with its own 4-lane
+/// accumulator in exactly `dot_product`'s grouping, so the chains overlap and every output keeps
+/// its bits. Blocks of 8 rows, then 4, then 2, so the rows left after the 8-row blocks (6 of a
+/// 30-row `W`) overlap too. Both the matrix @ vector case and `matmul_nt` go through it, so a batched forward's
+/// rows stay bit-identical to the single-example forward.
+fn dot_products_into(rows: &[f64], k: usize, v: &[f64], out: &mut [f64]) {
+    let mut row = 0;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            row = unsafe { dot_product_blocks_avx2_fma::<8>(rows, k, v, out, row) };
+            row = unsafe { dot_product_blocks_avx2_fma::<4>(rows, k, v, out, row) };
+            row = unsafe { dot_product_blocks_avx2_fma::<2>(rows, k, v, out, row) };
+        }
+    }
+    // the rows left over after the last full block, or every row without AVX2
+    for r in row..out.len() {
+        out[r] = dot_product(&rows[r * k..(r + 1) * k], v);
+    }
+}
+
+/// Fills `out[row..]` in blocks of `R` rows while a whole block fits; returns the first row left.
+/// Safety: as `dot_product_rows_avx2_fma`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_product_blocks_avx2_fma<const R: usize>(rows: &[f64], k: usize, v: &[f64], out: &mut [f64], mut row: usize) -> usize {
+    while row + R <= out.len() {
+        let block = dot_product_rows_avx2_fma::<R>(&rows[row * k..(row + R) * k], k, v);
+        out[row..row + R].copy_from_slice(&block);
+        row += R;
+    }
+    row
+}
+
+/// `R` consecutive `k`-wide rows of `rows` against `v`: accumulator `r` is exactly
+/// `dot_product_avx2_fma(rows[r], v)`'s `acc_vec` (the same loads, the same FMA operand order,
+/// the same `i`), and the lanes combine and the tail finishes as there. Safety: only called after
+/// `dot_products_into`'s runtime feature check; `rows` holds `R * k` values and `v` `k`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_product_rows_avx2_fma<const R: usize>(rows: &[f64], k: usize, v: &[f64]) -> [f64; R] {
+    use std::arch::x86_64::{_mm256_fmadd_pd, _mm256_loadu_pd, _mm256_setzero_pd, _mm256_storeu_pd};
+
+    let rows_ptr = rows.as_ptr();
+    let mut acc = [_mm256_setzero_pd(); R];
+    let mut i = 0;
+    while i + 4 <= k {
+        let v_vec = _mm256_loadu_pd(v.as_ptr().add(i));
+        for r in 0..R {
+            acc[r] = _mm256_fmadd_pd(_mm256_loadu_pd(rows_ptr.add(r * k + i)), v_vec, acc[r]);
+        }
+        i += 4;
+    }
+    let mut out = [0.0; R];
+    for r in 0..R {
+        let mut lanes = [0.0f64; 4];
+        _mm256_storeu_pd(lanes.as_mut_ptr(), acc[r]);
+        out[r] = dot_product_tail(&rows[r * k..(r + 1) * k], v, i, combine_lanes(lanes));
+    }
+    out
 }
 
 /// `(lanes[0] + lanes[1]) + (lanes[2] + lanes[3])` - one fixed combine order, factored out so the
@@ -241,9 +304,7 @@ pub(crate) fn matmul_nt(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
         for row in row_start..row_end {
             let a_row = &a.data[row * k..(row + 1) * k];
             let out_row = &mut chunk[(row - row_start) * n..(row - row_start + 1) * n];
-            for (col, out_value) in out_row.iter_mut().enumerate() {
-                *out_value = dot_product(&b.data[col * k..(col + 1) * k], a_row);
-            }
+            dot_products_into(&b.data, k, a_row, out_row);
         }
     });
     Ok(RustArray::from_matrix(out, m, n))
