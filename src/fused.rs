@@ -24,6 +24,13 @@ fn require_same_shape(a: &RustArray, b: &RustArray, context: &str) -> PyResult<(
     Ok(())
 }
 
+fn require_batch_size(batch_size: usize, context: &str) -> PyResult<()> {
+    if batch_size == 0 {
+        return Err(PyValueError::new_err(format!("{context} requires batch_size >= 1")));
+    }
+    Ok(())
+}
+
 fn sigmoid(z: &RustArray) -> RustArray {
     RustArray {
         data: z.data.iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect(),
@@ -249,11 +256,7 @@ pub fn layer_apply_accumulated_gradient(
 ) -> PyResult<(RustArray, RustArray)> {
     require_same_shape(w, grad_w, "layer_apply_accumulated_gradient (W, grad_W)")?;
     require_same_shape(b, grad_b, "layer_apply_accumulated_gradient (b, grad_b)")?;
-    if batch_size == 0 {
-        return Err(PyValueError::new_err(
-            "layer_apply_accumulated_gradient requires batch_size >= 1",
-        ));
-    }
+    require_batch_size(batch_size, "layer_apply_accumulated_gradient")?;
     let scale = learning_rate / (batch_size as f64);
     let new_w = RustArray {
         data: same_shape_elementwise(&w.data, &grad_w.data, |wv, gv| wv - scale * gv),
@@ -404,11 +407,7 @@ pub fn layer_adam_apply_accumulated_gradient(
     require_same_shape(b, grad_b, "layer_adam_apply_accumulated_gradient (b, grad_b)")?;
     require_same_shape(b, m_b, "layer_adam_apply_accumulated_gradient (b, m_b)")?;
     require_same_shape(b, v_b, "layer_adam_apply_accumulated_gradient (b, v_b)")?;
-    if batch_size == 0 {
-        return Err(PyValueError::new_err(
-            "layer_adam_apply_accumulated_gradient requires batch_size >= 1",
-        ));
-    }
+    require_batch_size(batch_size, "layer_adam_apply_accumulated_gradient")?;
     if t == 0 {
         return Err(PyValueError::new_err(
             "layer_adam_apply_accumulated_gradient requires t >= 1 (the step count after incrementing)",
@@ -461,11 +460,7 @@ pub fn layer_l2_apply_accumulated_gradient(
 ) -> PyResult<(RustArray, RustArray)> {
     require_same_shape(w, grad_w, "layer_l2_apply_accumulated_gradient (W, grad_W)")?;
     require_same_shape(b, grad_b, "layer_l2_apply_accumulated_gradient (b, grad_b)")?;
-    if batch_size == 0 {
-        return Err(PyValueError::new_err(
-            "layer_l2_apply_accumulated_gradient requires batch_size >= 1",
-        ));
-    }
+    require_batch_size(batch_size, "layer_l2_apply_accumulated_gradient")?;
     let scale = learning_rate / (batch_size as f64);
     let new_w = RustArray {
         data: same_shape_elementwise(&w.data, &grad_w.data, |wv, gv| {
@@ -503,11 +498,7 @@ pub fn layer_momentum_apply_accumulated_gradient(
     require_same_shape(w, prev_delta_w, "layer_momentum_apply_accumulated_gradient (W, prev_delta_W)")?;
     require_same_shape(b, grad_b, "layer_momentum_apply_accumulated_gradient (b, grad_b)")?;
     require_same_shape(b, prev_delta_b, "layer_momentum_apply_accumulated_gradient (b, prev_delta_b)")?;
-    if batch_size == 0 {
-        return Err(PyValueError::new_err(
-            "layer_momentum_apply_accumulated_gradient requires batch_size >= 1",
-        ));
-    }
+    require_batch_size(batch_size, "layer_momentum_apply_accumulated_gradient")?;
     let scale = learning_rate / (batch_size as f64);
 
     let new_delta_w_data: Vec<f64> = (0..w.data.len())
