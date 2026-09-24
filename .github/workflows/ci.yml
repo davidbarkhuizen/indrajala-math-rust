@@ -14,10 +14,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      # No separate `cargo check`: the maturin build below compiles everything anyway (its
-      # check-mode output isn't reused by that release build) and fails on the same errors. No
-      # rust-cache either: the dependency builds it saves take ~6 s here, and its restore measured
-      # 1-10 s, within the noise of the crate's own 3-24 s compile.
+      # target/'s dependency builds (pyo3, syn, proc-macro2, ...; ~15 s uncached), keyed by
+      # rust-cache on the toolchain, Cargo.lock and Cargo.toml; the crate itself always
+      # recompiles. No separate `cargo check`: the maturin build below compiles everything anyway
+      # and fails on the same errors - check only pre-built the shared proc-macro/build-script
+      # dependencies, which rust-cache now restores instead.
+      - uses: Swatinem/rust-cache@v2
       # maturin pinned to match indrajala-ml's ./cli (maturin_version); numpy and pytest left
       # unpinned, so this CI checks the crate against the latest numpy while indrajala-ml's CI
       # checks it against that repo's pinned one.
