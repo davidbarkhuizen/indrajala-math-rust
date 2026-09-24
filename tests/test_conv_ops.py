@@ -161,10 +161,11 @@ def test_conv_forward_batch_matches_the_brute_force_definition(shape):
     np.testing.assert_array_equal(_np(cols), expected_cols)
 
 
-# (shape, N) beyond SHAPES x (1, BATCH_SIZE) for the forward's matmul_narrow kernel: output
-# channel counts that hit each of its paths (16-wide blocks, 4-wide blocks, the scalar tail, and
-# mixes), a 28x28 input at N = 256 (over the 8M-flop threading threshold), fan_in 800 x 48
-# channels (many 16-wide blocks), and 13x13x8 x 32 at N = 32 (threaded too)
+# (shape, N) beyond SHAPES x (1, BATCH_SIZE) for the forward's matmul_narrow kernel, which it
+# runs one example at a time on one thread: output channel counts that hit each of its paths
+# (16-wide blocks, 4-wide blocks, the scalar tail, and mixes), a 28x28 input at N = 256, fan_in
+# 800 x 48 channels (many 16-wide blocks), and 13x13x8 x 32 at N = 32. The last two batch sizes
+# are over the threading threshold for a whole-batch product, the forward's before candidate 4
 FORWARD_EXTRA_CASES = [
     ((6, 6, 1, 3, 1, 1), 2),
     ((6, 6, 2, 3, 5, 1), 2),
@@ -246,15 +247,17 @@ THREADED_CASES = [((28, 28, 1, 3, 8, 1), 256), ((13, 13, 8, 3, 32, 1), 32)]
 
 
 def test_the_threaded_cases_are_over_the_threading_threshold():
-    # every conv op's matmul_narrow product at these cases splits across threads at the default
-    # threshold (8 threads allowed on any machine), so a threshold change can't silently drop them
+    # the backward ops' matmul_narrow products at these cases split across threads at the default
+    # threshold (8 threads allowed on any machine), so a threshold change can't silently drop them.
+    # The forward runs per example on one thread; its whole-batch product is checked too, as the
+    # size its cases were chosen for
     set_matmul_threading(8, 0)
     try:
         for shape, n in THREADED_CASES:
             assert (shape, n) in FORWARD_EXTRA_CASES and (shape, n) in BACKWARD_EXTRA_CASES
             g = _geometry(shape)
             rows, channel_count = n * g.positions, shape[4]
-            assert matmul_threads_for(rows, g.fan_in, channel_count) == 8  # forward
+            assert matmul_threads_for(rows, g.fan_in, channel_count) == 8  # forward, whole batch
             assert matmul_threads_for(rows, channel_count, g.fan_in) == 8  # downstream
             assert matmul_threads_for(channel_count, rows, g.fan_in) == 8  # accumulate
     finally:
