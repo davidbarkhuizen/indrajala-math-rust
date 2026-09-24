@@ -98,8 +98,8 @@ fn dot_product(a: &[f64], b: &[f64]) -> f64 {
 /// FMA throughput. This runs several rows against `v` at once, each row with its own 4-lane
 /// accumulator in exactly `dot_product`'s grouping, so the chains overlap and every output keeps
 /// its bits. Blocks of 8 rows, then 4, then 2, so the rows left after the 8-row blocks (6 of a
-/// 30-row `W`) overlap too. Both the matrix @ vector case and `matmul_nt` go through it, so a batched forward's
-/// rows stay bit-identical to the single-example forward.
+/// 30-row `W`) overlap too. The matrix @ vector case goes through it, and `matmul_nt`'s tiles
+/// keep its grouping, so a batched forward's rows stay bit-identical to the single-example forward.
 fn dot_products_into(rows: &[f64], k: usize, v: &[f64], out: &mut [f64]) {
     let mut row = 0;
     #[cfg(target_arch = "x86_64")]
@@ -325,8 +325,9 @@ where
 /// `a @ b.T` for `a` (`M, K`) and `b` (`N, K`), without materializing `b.T`: `out[m, n] =
 /// dot_product(a[m], b[n])`, both rows contiguous. That is exactly the matrix @ vector case's
 /// `matmul(b, a[m])` for each row `m`, so row `m` of the result is bit-identical to it, and a
-/// batched forward agrees exactly with the single-example one. Threaded over `M` rows like
-/// `matmul_2d`.
+/// batched forward agrees exactly with the single-example one. Rows of `a` go in register tiles
+/// against rows of `b` (`matmul_nt_blocks_avx2_fma`), and the rows left over one at a time.
+/// Threaded over `M` rows like `matmul_2d`.
 pub(crate) fn matmul_nt(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
     let (Shape::Matrix(m, k), Shape::Matrix(n, b_k)) = (a.shape, b.shape) else {
         return Err(PyValueError::new_err(format!(
@@ -342,13 +343,103 @@ pub(crate) fn matmul_nt(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
     }
     let mut out = vec![0.0; m * n];
     for_each_row_range(&mut out, m, n, m * k * n, |chunk, row_start, row_end| {
-        for row in row_start..row_end {
+        let mut row = row_start;
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+                row = unsafe { matmul_nt_blocks_avx2_fma(&a.data, &b.data, chunk, row_start, row_end, k, n) };
+            }
+        }
+        // the rows left over after the last full block, or every row without AVX2
+        for row in row..row_end {
             let a_row = &a.data[row * k..(row + 1) * k];
             let out_row = &mut chunk[(row - row_start) * n..(row - row_start + 1) * n];
             dot_products_into(&b.data, k, a_row, out_row);
         }
     });
     Ok(RustArray::from_matrix(out, m, n))
+}
+
+/// `matmul_nt`'s register tile, 4 rows of `a` by 2 of `b`: 8 accumulators and 6 loads, in
+/// AVX2's 16 registers. Measured against 2 x 4, 3 x 3 and 2 x 2 (dense `forward_batch` at 32 x
+/// 5408, batch 32-512, and 30 x 784, batch 32 and 512), it was the fastest or tied at every shape.
+const NT_A_ROWS: usize = 4;
+const NT_B_ROWS: usize = 2;
+
+/// `matmul_nt`'s rows `row_start..` in blocks of `NT_A_ROWS` rows of `a`, while a whole block
+/// fits before `row_end`; returns the first row left. Each block runs against `b` `NT_B_ROWS`
+/// rows at a time, so every load of `b` serves `NT_A_ROWS` outputs and every load of `a` serves
+/// `NT_B_ROWS`: row by row, all of `b` (1.4 MB at 32 x 5408, past L2) streams in again for every
+/// row of `a`. The `n % NT_B_ROWS` rows of `b` left over go through `dot_products_into`. Every
+/// output is still one `dot_product` in its grouping, so the result is bit-identical to the row
+/// by row loop. Safety: only called after `matmul_nt`'s runtime feature check; `a_data` holds
+/// `row_end * k` values, `b_data` `n * k`, and `chunk` `(row_end - row_start) * n`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn matmul_nt_blocks_avx2_fma(
+    a_data: &[f64],
+    b_data: &[f64],
+    chunk: &mut [f64],
+    row_start: usize,
+    row_end: usize,
+    k: usize,
+    n: usize,
+) -> usize {
+    let mut row = row_start;
+    while row + NT_A_ROWS <= row_end {
+        let a_block = &a_data[row * k..(row + NT_A_ROWS) * k];
+        let out_block = &mut chunk[(row - row_start) * n..(row - row_start + NT_A_ROWS) * n];
+        let mut col = 0;
+        while col + NT_B_ROWS <= n {
+            let tile = dot_product_tile_avx2_fma::<NT_A_ROWS, NT_B_ROWS>(a_block, &b_data[col * k..(col + NT_B_ROWS) * k], k);
+            for r in 0..NT_A_ROWS {
+                out_block[r * n + col..r * n + col + NT_B_ROWS].copy_from_slice(&tile[r]);
+            }
+            col += NT_B_ROWS;
+        }
+        if col < n {
+            for r in 0..NT_A_ROWS {
+                dot_products_into(&b_data[col * k..n * k], k, &a_block[r * k..(r + 1) * k], &mut out_block[r * n + col..(r + 1) * n]);
+            }
+        }
+        row += NT_A_ROWS;
+    }
+    row
+}
+
+/// `tile[r][c] = dot_product(b_rows[c], a_rows[r])` for `RA` consecutive `k`-wide rows of
+/// `a_rows` and `RB` of `b_rows`, as `dot_products_into(b_rows, k, a_rows[r])` computes it:
+/// accumulator `(r, c)` is exactly `dot_product_avx2_fma`'s `acc_vec` for that pair (the same loads, the same FMA operand order, the same `i`), and the
+/// lanes combine and the tail finishes as there. `RA * RB` accumulators plus `RA + RB` loads
+/// have to fit AVX2's 16 registers. Safety: as `dot_product_rows_avx2_fma`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_product_tile_avx2_fma<const RA: usize, const RB: usize>(a_rows: &[f64], b_rows: &[f64], k: usize) -> [[f64; RB]; RA] {
+    use std::arch::x86_64::{_mm256_fmadd_pd, _mm256_loadu_pd, _mm256_setzero_pd, _mm256_storeu_pd};
+
+    let a_ptr = a_rows.as_ptr();
+    let b_ptr = b_rows.as_ptr();
+    let mut acc = [[_mm256_setzero_pd(); RB]; RA];
+    let mut i = 0;
+    while i + 4 <= k {
+        let b_vecs: [_; RB] = std::array::from_fn(|c| _mm256_loadu_pd(b_ptr.add(c * k + i)));
+        for r in 0..RA {
+            let a_vec = _mm256_loadu_pd(a_ptr.add(r * k + i));
+            for c in 0..RB {
+                acc[r][c] = _mm256_fmadd_pd(b_vecs[c], a_vec, acc[r][c]);
+            }
+        }
+        i += 4;
+    }
+    let mut out = [[0.0; RB]; RA];
+    for r in 0..RA {
+        for c in 0..RB {
+            let mut lanes = [0.0f64; 4];
+            _mm256_storeu_pd(lanes.as_mut_ptr(), acc[r][c]);
+            out[r][c] = dot_product_tail(&b_rows[c * k..(c + 1) * k], &a_rows[r * k..(r + 1) * k], i, combine_lanes(lanes));
+        }
+    }
+    out
 }
 
 /// `a @ b` for `a` (`M, K`) and a narrow `b` (`K, N`, `N` a few dozen at most), the conv ops'
