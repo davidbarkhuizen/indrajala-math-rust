@@ -471,7 +471,7 @@ pub(crate) fn matmul_narrow(a: &RustArray, b: &RustArray) -> PyResult<RustArray>
 /// Blocked over rows: for each block of `rows_per_block` rows, each column tile runs over every
 /// row of the block, so the tile's `K x 16` panel of `b` is read from cache by all of them. The
 /// order of rows and tiles doesn't change any output's value.
-fn tiled_row_range(
+pub(crate) fn tiled_row_range(
     a_data: &[f64],
     b_data: &[f64],
     out_chunk: &mut [f64],

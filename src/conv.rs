@@ -2,7 +2,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::array::{RustArray, Shape};
-use crate::linalg::matmul_narrow;
+use crate::linalg::{matmul_narrow, tiled_row_range};
 
 /// Convolution and max pooling ops, one Rust call per `ConvArrayLayer`/`MaxPoolArrayLayer` method
 /// (indrajala-ml's `indrajala_ml/model/conv_array_layer.py`/`max_pool_array_layer.py`). The ops
@@ -19,7 +19,8 @@ use crate::linalg::matmul_narrow;
 /// - the cached im2col columns are `(N*P, C*k*k)`, `P = out_height * out_width`, row `n*P + p`
 ///   with `p` in row-major output order, columns in `W`-row order.
 ///
-/// Every conv reduction goes through `linalg::matmul_narrow`, which gives `matmul`'s bits: the
+/// Every conv reduction goes through `linalg::matmul_narrow` (the forward through its kernel,
+/// `tiled_row_range`, one example at a time), which gives `matmul`'s bits: the
 /// summation order is that file's one fixed grouping - machine-independent, and within `rtol` of
 /// numpy rather than bit-identical to it. Pooling does no arithmetic beyond the scatter-add, so it matches numpy exactly.
 
@@ -184,12 +185,20 @@ fn deltas_by_channel(delta: &RustArray, n: usize, o: usize, p: usize) -> RustArr
     RustArray::from_matrix(out, o, n * p)
 }
 
-/// `ConvArrayLayer.forward_batch`: im2col, `cols @ W.T` with `matmul_narrow` (the same bits as
-/// `matmul`, faster for `O`-wide output rows), then a scatter into
-/// channel-major `(N, O*P)` that adds `b` and applies the ReLU in the same pass. Returns `(A,
-/// cols)`, `A` a vector when `X` is one, `cols` always `(N*P, C*k*k)`: `cols` is kept by the caller for `conv_accumulate_gradient_batch`, as
-/// `ConvArrayLayer._cols` is. The pre-activation `Z` is never stored: nothing in the backward
+/// `ConvArrayLayer.forward_batch`, one example at a time: im2col appended to `cols`, the example's
+/// `P` rows of `cols @ W.T` with `matmul_narrow`'s kernel into one `(P, O)` buffer reused for every
+/// example (so each output has `matmul`'s bits), then `A`'s channel-major row appended in order,
+/// adding `b` and applying the ReLU as it goes. Returns `(A, cols)`, `A` a vector when `X` is one,
+/// `cols` always `(N*P, C*k*k)`: `cols` is kept by the caller for `conv_accumulate_gradient_batch`,
+/// as `ConvArrayLayer._cols` is. The pre-activation `Z` is never stored: nothing in the backward
 /// pass reads it (`array_relu_mask` masks on `A`).
+///
+/// Per example, not over the whole batch (candidate 4 in indrajala-ml's docs/optimizations.md):
+/// at N = 32 the whole-batch `cols`, product and `A` are 1.4-1.6 MB each, past L2, and zeroing
+/// them and then scattering into `A` made the op cost 1.5-2.8x its N single-example calls. Here
+/// only `cols` and `A` are batch-sized, and each is written once, in order; the example's slab
+/// of `cols` and its 43 KB product are still in cache when they are read. The product runs on
+/// one thread: `matmul_narrow`'s row threading made no difference at N = 512.
 #[pyfunction]
 pub fn conv_forward_batch(
     w: &RustArray,
@@ -208,35 +217,29 @@ pub fn conv_forward_batch(
     let g = geometry;
     let (p, k, fan_in) = (g.positions, g.kernel_size, g.fan_in);
 
-    let mut cols = vec![0.0; n * p * fan_in];
+    let w_t = w.transpose(); // (C*k*k, O)
+    let mut cols = Vec::with_capacity(n * p * fan_in);
+    let mut by_position = vec![0.0; p * o]; // one example's (P, O)
+    let mut a = Vec::with_capacity(n * o * p);
     for example in 0..n {
         let input = &x.data[example * g.input_size..(example + 1) * g.input_size];
         for out_row in 0..g.out_height {
             for out_col in 0..g.out_width {
-                let row = &mut cols[(example * p + out_row * g.out_width + out_col) * fan_in..][..fan_in];
-                let mut column = 0;
                 for c in 0..g.input_channels {
                     for kr in 0..k {
                         let start = g.input_index(c, out_row, out_col, kr, 0);
-                        row[column..column + k].copy_from_slice(&input[start..start + k]);
-                        column += k;
+                        cols.extend_from_slice(&input[start..start + k]);
                     }
                 }
             }
         }
-    }
-    let cols = RustArray::from_matrix(cols, n * p, fan_in);
-
-    let by_position = matmul_narrow(&cols, &w.transpose())?; // (N*P, O)
-    let mut a = vec![0.0; n * o * p];
-    for example in 0..n {
-        for position in 0..p {
-            let src = &by_position.data[(example * p + position) * o..][..o];
-            for channel in 0..o {
-                a[(example * o + channel) * p + position] = (src[channel] + b.data[channel]).max(0.0);
-            }
+        tiled_row_range(&cols[example * p * fan_in..], &w_t.data, &mut by_position, 0, p, fan_in, o, 1);
+        for channel in 0..o {
+            let bias = b.data[channel];
+            a.extend((0..p).map(|position| (by_position[position * o + channel] + bias).max(0.0)));
         }
     }
+    let cols = RustArray::from_matrix(cols, n * p, fan_in);
     Ok((batch_output(a, n, o * p, is_vector), cols))
 }
 
