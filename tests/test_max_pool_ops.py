@@ -16,11 +16,15 @@ import pytest
 from indrajala_math_rust import Array, ConvGeometry, max_pool_downstream_batch, max_pool_forward_batch
 
 # (input_height, input_width, input_channels, pool_size, stride): non-overlapping, overlapping
-# (stride < pool_size), gapped (stride > pool_size), multi-channel, non-square
+# (stride < pool_size), gapped (stride > pool_size), multi-channel, non-square. The forward pass
+# has a separate kernel for 2x2 at stride 2, so it gets even and odd sides (odd drops the last
+# row and column); the rest go through the general kernel.
 SHAPES = [
     (4, 4, 1, 2, 2),
     (6, 6, 2, 2, 2),
+    (5, 7, 2, 2, 2),
     (5, 7, 3, 3, 3),
+    (7, 6, 1, 3, 2),
     (5, 5, 2, 3, 1),
     (6, 5, 1, 2, 1),
     (7, 7, 2, 2, 3),
@@ -97,6 +101,22 @@ def test_a_vector_operand_is_one_example_with_the_same_bits(shape, tie_heavy):
     dX_vec = max_pool_downstream_batch(Array(d), argmax_vec, g)
     assert dX_vec.shape == (g.input_size,)
     assert dX_vec.tolist() == dX_row.tolist()[0]
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+def test_signed_zero_ties_keep_the_first_slot_and_its_sign(shape):
+    # -0.0 == 0.0, so a strict > keeps whichever zero comes first, sign included;
+    # assert_array_equal can't tell the two zeros apart, so compare the bits
+    rng = np.random.default_rng(5)
+    height, width, channels, _p, _s = shape
+    X = rng.choice([-0.0, 0.0, 0.0, -0.5], size=(BATCH_SIZE, channels * height * width))
+    delta = np.zeros((BATCH_SIZE, channels * _geometry(shape).positions))
+    expected_A, expected_argmax, _ = _reference(X, delta, shape)
+
+    A, argmax = max_pool_forward_batch(Array(X.tolist()), _geometry(shape))
+    assert np.signbit(expected_A).any() and not np.signbit(expected_A).all()
+    np.testing.assert_array_equal(_np(A).view(np.int64), expected_A.view(np.int64))
+    np.testing.assert_array_equal(_np(argmax), expected_argmax)
 
 
 def test_ties_resolve_to_the_first_slot():
