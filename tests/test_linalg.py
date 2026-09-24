@@ -319,6 +319,25 @@ def test_forward_batch_rows_are_the_grouped_dot_product_exactly(m, k):
     assert layer_relu_forward_batch(Array(W), Array(X), Array([0.0] * m)).tolist() == expected
 
 
+# (batch, k, n): batches 1-9 give 0-2 full 4-row blocks of X with 0-3 rows left over; odd n
+# leaves a W row outside matmul_nt's 2-row tiles, and n = 1 has no tile at all
+NT_TILE_SHAPES = [(batch, k, n) for batch in range(1, 10) for k, n in ((9, 5), (14, 1), (3, 2))] + [
+    (9, 64, 17),
+    (8, 203, 30),
+]
+
+
+@pytest.mark.parametrize("batch, k, n", NT_TILE_SHAPES)
+def test_forward_batch_tiles_are_the_grouped_dot_product_exactly(batch, k, n):
+    # every output of matmul_nt's X-row by W-row tiles, and of the rows and columns left over
+    # outside them, is dot_product(W[j], X[i]) in its grouping
+    rng = np.random.default_rng(batch * 1000 + k * 10 + n)
+    W = rng.uniform(-1.0, 1.0, size=(n, k)).tolist()
+    X = rng.uniform(-1.0, 1.0, size=(batch, k)).tolist()
+    expected = [[max(_grouped_dot(row, x), 0.0) for row in W] for x in X]
+    assert layer_relu_forward_batch(Array(W), Array(X), Array([0.0] * n)).tolist() == expected
+
+
 def _fma_chain(a_row, b, col):
     """matmul's matrix @ matrix output [row, col]: an FMA chain over k increasing from 0.0."""
     total = 0.0
