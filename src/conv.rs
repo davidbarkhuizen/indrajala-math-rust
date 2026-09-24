@@ -401,10 +401,12 @@ fn max_pool_plane_2x2(channel: &[f64], g: &ConvGeometry, a: &mut [f64], argmax: 
 }
 
 /// `MaxPoolArrayLayer._downstream`: each window's delta goes to its winning input by scatter-add,
-/// so an input that wins several overlapping windows receives all their deltas. The loop runs
-/// slot outside window, so each input accumulates in the same order as numpy's one-slice-add-
-/// per-slot loop; no matmul is involved, so the result is bit-identical to numpy's. `delta_batch`
-/// and `argmax` must have the same rank; `dX` has it too.
+/// so an input that wins several overlapping windows receives all their deltas. With overlapping
+/// windows (stride < `kernel_size`) the loop runs slot outside window, so each input accumulates
+/// in the same order as numpy's one-slice-add-per-slot loop; no matmul is involved, so the result
+/// is bit-identical to numpy's. Without overlap each input receives at most one delta, so one pass
+/// in window order stores `0.0 + d`, the bits the add into the zeroed `dX` gives (`-0.0` included).
+/// `delta_batch` and `argmax` must have the same rank; `dX` has it too.
 #[pyfunction]
 pub fn max_pool_downstream_batch(
     delta_batch: &RustArray,
@@ -421,16 +423,33 @@ pub fn max_pool_downstream_batch(
             delta_batch.shape, argmax.shape
         )));
     }
-    let slot_count = (k * k) as f64;
-    let is_slot = |v: f64| v >= 0.0 && v < slot_count && v.fract() == 0.0;
-    if let Some(bad) = argmax.data.iter().find(|&&v| !is_slot(v)) {
-        return Err(PyValueError::new_err(format!(
+    let bad_slot = |bad: f64| {
+        PyValueError::new_err(format!(
             "max_pool_downstream_batch: argmax entries must be slot indices in 0..{}, got {bad}",
             k * k
-        )));
-    }
+        ))
+    };
 
     let mut dx = vec![0.0; n * g.input_size];
+    if g.stride >= k {
+        // each slot's offset from its window's top-left input, so no slot costs a division
+        let offsets: Vec<usize> = (0..k * k).map(|slot| slot / k * g.input_width + slot % k).collect();
+        let plane = g.input_height * g.input_width;
+        // the operands' rows are whole examples of C planes each, so their planes line up
+        for ((deltas, slots), out) in delta_batch
+            .data
+            .chunks_exact(g.positions)
+            .zip(argmax.data.chunks_exact(g.positions))
+            .zip(dx.chunks_exact_mut(plane))
+        {
+            max_pool_downstream_plane(deltas, slots, &offsets, g, out).map_err(bad_slot)?;
+        }
+        return Ok(batch_output(dx, n, g.input_size, is_vector));
+    }
+
+    if let Some(&bad) = argmax.data.iter().find(|&&v| as_slot(v, k * k).is_none()) {
+        return Err(bad_slot(bad));
+    }
     for example in 0..n {
         let out = &mut dx[example * g.input_size..(example + 1) * g.input_size];
         for slot in 0..k * k {
@@ -448,4 +467,33 @@ pub fn max_pool_downstream_batch(
         }
     }
     Ok(batch_output(dx, n, g.input_size, is_vector))
+}
+
+/// One channel plane of `max_pool_downstream_batch` without overlap: each window's delta stored
+/// at its winning input, in one pass. Fails with the first entry of `slots` that isn't a slot.
+fn max_pool_downstream_plane(
+    deltas: &[f64],
+    slots: &[f64],
+    offsets: &[usize],
+    g: &ConvGeometry,
+    out: &mut [f64],
+) -> Result<(), f64> {
+    let (s, w) = (g.stride, g.input_width);
+    for (out_row, (delta_row, slot_row)) in
+        deltas.chunks_exact(g.out_width).zip(slots.chunks_exact(g.out_width)).enumerate()
+    {
+        let row = &mut out[out_row * s * w..];
+        for (out_col, (&d, &v)) in delta_row.iter().zip(slot_row).enumerate() {
+            let slot = as_slot(v, offsets.len()).ok_or(v)?;
+            row[out_col * s + offsets[slot]] = 0.0 + d;
+        }
+    }
+    Ok(())
+}
+
+/// The slot an `argmax` entry names, if it names one: an exact integer in `0..slot_count` (`-0.0`
+/// is slot 0; NaN, fractions and out-of-range values are none).
+fn as_slot(v: f64, slot_count: usize) -> Option<usize> {
+    let slot = v as usize; // truncates, and saturates out of range
+    (v >= 0.0 && slot < slot_count && slot as f64 == v).then_some(slot)
 }
