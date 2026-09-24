@@ -193,7 +193,7 @@ fn deltas_by_channel(delta: &RustArray, n: usize, o: usize, p: usize) -> RustArr
 /// as `ConvArrayLayer._cols` is. The pre-activation `Z` is never stored: nothing in the backward
 /// pass reads it (`array_relu_mask` masks on `A`).
 ///
-/// Per example, not over the whole batch (candidate 4 in indrajala-ml's docs/optimizations.md):
+/// Per example, not over the whole batch (indrajala-ml's docs/optimizations/implemented.md):
 /// at N = 32 the whole-batch `cols`, product and `A` are 1.4-1.6 MB each, past L2, and zeroing
 /// them and then scattering into `A` made the op cost 1.5-2.8x its N single-example calls. Here
 /// only `cols` and `A` are batch-sized, and each is written once, in order; the example's slab
