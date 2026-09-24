@@ -2,7 +2,7 @@
 The dense batched forward ops (`layer_*forward_batch`), which compute `X @ W.T` with `matmul_nt`:
 without copying `W.T`, as one `dot_product(W[j], X[i])` per output. That makes every row of a
 batched forward bit-identical to the single-example forward on that row, which these tests pin
-exactly, on both sides of the threading threshold (4M flops).
+exactly, on both sides of the threading threshold (8M flops).
 """
 
 import numpy as np
@@ -18,6 +18,8 @@ from indrajala_math_rust import (
     layer_relu_forward_batch,
     layer_softmax_forward,
     layer_softmax_forward_batch,
+    matmul_threads_for,
+    set_matmul_threading,
 )
 
 
@@ -46,8 +48,8 @@ VARIANTS = [
     ("dropout eval", _dropout_eval_forward, _dropout_eval_forward_batch, _sigmoid),
 ]
 
-# (batch, input_size, size). The last three are over the threading threshold (batch * input_size *
-# size >= 4M flops), so their rows are split across threads
+# (batch, input_size, size). The last two are over the threading threshold (batch * input_size *
+# size >= 8M flops), so their rows are split across threads
 SHAPES = [
     (1, 1, 1),
     (1, 7, 1),
@@ -60,7 +62,10 @@ SHAPES = [
     (256, 784, 30),
     (32, 5408, 32),
     (3, 5408, 300),
+    (64, 5408, 32),
+    (512, 784, 30),
 ]
+THREADED_SHAPES = SHAPES[-2:]
 
 
 def _inputs(batch, input_size, size):
@@ -77,7 +82,11 @@ def test_forward_batch_matches_numpy(name, forward, forward_batch, reference, ba
     W, X, b = _inputs(batch, input_size, size)
     result = forward_batch(Array(W.tolist()), Array(X.tolist()), Array(b.tolist()))
     assert result.shape == (batch, size)
-    np.testing.assert_allclose(result.tolist(), reference(X @ W.T + b), rtol=1e-12, atol=1e-14)
+    # numpy sums in another order, so an output that cancels to near zero differs by a few ULPs of
+    # its terms' size, not its own: the absolute tolerance scales with sum(|x * w|) + |b|
+    terms = np.abs(X) @ np.abs(W).T + np.abs(b)
+    expected = reference(X @ W.T + b)
+    assert np.all(np.abs(np.array(result.tolist()) - expected) <= 1e-12 * np.abs(expected) + 1e-15 * terms)
 
 
 @pytest.mark.parametrize("name, forward, forward_batch, reference", VARIANTS)
@@ -101,3 +110,15 @@ def test_forward_batch_rejects_mismatched_shapes():
         layer_forward_batch(W, Array.zeros(7), b)
     with pytest.raises(ValueError):
         layer_forward_batch(W, Array.zeros((3, 7)), Array.zeros(5))
+
+
+def test_the_shapes_cover_both_sides_of_the_threading_threshold():
+    # at the default threshold, with 8 threads allowed on any machine, THREADED_SHAPES split
+    # across threads and the rest don't, so a threshold change can't silently drop the threaded path
+    set_matmul_threading(8, 0)
+    try:
+        for batch, input_size, size in SHAPES:
+            expected = 8 if (batch, input_size, size) in THREADED_SHAPES else 1
+            assert matmul_threads_for(batch, input_size, size) == expected, (batch, input_size, size)
+    finally:
+        set_matmul_threading(0, 0)

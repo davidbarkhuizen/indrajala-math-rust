@@ -443,10 +443,13 @@ unsafe fn dot_product_tile_avx2_fma<const RA: usize, const RB: usize>(a_rows: &[
 }
 
 /// `a @ b` for `a` (`M, K`) and a narrow `b` (`K, N`, `N` a few dozen at most), the conv ops'
-/// matmul: the same kernel and bits as `matmul`'s matrix @ matrix case, one row per block. Conv's
-/// `a` is tall (`cols`, `N * P` rows), and the conv shapes measured the same or slower with
-/// `matmul_2d`'s larger row blocks (the conv accumulate at 28x28, N = 512: 35-39 ms against
-/// 30-32 ms). Threaded over `M` rows like `matmul_2d`, which doesn't change any output's value.
+/// matmul: the same kernel and bits as `matmul`'s matrix @ matrix case, one row per block. Forward
+/// and downstream pass a tall `a` (`N * P` rows, `K` the fan-in or the channel count); accumulate
+/// passes `O` rows with `K = N * P`, where `matmul_2d`'s 16 KB rule gives one row per block too.
+/// The one comparison with `matmul_2d` recorded (the conv accumulate at 28x28, N = 512: 35-39 ms
+/// against 30-32 ms) ran that same 1-row path both times, so it was run-to-run variation; larger
+/// row blocks for the conv shapes are untested. Threaded over `M` rows like `matmul_2d`, which
+/// doesn't change any output's value.
 pub(crate) fn matmul_narrow(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
     let (Shape::Matrix(m, k), Shape::Matrix(b_k, n)) = (a.shape, b.shape) else {
         return Err(shape_error(a.shape, b.shape));

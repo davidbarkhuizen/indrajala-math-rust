@@ -362,7 +362,7 @@ def test_matrix_at_matrix_is_the_fma_chain_exactly(m, k, n):
 
 
 # (m, k, n) at the sizes the kernel's blocking and threading switch on: the dense layers' batch
-# downstream and accumulate (5408 and 784 wide), over the 4M-flop threading threshold, K large
+# downstream and accumulate (5408 and 784 wide), some over the 8M-flop threading threshold, K large
 # enough that a 16 KB row block is a few rows or less than one row, and a tall narrow product
 BIG_SHAPES = [
     (8, 32, 5408),

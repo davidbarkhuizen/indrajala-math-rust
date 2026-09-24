@@ -23,7 +23,7 @@ pytest tests/
 Always build with `--release`; a debug build is much slower. CI (`.github/workflows/ci.yml`) runs
 the same steps, plus `cargo check --release`, on every push and PR to `main`.
 
-`tests/` (~270 tests, under a second) checks each op against numpy and needs nothing from
+`tests/` (~860 tests, about 15 s) checks each op against numpy and needs nothing from
 indrajala-ml. The tests that check the fused layer ops against indrajala-ml's numpy reference
 classes live in indrajala-ml's own `tests/`, so a change to `src/fused.rs` or `src/conv.rs` should
 also be tested there: in an indrajala-ml checkout, point `rust/` at the new commit, then
@@ -36,7 +36,7 @@ also be tested there: in an indrajala-ml checkout, point `rust/` at the new comm
 | `src/lib.rs` | module definition; `ping()` toolchain check |
 | `src/array.rs` | `RustArray`: construction, `zeros`, `shape`, `.T`, indexing and contiguous slicing, `reshape`, `copy`, `tolist` |
 | `src/ops.rs` | elementwise `+ - * /` and in-place `+= -=` |
-| `src/linalg.rs` | `@` (matmul), `outer`; `set_matmul_threading(max_threads, threshold_flops)`, a test/benchmark override of the matmul threading (0 = default) |
+| `src/linalg.rs` | `@` (matmul), `outer`; `set_matmul_threading(max_threads, threshold_flops)`, a test/benchmark override of the matmul threading (0 = default); `matmul_threads_for(m, k, n)`, the thread count the policy picks for an `(m, k) @ (k, n)` product |
 | `src/ufuncs.rs` | `exp`, `sum_axis0`, `argmax`, `array_relu`, `array_relu_mask`, `array_softmax` |
 | `src/random.rs` | `uniform`, `bernoulli_mask`: unseeded hand-rolled xorshift128+, so not reproducible against numpy |
 | `src/mnist.rs` | `decode_mnist_pixels`: raw MNIST records to normalised pixels |
