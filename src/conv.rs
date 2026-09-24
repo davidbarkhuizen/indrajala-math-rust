@@ -233,7 +233,7 @@ pub fn conv_forward_batch(
                 }
             }
         }
-        tiled_row_range(&cols[example * p * fan_in..], &w_t.data, &mut by_position, 0, p, fan_in, o, 1);
+        tiled_row_range::<false>(&cols[example * p * fan_in..], &w_t.data, &mut by_position, 0, p, fan_in, o, 1);
         for channel in 0..o {
             let bias = b.data[channel];
             a.extend((0..p).map(|position| (by_position[position * o + channel] + bias).max(0.0)));

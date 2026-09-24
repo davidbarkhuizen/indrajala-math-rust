@@ -46,7 +46,7 @@ pub(crate) fn matmul(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
             // row per k instead (one load/FMA/store pass over it per row of b) took 43-52 us at
             // 32 x 5408, where the tiled kernel's registers took 21-22.
             let mut out = vec![0.0; cols];
-            tiled_row_range(&a.data, &b.data, &mut out, 0, 1, rows, cols, 1);
+            tiled_row_range::<false>(&a.data, &b.data, &mut out, 0, 1, rows, cols, 1);
             Ok(RustArray::from_vector(out))
         }
         (Shape::Matrix(r1, c1), Shape::Matrix(r2, c2)) => {
@@ -54,7 +54,7 @@ pub(crate) fn matmul(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
                 return Err(shape_error(a.shape, b.shape));
             }
             let mut out = vec![0.0; r1 * c2];
-            matmul_2d(&a.data, &b.data, &mut out, r1, c1, c2);
+            matmul_2d::<false>(&a.data, &b.data, &mut out, r1, c1, c2);
             Ok(RustArray::from_matrix(out, r1, c2))
         }
         (a_shape, b_shape) => Err(shape_error(a_shape, b_shape)),
@@ -227,12 +227,37 @@ unsafe fn dot_product_avx2_fma(a: &[f64], b: &[f64]) -> f64 {
 /// measured in the tens of microseconds) if queried unconditionally on every dispatch. Cached
 /// once behind a `OnceLock` and read only when there's already enough work to justify the
 /// question.
-fn matmul_2d(a_data: &[f64], b_data: &[f64], out: &mut [f64], r1: usize, c1: usize, c2: usize) {
+///
+/// `ADD` as in `tiled_row_range`: `out` holds `c` on entry and `c + a @ b` on return.
+fn matmul_2d<const ADD: bool>(a_data: &[f64], b_data: &[f64], out: &mut [f64], r1: usize, c1: usize, c2: usize) {
     const A_BLOCK_BYTES: usize = 16 * 1024;
     let rows_per_block = (A_BLOCK_BYTES / (c1 * std::mem::size_of::<f64>()).max(1)).max(1);
     for_each_row_range(out, r1, c2, r1 * c1 * c2, |chunk, row_start, row_end| {
-        tiled_row_range(a_data, b_data, chunk, row_start, row_end, c1, c2, rows_per_block);
+        tiled_row_range::<ADD>(a_data, b_data, chunk, row_start, row_end, c1, c2, rows_per_block);
     });
+}
+
+/// `c + a @ b` for matrices, bit-identical to `matmul(a, b)` then an elementwise add: each
+/// output's chain still starts from 0.0 and runs all of `k`, and only the finished chain is added
+/// to `c`, one rounding as the separate add. Saves that add's full pass over the output, and one
+/// output-sized array (`layer_accumulate_gradient_batch` at 32 x 5408 spent 140-160 us on the pass).
+pub(crate) fn matmul_add(c: &RustArray, a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
+    let (Shape::Matrix(r1, c1), Shape::Matrix(r2, c2)) = (a.shape, b.shape) else {
+        return Err(shape_error(a.shape, b.shape));
+    };
+    if c1 != r2 {
+        return Err(shape_error(a.shape, b.shape));
+    }
+    if c.shape != Shape::Matrix(r1, c2) {
+        return Err(PyValueError::new_err(format!(
+            "cannot add a product of shape {:?} to an array of shape {:?}",
+            Shape::Matrix(r1, c2),
+            c.shape
+        )));
+    }
+    let mut out = c.data.clone();
+    matmul_2d::<true>(&a.data, &b.data, &mut out, r1, c1, c2);
+    Ok(RustArray::from_matrix(out, r1, c2))
 }
 
 static MAX_THREADS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
@@ -455,7 +480,7 @@ pub(crate) fn matmul_narrow(a: &RustArray, b: &RustArray) -> PyResult<RustArray>
     }
     let mut out = vec![0.0; m * n];
     for_each_row_range(&mut out, m, n, m * k * n, |chunk, row_start, row_end| {
-        tiled_row_range(&a.data, &b.data, chunk, row_start, row_end, k, n, 1);
+        tiled_row_range::<false>(&a.data, &b.data, chunk, row_start, row_end, k, n, 1);
     });
     Ok(RustArray::from_matrix(out, m, n))
 }
@@ -471,7 +496,10 @@ pub(crate) fn matmul_narrow(a: &RustArray, b: &RustArray) -> PyResult<RustArray>
 /// Blocked over rows: for each block of `rows_per_block` rows, each column tile runs over every
 /// row of the block, so the tile's `K x 16` panel of `b` is read from cache by all of them. The
 /// order of rows and tiles doesn't change any output's value.
-pub(crate) fn tiled_row_range(
+///
+/// With `ADD`, every store adds the finished chain to the value already in `out_chunk` (`c +
+/// chain`) instead of overwriting it, which is the separate elementwise add's single rounding.
+pub(crate) fn tiled_row_range<const ADD: bool>(
     a_data: &[f64],
     b_data: &[f64],
     out_chunk: &mut [f64],
@@ -484,14 +512,14 @@ pub(crate) fn tiled_row_range(
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-            unsafe { tiled_row_range_avx2_fma(a_data, b_data, out_chunk, row_start, row_end, k, n, rows_per_block) };
+            unsafe { tiled_row_range_avx2_fma::<ADD>(a_data, b_data, out_chunk, row_start, row_end, k, n, rows_per_block) };
             return;
         }
     }
-    tiled_row_range_scalar(a_data, b_data, out_chunk, row_start, row_end, k, n);
+    tiled_row_range_scalar::<ADD>(a_data, b_data, out_chunk, row_start, row_end, k, n);
 }
 
-fn tiled_row_range_scalar(a_data: &[f64], b_data: &[f64], out_chunk: &mut [f64], row_start: usize, row_end: usize, k: usize, n: usize) {
+fn tiled_row_range_scalar<const ADD: bool>(a_data: &[f64], b_data: &[f64], out_chunk: &mut [f64], row_start: usize, row_end: usize, k: usize, n: usize) {
     for row in row_start..row_end {
         let a_row = &a_data[row * k..(row + 1) * k];
         let out_row = &mut out_chunk[(row - row_start) * n..(row - row_start + 1) * n];
@@ -500,7 +528,7 @@ fn tiled_row_range_scalar(a_data: &[f64], b_data: &[f64], out_chunk: &mut [f64],
             for (kk, &a_value) in a_row.iter().enumerate() {
                 sum = a_value.mul_add(b_data[kk * n + col], sum);
             }
-            *out_value = sum;
+            *out_value = if ADD { *out_value + sum } else { sum };
         }
     }
 }
@@ -520,7 +548,7 @@ const TILE_ROWS: usize = 2;
 /// `row_start..row_end`, `b`'s `k x n` data, or `out_chunk`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn tiled_row_range_avx2_fma(
+unsafe fn tiled_row_range_avx2_fma<const ADD: bool>(
     a_data: &[f64],
     b_data: &[f64],
     out_chunk: &mut [f64],
@@ -530,7 +558,7 @@ unsafe fn tiled_row_range_avx2_fma(
     n: usize,
     rows_per_block: usize,
 ) {
-    use std::arch::x86_64::{_mm256_fmadd_pd, _mm256_loadu_pd, _mm256_set1_pd, _mm256_setzero_pd, _mm256_storeu_pd};
+    use std::arch::x86_64::{_mm256_fmadd_pd, _mm256_loadu_pd, _mm256_set1_pd, _mm256_setzero_pd};
 
     let a_ptr = a_data.as_ptr();
     let b_ptr = b_data.as_ptr();
@@ -561,7 +589,7 @@ unsafe fn tiled_row_range_avx2_fma(
                 for r in 0..TILE_ROWS {
                     let out = out_ptr.add((row + r - row_start) * n + col);
                     for j in 0..4 {
-                        _mm256_storeu_pd(out.add(4 * j), acc[r][j]);
+                        store_lanes::<ADD>(out.add(4 * j), acc[r][j]);
                     }
                 }
                 row += TILE_ROWS;
@@ -578,10 +606,10 @@ unsafe fn tiled_row_range_avx2_fma(
                     acc3 = _mm256_fmadd_pd(a_vec, _mm256_loadu_pd(b_row.add(12)), acc3);
                 }
                 let out = out_ptr.add((row - row_start) * n + col);
-                _mm256_storeu_pd(out, acc0);
-                _mm256_storeu_pd(out.add(4), acc1);
-                _mm256_storeu_pd(out.add(8), acc2);
-                _mm256_storeu_pd(out.add(12), acc3);
+                store_lanes::<ADD>(out, acc0);
+                store_lanes::<ADD>(out.add(4), acc1);
+                store_lanes::<ADD>(out.add(8), acc2);
+                store_lanes::<ADD>(out.add(12), acc3);
             }
             col += 16;
         }
@@ -591,7 +619,7 @@ unsafe fn tiled_row_range_avx2_fma(
                 for (kk, &a_value) in a_data[row * k..(row + 1) * k].iter().enumerate() {
                     acc = _mm256_fmadd_pd(_mm256_set1_pd(a_value), _mm256_loadu_pd(b_ptr.add(kk * n + col)), acc);
                 }
-                _mm256_storeu_pd(out_ptr.add((row - row_start) * n + col), acc);
+                store_lanes::<ADD>(out_ptr.add((row - row_start) * n + col), acc);
             }
             col += 4;
         }
@@ -601,11 +629,27 @@ unsafe fn tiled_row_range_avx2_fma(
                 for (kk, &a_value) in a_data[row * k..(row + 1) * k].iter().enumerate() {
                     sum = a_value.mul_add(*b_ptr.add(kk * n + col), sum);
                 }
-                *out_ptr.add((row - row_start) * n + col) = sum;
+                let out = out_ptr.add((row - row_start) * n + col);
+                *out = if ADD { *out + sum } else { sum };
             }
             col += 1;
         }
         block_start = block_end;
+    }
+}
+
+/// `tiled_row_range_avx2_fma`'s store of 4 finished chains, added to the 4 values at `out` under
+/// `ADD`. Safety: as `tiled_row_range_avx2_fma`; `out` points at 4 values of its `out_chunk`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn store_lanes<const ADD: bool>(out: *mut f64, acc: std::arch::x86_64::__m256d) {
+    use std::arch::x86_64::{_mm256_add_pd, _mm256_loadu_pd, _mm256_storeu_pd};
+
+    if ADD {
+        _mm256_storeu_pd(out, _mm256_add_pd(_mm256_loadu_pd(out), acc));
+    } else {
+        _mm256_storeu_pd(out, acc);
     }
 }
 

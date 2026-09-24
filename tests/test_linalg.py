@@ -20,6 +20,7 @@ from indrajala_math_rust import (
     conv_downstream_batch,
     conv_forward_batch,
     layer_accumulate_gradient,
+    layer_accumulate_gradient_batch,
     layer_apply_accumulated_gradient,
     layer_relu_forward_batch,
     layer_sgd_step,
@@ -462,6 +463,48 @@ def test_thread_count_cannot_change_matmul_nt_bits(reset_matmul_threading, m, k,
     unthreaded, threaded = _under_each_thread_count(lambda: layer_relu_forward_batch(W, X, b).tolist())
     for threads, result in threaded.items():
         assert result == unthreaded, threads
+
+
+def _accumulate_case(m, k, n):
+    # delta_batch (k, m) and X (k, n), so the update is the (m, k) @ (k, n) product delta.T @ X;
+    # grad_w has zeros and -0.0 among its values, delta_batch zeros
+    rng = np.random.default_rng(m * 10000 + k * 100 + n + 2)
+    delta = rng.uniform(-1.0, 1.0, size=(k, m))
+    delta[rng.random(delta.shape) < 0.1] = 0.0
+    grad_w = rng.uniform(-1.0, 1.0, size=(m, n))
+    grad_w[rng.random(grad_w.shape) < 0.1] = 0.0
+    grad_w[rng.random(grad_w.shape) < 0.1] = -0.0
+    X = rng.uniform(-1.0, 1.0, size=(k, n))
+    return Array(delta.tolist()), Array(X.tolist()), Array(grad_w.tolist()), Array([0.0] * m)
+
+
+# every column path and row tile at short k, and the dense accumulate shapes
+@pytest.mark.parametrize(
+    "m, k, n", [(m, k, n) for m in range(1, 6) for k in (1, 2, 7) for n in TILE_WIDTHS] + BIG_SHAPES
+)
+def test_accumulate_gradient_batch_is_the_separate_add_exactly(m, k, n):
+    # the add fused into the product's store is the separate grad_w + delta.T @ X bit for bit:
+    # the product's chains start from 0.0, and grad_w joins only the finished chain
+    delta, X, grad_w, grad_b = _accumulate_case(m, k, n)
+    expected = (grad_w + delta.T @ X).tolist()
+    new_grad_w, _new_grad_b = layer_accumulate_gradient_batch(delta, X, grad_w, grad_b)
+    assert new_grad_w.tolist() == expected
+
+
+@pytest.mark.parametrize("m, k, n", BIG_SHAPES)
+def test_thread_count_cannot_change_accumulate_gradient_batch_bits(reset_matmul_threading, m, k, n):
+    delta, X, grad_w, grad_b = _accumulate_case(m, k, n)
+    unthreaded, threaded = _under_each_thread_count(
+        lambda: layer_accumulate_gradient_batch(delta, X, grad_w, grad_b)[0].tolist()
+    )
+    for threads, result in threaded.items():
+        assert result == unthreaded, threads
+
+
+def test_accumulate_gradient_batch_rejects_a_mismatched_grad_w():
+    delta, X, _grad_w, grad_b = _accumulate_case(3, 2, 5)
+    with pytest.raises(ValueError):
+        layer_accumulate_gradient_batch(delta, X, Array([[0.0] * 4] * 3), grad_b)
 
 
 # (input_height, input_width, input_channels, kernel_size, channel_count, stride), batch size:
