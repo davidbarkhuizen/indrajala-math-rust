@@ -4,6 +4,7 @@ against a hand-constructed array with a known, distinctive pattern, the same "is
 convention right" discipline the convolutional layer's own hot-pixel test uses.
 """
 
+import numpy as np
 import pytest
 
 from indrajala_math_rust import Array
@@ -32,6 +33,17 @@ def test_transpose_of_transpose_round_trips():
         matrix.T.T[row, col] for row in range(3) for col in range(2)
     ] == [matrix[row, col] for row in range(3) for col in range(2)]
 
+
+
+@pytest.mark.parametrize(
+    "rows, cols",
+    # whole 8 x 8 blocks, partial blocks on either axis, fewer than a block, a single row or
+    # column, and the dense accumulate's (512, 30) delta_batch at batch 512
+    [(1, 1), (1, 13), (13, 1), (7, 9), (8, 8), (16, 24), (17, 23), (512, 30), (30, 512)],
+)
+def test_transpose_matches_numpy_at_block_edges(rows, cols):
+    values = np.arange(rows * cols, dtype=float).reshape(rows, cols) + 0.5
+    assert Array(values.tolist()).T.tolist() == values.T.tolist()
 
 def _hot_pixel_matrix(rows: int, cols: int, hot_row: int, hot_col: int) -> Array:
     grid = [[0.0] * cols for _ in range(rows)]

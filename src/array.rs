@@ -233,10 +233,22 @@ impl RustArray {
         match self.shape {
             Shape::Vector(_) => self.clone(),
             Shape::Matrix(rows, cols) => {
+                // In 8 x 8 blocks, so each block reads 8 source lines and writes 8 whole output
+                // lines. A row-by-row loop writes a line per element at a stride of `rows`; at
+                // 512 rows that stride is 4 KB, every write lands in the same L1 set, and the
+                // (512, 30) delta_batch.T of the dense accumulate took 87-107 µs against numpy's
+                // 8-12. A copy, so bit-identical in any order.
+                const BLOCK: usize = 8;
                 let mut out = vec![0.0; rows * cols];
-                for row in 0..rows {
-                    for col in 0..cols {
-                        out[col * rows + row] = self.data[row * cols + col];
+                for row_start in (0..rows).step_by(BLOCK) {
+                    let row_end = (row_start + BLOCK).min(rows);
+                    for col_start in (0..cols).step_by(BLOCK) {
+                        let col_end = (col_start + BLOCK).min(cols);
+                        for col in col_start..col_end {
+                            for row in row_start..row_end {
+                                out[col * rows + row] = self.data[row * cols + col];
+                            }
+                        }
                     }
                 }
                 RustArray::from_matrix(out, cols, rows)
