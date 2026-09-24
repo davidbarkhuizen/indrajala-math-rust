@@ -21,7 +21,10 @@ from indrajala_math_rust import (
     conv_forward_batch,
     layer_accumulate_gradient,
     layer_accumulate_gradient_batch,
+    layer_adam_apply_accumulated_gradient,
     layer_apply_accumulated_gradient,
+    layer_l2_apply_accumulated_gradient,
+    layer_momentum_apply_accumulated_gradient,
     layer_relu_forward_batch,
     layer_sgd_step,
     matmul_threads_for,
@@ -237,6 +240,27 @@ def _sgd_step_inputs(rng, m, n):
     w = Array([_vector_with_special_values(rng, n) for _ in range(m)])
     b = Array(_vector_with_special_values(rng, m))
     return w, b, delta, x
+
+
+@pytest.mark.parametrize(
+    "name, call",
+    [
+        ("layer_apply_accumulated_gradient", lambda w, b, z: layer_apply_accumulated_gradient(w, b, w, b, 0.1, 0)),
+        ("layer_l2_apply_accumulated_gradient", lambda w, b, z: layer_l2_apply_accumulated_gradient(w, b, w, b, 0.01, 0.1, 0)),
+        (
+            "layer_momentum_apply_accumulated_gradient",
+            lambda w, b, z: layer_momentum_apply_accumulated_gradient(w, b, w, b, z, b, 0.9, 0.1, 0),
+        ),
+        (
+            "layer_adam_apply_accumulated_gradient",
+            lambda w, b, z: layer_adam_apply_accumulated_gradient(w, b, w, b, z, z, b, b, 1, 0.9, 0.999, 1e-8, 0.1, 0),
+        ),
+    ],
+)
+def test_apply_accumulated_gradient_rejects_a_zero_batch_size(name, call):
+    w, b, z = Array([[1.0, 2.0]]), Array([0.5]), Array([[0.0, 0.0]])
+    with pytest.raises(ValueError, match=f"^{name} requires batch_size >= 1$"):
+        call(w, b, z)
 
 
 @pytest.mark.parametrize("seed", range(20))
