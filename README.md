@@ -15,7 +15,7 @@ active virtualenv, so one must be active:
 ```
 python3 -m venv .venv
 source .venv/bin/activate
-pip install maturin pytest numpy
+pip install maturin==1.15.0 pytest numpy
 maturin develop --release   # rerun after any change under src/
 pytest tests/
 ```

@@ -14,13 +14,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Cargo check
-        run: cargo check --release
+      # target/'s dependency builds (pyo3 and its dependencies), keyed by rust-cache on the
+      # toolchain, Cargo.lock and Cargo.toml; the crate itself always recompiles. No separate
+      # `cargo check`: the maturin build below compiles everything anyway, and fails on the same
+      # errors.
+      - uses: Swatinem/rust-cache@v2
+      # maturin pinned to match indrajala-ml's ./cli (maturin_version); numpy and pytest left
+      # unpinned, so this CI checks the crate against the latest numpy while indrajala-ml's CI
+      # checks it against that repo's pinned one.
       - name: Create venv and install Python deps
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install maturin pytest numpy
+          pip install maturin==1.15.0 pytest numpy
       - name: Build extension
         run: |
           source .venv/bin/activate
