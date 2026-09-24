@@ -36,7 +36,7 @@ also be tested there: in an indrajala-ml checkout, point `rust/` at the new comm
 | `src/lib.rs` | module definition; `ping()` toolchain check |
 | `src/array.rs` | `RustArray`: construction, `zeros`, `shape`, `.T`, indexing and contiguous slicing, `reshape`, `copy`, `tolist` |
 | `src/ops.rs` | elementwise `+ - * /` and in-place `+= -=` |
-| `src/linalg.rs` | `@` (matmul), `outer` |
+| `src/linalg.rs` | `@` (matmul), `outer`; `set_matmul_threading(max_threads, threshold_flops)`, a test/benchmark override of the matmul threading (0 = default) |
 | `src/ufuncs.rs` | `exp`, `sum_axis0`, `argmax`, `array_relu`, `array_relu_mask`, `array_softmax` |
 | `src/random.rs` | `uniform`, `bernoulli_mask`: unseeded hand-rolled xorshift128+, so not reproducible against numpy |
 | `src/mnist.rs` | `decode_mnist_pixels`: raw MNIST records to normalised pixels |

@@ -25,7 +25,7 @@ use fused::{
     layer_relu_hidden_delta_batch, layer_sgd_step, layer_softmax_forward,
     layer_softmax_forward_batch, layer_softmax_output_delta,
 };
-use linalg::outer;
+use linalg::{outer, set_matmul_threading};
 use mnist::decode_mnist_pixels;
 use random::{bernoulli_mask, uniform};
 use ufuncs::{argmax, array_relu, array_relu_mask, array_softmax, exp, sum_axis0};
@@ -40,6 +40,7 @@ fn ping() -> PyResult<String> {
 #[pymodule]
 fn indrajala_math_rust(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ping, m)?)?;
+    m.add_function(wrap_pyfunction!(set_matmul_threading, m)?)?;
     m.add_function(wrap_pyfunction!(exp, m)?)?;
     m.add_function(wrap_pyfunction!(outer, m)?)?;
     m.add_function(wrap_pyfunction!(sum_axis0, m)?)?;
