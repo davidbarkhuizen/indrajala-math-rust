@@ -224,6 +224,79 @@ def test_a_vector_operand_is_one_example_with_the_same_bits(shape):
     assert [r.tolist() for r in vec] == [r.tolist() for r in row]
 
 
+# (shape, N) beyond SHAPES x (1, BATCH_SIZE) for the backward ops' matmul_narrow calls, whose
+# output rows are fan_in wide: 9 (4-wide blocks and a tail), 12 (4-wide blocks only), 18 (a
+# 16-wide block and a tail) and 72 (16- and 4-wide blocks); fan_in 800 (many 16-wide blocks, and
+# cols over matmul's 256 KB blocking threshold); a 28x28 input at N = 128 (downstream over the
+# 4M-flop threading threshold); and 13x13x8 x 32 at N = 32 (both threaded)
+BACKWARD_EXTRA_CASES = [
+    ((6, 6, 1, 3, 3, 1), 2),
+    ((6, 6, 3, 2, 5, 1), 2),
+    ((6, 6, 2, 3, 4, 1), 2),
+    ((13, 13, 8, 3, 8, 1), 3),
+    ((8, 8, 32, 5, 6, 1), 2),
+    ((28, 28, 1, 3, 8, 1), 128),
+    ((13, 13, 8, 3, 32, 1), 32),
+]
+
+
+def _backward_case(seed, shape, n):
+    rng = np.random.default_rng(seed)
+    height, width, channels, k, channel_count, _s = shape
+    g = _geometry(shape)
+    W = rng.uniform(-1.0, 1.0, size=(channel_count, g.fan_in))
+    X = rng.uniform(-1.0, 1.0, size=(n, g.input_size))
+    delta = rng.uniform(-1.0, 1.0, size=(n, channel_count * g.positions))
+    delta[rng.random(delta.shape) < 0.3] = 0.0  # what a ReLU mask leaves
+    return W, X, delta, g
+
+
+@pytest.mark.parametrize(
+    "shape, n", [(shape, n) for shape in SHAPES for n in (1, BATCH_SIZE)] + BACKWARD_EXTRA_CASES
+)
+def test_conv_downstream_batch_is_the_matmul_col2im_exactly(shape, n):
+    # rebuild dX from its parts: the crate's own matmul (Array @) on the deltas regrouped to
+    # (N*P, O), then col2im as a sequential scatter-add in the op's order (kernel offset outside
+    # output position). The op computes D @ W with matmul_narrow, so this is its exact check
+    W, _X, delta, g = _backward_case(8, shape, n)
+    o, p, k, fan_in = len(W), g.positions, g.kernel_size, g.fan_in
+    by_position = delta.reshape(n, o, p).transpose(0, 2, 1).reshape(n * p, o)
+    dcols = _np(Array(by_position.tolist()) @ Array(W.tolist())).tolist()
+
+    expected = [[0.0] * g.input_size for _ in range(n)]
+    for example in range(n):
+        out = expected[example]
+        for c, kr, kc in itertools.product(range(g.input_channels), range(k), range(k)):
+            column = (c * k + kr) * k + kc
+            for out_row, out_col in itertools.product(range(g.out_height), range(g.out_width)):
+                row, col = out_row * g.stride + kr, out_col * g.stride + kc
+                out[(c * g.input_height + row) * g.input_width + col] += dcols[example * p + out_row * g.out_width + out_col][column]
+
+    dX = conv_downstream_batch(Array(W.tolist()), Array(delta.tolist()), g)
+    assert dX.tolist() == expected
+
+
+@pytest.mark.parametrize(
+    "shape, n", [(shape, n) for shape in SHAPES for n in (1, BATCH_SIZE)] + BACKWARD_EXTRA_CASES
+)
+def test_conv_accumulate_gradient_batch_is_the_matmul_update_exactly(shape, n):
+    # grad_W: grad_W0 + (the crate's own matmul of the deltas regrouped to (O, N*P) with cols),
+    # one add per element. The op computes D @ cols with matmul_narrow, so this is its exact check
+    W, X, delta, g = _backward_case(9, shape, n)
+    o, p = len(W), g.positions
+    b = np.zeros(o)
+    _A, cols = conv_forward_batch(Array(W.tolist()), Array(X.tolist()), Array(b.tolist()), g)
+    rng = np.random.default_rng(10)
+    grad_W0 = rng.uniform(-1.0, 1.0, size=W.shape)
+    by_channel = delta.reshape(n, o, p).transpose(1, 0, 2).reshape(o, n * p)
+    expected = grad_W0 + _np(Array(by_channel.tolist()) @ cols)
+
+    grad_W, _grad_b = conv_accumulate_gradient_batch(
+        Array(delta.tolist()), cols, Array(grad_W0.tolist()), Array(b.tolist()), g
+    )
+    assert grad_W.tolist() == expected.tolist()
+
+
 @pytest.mark.parametrize("shape", SHAPES)
 def test_conv_downstream_batch_matches_the_brute_force_definition(shape):
     W, _b, _X, delta = _random_case(1, shape)
