@@ -1,6 +1,6 @@
 """
-The Python<->Rust round-trip works for construction, shape, single-element read/write (both the
-1D scalar-index and 2D tuple-index shapes), .copy(), and .reshape().
+The Python<->Rust round-trip works for construction (including from_rows), shape, single-element read/write (both the
+1D scalar-index and 2D tuple-index shapes), .copy(), .reshape(), and the row ops row()/take_rows().
 """
 
 import pytest
@@ -96,3 +96,57 @@ def test_reshape_rejects_a_size_mismatch():
     arr = Array([1.0, 2.0, 3.0, 4.0])
     with pytest.raises(ValueError):
         arr.reshape((3, 3))
+
+
+def test_from_rows_matches_nested_construction_for_lists_and_tuples():
+    nested = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+    expected = Array(nested).tolist()
+    assert Array.from_rows(nested).tolist() == expected
+    assert Array.from_rows([tuple(row) for row in nested]).tolist() == expected
+    assert Array.from_rows(tuple(tuple(row) for row in nested)).shape == (2, 3)
+
+
+def test_from_rows_rejects_ragged_and_empty_input():
+    with pytest.raises(ValueError):
+        Array.from_rows([[1.0, 2.0], [3.0]])
+    with pytest.raises(ValueError):
+        Array.from_rows([[1.0], [2.0, 3.0]])
+    with pytest.raises(ValueError):
+        Array.from_rows([])
+    with pytest.raises(TypeError):
+        Array.from_rows([[1.0, "x"]])
+
+
+def test_row_copies_one_row_as_a_vector():
+    arr = Array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+    row = arr.row(1)
+    assert row.shape == (2,)
+    assert row.tolist() == [3.0, 4.0]
+    row[0] = 99.0
+    assert arr[1, 0] == 3.0
+    with pytest.raises(IndexError):
+        arr.row(3)
+    with pytest.raises(OverflowError):
+        arr.row(-1)
+    with pytest.raises(ValueError):
+        Array([1.0, 2.0]).row(0)
+
+
+def test_take_rows_gathers_rows_in_the_given_order_with_repeats():
+    arr = Array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+    taken = arr.take_rows([2, 0, 2])
+    assert taken.shape == (3, 2)
+    assert taken.tolist() == [[5.0, 6.0], [1.0, 2.0], [5.0, 6.0]]
+    with pytest.raises(IndexError):
+        arr.take_rows([0, 3])
+    with pytest.raises(ValueError):
+        arr.take_rows([])
+    with pytest.raises(ValueError):
+        Array([1.0, 2.0]).take_rows([0])
+
+
+def test_from_rows_reads_other_sequences_through_iteration():
+    from array import array
+
+    rows = [array("d", [1.0, 2.0]), array("d", [3.0, 4.0])]
+    assert Array.from_rows(rows).tolist() == [[1.0, 2.0], [3.0, 4.0]]
