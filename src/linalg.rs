@@ -505,9 +505,17 @@ fn tiled_row_range_scalar(a_data: &[f64], b_data: &[f64], out_chunk: &mut [f64],
     }
 }
 
+/// Rows per 16-column register tile in `tiled_row_range_avx2_fma`: each `k` loads the tile's `b`
+/// row once for all of them, and their `4 * TILE_ROWS` independent FMA chains hide more of the FMA
+/// latency than one row's 4 chains. A probe measured 2 rows 10-18% faster than 1 at short `k`
+/// (`(32, 32) @ (32, 5408)`) and 7-31% at `k` = 512; 3 rows won only at `k` = 128.
+const TILE_ROWS: usize = 2;
+
 /// AVX2+FMA path: output columns in tiles of 16 (four 4-lane accumulators), then 4, then a
-/// scalar tail, each tile running all of `k` before it is stored. Lane `j`'s accumulator is
-/// exactly `tiled_row_range_scalar`'s `sum` for that column. Safety: only called after
+/// scalar tail, each tile running all of `k` before it is stored. The 16-wide tiles cover
+/// `TILE_ROWS` rows of a block at once, and a block's leftover rows run them one row at a time.
+/// Lane `j`'s accumulator is exactly `tiled_row_range_scalar`'s `sum` for that column, whichever
+/// tile computes it. Safety: only called after
 /// `tiled_row_range`'s runtime feature check; every pointer offset stays inside `a`'s rows
 /// `row_start..row_end`, `b`'s `k x n` data, or `out_chunk`.
 #[cfg(target_arch = "x86_64")]
@@ -524,6 +532,7 @@ unsafe fn tiled_row_range_avx2_fma(
 ) {
     use std::arch::x86_64::{_mm256_fmadd_pd, _mm256_loadu_pd, _mm256_set1_pd, _mm256_setzero_pd, _mm256_storeu_pd};
 
+    let a_ptr = a_data.as_ptr();
     let b_ptr = b_data.as_ptr();
     let out_ptr = out_chunk.as_mut_ptr();
     let mut block_start = row_start;
@@ -531,7 +540,33 @@ unsafe fn tiled_row_range_avx2_fma(
         let block_end = (block_start + rows_per_block).min(row_end);
         let mut col = 0;
         while col + 16 <= n {
-            for row in block_start..block_end {
+            let mut row = block_start;
+            while row + TILE_ROWS <= block_end {
+                let mut acc = [[_mm256_setzero_pd(); 4]; TILE_ROWS];
+                for kk in 0..k {
+                    let b_row = b_ptr.add(kk * n + col);
+                    let b_tile = [
+                        _mm256_loadu_pd(b_row),
+                        _mm256_loadu_pd(b_row.add(4)),
+                        _mm256_loadu_pd(b_row.add(8)),
+                        _mm256_loadu_pd(b_row.add(12)),
+                    ];
+                    for r in 0..TILE_ROWS {
+                        let a_vec = _mm256_set1_pd(*a_ptr.add((row + r) * k + kk));
+                        for j in 0..4 {
+                            acc[r][j] = _mm256_fmadd_pd(a_vec, b_tile[j], acc[r][j]);
+                        }
+                    }
+                }
+                for r in 0..TILE_ROWS {
+                    let out = out_ptr.add((row + r - row_start) * n + col);
+                    for j in 0..4 {
+                        _mm256_storeu_pd(out.add(4 * j), acc[r][j]);
+                    }
+                }
+                row += TILE_ROWS;
+            }
+            for row in row..block_end {
                 let (mut acc0, mut acc1, mut acc2, mut acc3) =
                     (_mm256_setzero_pd(), _mm256_setzero_pd(), _mm256_setzero_pd(), _mm256_setzero_pd());
                 for (kk, &a_value) in a_data[row * k..(row + 1) * k].iter().enumerate() {

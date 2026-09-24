@@ -351,7 +351,13 @@ def _fma_chain(a_row, b, col):
 TILE_WIDTHS = (1, 3, 4, 5, 15, 16, 17, 20, 21, 35)
 
 
-@pytest.mark.parametrize("m, k, n", [(m, k, n) for m in (1, 3) for k in (1, 2, 7) for n in TILE_WIDTHS])
+# m from 1 to 2 * TILE_ROWS + 1 covers 1-row products, whole row tiles, and a leftover row after
+# one or two tiles; at k = 600 a 16 KB row block is 3 rows, so m = 7 leaves a leftover row at the
+# end of every block (blocks of 3, 3, 1)
+@pytest.mark.parametrize(
+    "m, k, n",
+    [(m, k, n) for m in range(1, 6) for k in (1, 2, 7) for n in TILE_WIDTHS] + [(7, 600, n) for n in TILE_WIDTHS],
+)
 def test_matrix_at_matrix_is_the_fma_chain_exactly(m, k, n):
     rng = np.random.default_rng(m * 10000 + k * 100 + n)
     A = rng.uniform(-1.0, 1.0, size=(m, k))
