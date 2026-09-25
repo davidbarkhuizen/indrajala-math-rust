@@ -13,8 +13,8 @@
 //! - the cached im2col columns are `(N*P, C*k*k)`, `P = out_height * out_width`, row `n*P + p`
 //!   with `p` in row-major output order, columns in `W`-row order.
 //!
-//! Every conv reduction goes through `linalg::matmul_narrow` (the forward through its kernel, `tiled_row_range`, one
-//! example at a time), which gives `matmul`'s bits: the summation order is that file's one fixed grouping -
+//! Every conv reduction goes through `linalg`'s tiled kernel, `tiled_row_range` (the forward one example at a time,
+//! the downstream through `matmul_narrow`, the accumulate through `matmul_long_k`), which gives `matmul`'s bits: the summation order is that file's one fixed grouping -
 //! machine-independent, and within `rtol` of numpy rather than bit-identical to it. Pooling does no arithmetic beyond
 //! the scatter-add, so it matches numpy exactly.
 
@@ -22,7 +22,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::array::{RustArray, Shape};
-use crate::linalg::{matmul_narrow, tiled_row_range};
+use crate::linalg::{matmul_long_k, matmul_narrow, tiled_row_range, Panel, OVERWRITE};
 
 /// The shape arithmetic for one conv or pool layer, built once by the Python layer and passed to
 /// every call. Pooling uses it with `kernel_size = pool_size`.
@@ -233,15 +233,11 @@ pub fn conv_forward_batch(
                 }
             }
         }
-        tiled_row_range::<false>(
+        tiled_row_range::<OVERWRITE>(
             &cols[example * p * fan_in..],
             &w_t.data,
             &mut by_position,
-            0,
-            p,
-            fan_in,
-            o,
-            1,
+            Panel::whole(0, p, fan_in, o, 1),
         );
         for channel in 0..o {
             let bias = b.data[channel];
@@ -285,7 +281,7 @@ pub fn conv_downstream_batch(w: &RustArray, delta_batch: &RustArray, geometry: &
     Ok(batch_output(dx, n, g.input_size, is_vector))
 }
 
-/// `ConvArrayLayer._accumulate`: `grad_W += D @ cols` with `matmul_narrow`, `D` the deltas regrouped to
+/// `ConvArrayLayer._accumulate`: `grad_W += D @ cols` with `matmul_long_k`, `D` the deltas regrouped to
 /// `(O, N*P)`, and `grad_b += ` each channel's delta sum over every example and position. Returns
 /// the updated pair for the caller to rebind, as `layer_accumulate_gradient_batch` does. A vector
 /// `delta_batch` is one example, whose `cols` has `P` rows.
@@ -314,7 +310,7 @@ pub fn conv_accumulate_gradient_batch(
     )?;
 
     let by_channel = deltas_by_channel(delta_batch, n, o, p); // (O, N*P)
-    let update = matmul_narrow(&by_channel, cols)?;
+    let update = matmul_long_k(&by_channel, cols)?;
     let new_grad_w = grad_w.combine_with_array(&update, |g, u| g + u, "add")?;
     let new_grad_b = grad_b
         .data
