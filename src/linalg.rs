@@ -707,18 +707,26 @@ unsafe fn tiled_row_range_avx2_fma<const MODE: u8>(a_data: &[f64], b_data: &[f64
     use std::arch::x86_64::{_mm256_fmadd_pd, _mm256_set1_pd};
 
     let Panel {
-        k, n, k_start, k_end, ..
+        row_start,
+        row_end,
+        rows_per_block,
+        col_start,
+        col_end,
+        k_start,
+        k_end,
+        k,
+        n,
+        out_stride,
     } = panel;
     let a_ptr = a_data.as_ptr();
     let b_ptr = b_data.as_ptr();
     let out_ptr = out.as_mut_ptr();
-    let out_at =
-        |row: usize, col: usize| out_ptr.add((row - panel.row_start) * panel.out_stride + col - panel.col_start);
-    let mut block_start = panel.row_start;
-    while block_start < panel.row_end {
-        let block_end = (block_start + panel.rows_per_block).min(panel.row_end);
-        let mut col = panel.col_start;
-        while col + 16 <= panel.col_end {
+    let out_at = move |row: usize, col: usize| out_ptr.add((row - row_start) * out_stride + col - col_start);
+    let mut block_start = row_start;
+    while block_start < row_end {
+        let block_end = (block_start + rows_per_block).min(row_end);
+        let mut col = col_start;
+        while col + 16 <= col_end {
             let mut row = block_start;
             while row + TILE_ROWS <= block_end {
                 let mut acc = [[chain_start::<MODE>(out_at(row, col)); 4]; TILE_ROWS];
@@ -760,7 +768,7 @@ unsafe fn tiled_row_range_avx2_fma<const MODE: u8>(a_data: &[f64], b_data: &[f64
             }
             col += 16;
         }
-        while col + 4 <= panel.col_end {
+        while col + 4 <= col_end {
             for row in block_start..block_end {
                 let mut acc = chain_start::<MODE>(out_at(row, col));
                 for (i, &a_value) in a_data[row * k + k_start..row * k + k_end].iter().enumerate() {
@@ -770,7 +778,7 @@ unsafe fn tiled_row_range_avx2_fma<const MODE: u8>(a_data: &[f64], b_data: &[f64
             }
             col += 4;
         }
-        while col < panel.col_end {
+        while col < col_end {
             for row in block_start..block_end {
                 let out_value = out_at(row, col);
                 let mut sum = if MODE == RESUME { *out_value } else { 0.0f64 };
