@@ -1,11 +1,7 @@
 """
-bernoulli_mask/draw_bernoulli_mask is an RNG primitive, a fresh category from the mechanical
-fused-arithmetic ops elsewhere in this crate. Checked directly against numpy's own
-np.random.random(shape) >= drop_probability formula before DropoutRustArrayLayer/
-layer_dropout_forward ever rely on it, the same "prove the primitive against numpy before
-building the layer" discipline array_relu/array_softmax follow. Like uniform() (test_random_uniform.py), bit-identical parity against numpy's own
-Mersenne Twister stream isn't achievable with a hand-rolled generator - this checks range/shape and
-statistical keep-rate instead, not per-draw equality.
+bernoulli_mask's shape, 0/1 entries and statistical keep rate. Its bit-identical parity with
+(np.random.random(shape) >= drop_probability) is test_random_numpy_parity.py's; these hold for
+any sound generator, and scripts/rng_audit.py quality reruns the keep rate at scale.
 """
 
 import statistics
@@ -29,7 +25,7 @@ def test_bernoulli_mask_entries_are_exactly_zero_or_one():
 
 def test_bernoulli_mask_mean_keep_rate_is_statistically_plausible():
     # a Bernoulli(keep_probability) mask has mean keep_probability - checked within a generous
-    # tolerance across a large N, not per-draw equality (see this module's own docstring).
+    # tolerance across a large N.
     drop_probability = 0.3
     expected_keep_rate = 1.0 - drop_probability
     n = 20000
