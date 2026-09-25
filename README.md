@@ -24,16 +24,27 @@ pytest tests/
 
 Always build with `--release`; a debug build is much slower.
 
-Before committing, format and lint:
+Before committing, format and lint the Rust and the Python tests, and check the type stub (with
+`ruff==0.16.9 pyright==1.1.414 mypy==2.3.1` installed, CI's pins):
 
 ```
 cargo fmt
 cargo clippy --all-targets -- -D warnings
+ruff check --fix . && ruff format .
+pyright
+(cd /tmp && python -m mypy.stubtest indrajala_math_rust --allowlist "$OLDPWD/stubtest_allowlist.txt")
 ```
 
-`rustfmt.toml` sets the line width (120); lint levels are in `Cargo.toml`'s `[lints]`. CI
-(`.github/workflows/ci.yml`) runs `cargo fmt --check`, the clippy command above and the build and
-test steps on every push and PR to `main`.
+`rustfmt.toml` sets the Rust line width (120) and `Cargo.toml`'s `[lints]` the lint levels;
+`pyproject.toml` configures ruff (120) and pyright (`standard`, over `tests/` and the stub).
+
+`indrajala_math_rust.pyi` is the extension's type stub, which maturin packages with a `py.typed`
+marker. Update it with any change to the Python API: stubtest (run on the installed build, after
+`maturin develop`) fails on a missing, extra or renamed function or parameter, and pyright on the
+tests catches wrong types.
+
+CI (`.github/workflows/ci.yml`) runs all of these, and the build and test steps, on every push and
+PR to `main`.
 
 `tests/` (~1,560 tests, about 20 s) checks each op against numpy and needs nothing from
 indrajala-ml. The tests that check the fused layer ops against indrajala-ml's numpy reference
@@ -46,6 +57,7 @@ also be tested there: in an indrajala-ml checkout, point `rust/` at the new comm
 | File | Python API |
 | --- | --- |
 | `src/lib.rs` | module definition; `ping()` toolchain check |
+| `indrajala_math_rust.pyi` | type stub for the whole Python API (packaged with `py.typed`) |
 | `src/array.rs` | `RustArray`: construction, `zeros`, `shape`, `.T`, indexing and contiguous slicing, `reshape`, `copy`, `tolist` |
 | `src/ops.rs` | elementwise `+ - * /` and in-place `+= -=` |
 | `src/linalg.rs` | `@` (matmul), `outer`; `set_matmul_threading(max_threads, threshold_flops)`, a test/benchmark override of the matmul threading (0 = default); `matmul_threads_for(m, k, n)`, the thread count the policy picks for an `(m, k) @ (k, n)` product |

@@ -55,17 +55,12 @@ def _pure_python_matvec(matrix, vector):
 
 def _pure_python_vecmat(vector, matrix):
     cols = len(matrix[0])
-    return [
-        sum(vector[k] * matrix[k][col] for k in range(len(vector))) for col in range(cols)
-    ]
+    return [sum(vector[k] * matrix[k][col] for k in range(len(vector))) for col in range(cols)]
 
 
 def _pure_python_matmat(a, b):
     rows, inner, cols = len(a), len(b), len(b[0])
-    return [
-        [sum(a[row][k] * b[k][col] for k in range(inner)) for col in range(cols)]
-        for row in range(rows)
-    ]
+    return [[sum(a[row][k] * b[k][col] for k in range(inner)) for col in range(cols)] for row in range(rows)]
 
 
 @pytest.mark.parametrize("seed", range(15))
@@ -115,7 +110,7 @@ def test_matrix_at_matrix_matches_numpy_and_pure_python(seed):
 
 def test_matmul_rejects_incompatible_shapes():
     with pytest.raises(ValueError):
-        Array.zeros((3, 4)) @ Array.zeros((5, 6))
+        _ = Array.zeros((3, 4)) @ Array.zeros((5, 6))
 
 
 @pytest.mark.parametrize("seed", range(15))
@@ -145,9 +140,7 @@ def test_sum_axis0_matches_numpy_and_pure_python(seed):
 
     result = sum_axis0(Array(matrix_data))
     expected_numpy = np.array(matrix_data).sum(axis=0)
-    expected_python = [
-        sum(matrix_data[row][col] for row in range(5)) for col in range(4)
-    ]
+    expected_python = [sum(matrix_data[row][col] for row in range(5)) for col in range(4)]
 
     actual = _to_numpy(result)
     assert actual == pytest.approx(expected_numpy)
@@ -246,7 +239,10 @@ def _sgd_step_inputs(rng, m, n):
     "name, call",
     [
         ("layer_apply_accumulated_gradient", lambda w, b, z: layer_apply_accumulated_gradient(w, b, w, b, 0.1, 0)),
-        ("layer_l2_apply_accumulated_gradient", lambda w, b, z: layer_l2_apply_accumulated_gradient(w, b, w, b, 0.01, 0.1, 0)),
+        (
+            "layer_l2_apply_accumulated_gradient",
+            lambda w, b, z: layer_l2_apply_accumulated_gradient(w, b, w, b, 0.01, 0.1, 0),
+        ),
         (
             "layer_momentum_apply_accumulated_gradient",
             lambda w, b, z: layer_momentum_apply_accumulated_gradient(w, b, w, b, z, b, 0.9, 0.1, 0),
@@ -328,8 +324,15 @@ def test_layer_momentum_apply_accumulated_gradient_is_the_papers_momentum_exactl
         grad_w = [_vector_with_special_values(rng, n) for _ in range(m)]
         grad_b = _vector_with_special_values(rng, m)
         got_w, got_b, got_velocity_w, got_velocity_b = layer_momentum_apply_accumulated_gradient(
-            got_w, got_b, Array(grad_w), Array(grad_b), got_velocity_w, got_velocity_b,
-            momentum, learning_rate, batch_size,
+            got_w,
+            got_b,
+            Array(grad_w),
+            Array(grad_b),
+            got_velocity_w,
+            got_velocity_b,
+            momentum,
+            learning_rate,
+            batch_size,
         )
         rows = [_momentum_step(*args, momentum, learning_rate, batch_size) for args in zip(w, grad_w, velocity_w)]
         w, velocity_w = [row for row, _ in rows], [uv for _, uv in rows]
@@ -508,9 +511,7 @@ def _fma_chain_row(a, B):
 # every column path at a few k, and the dense layers' single-example downstream shapes (the conv
 # tail's 32 x 5408, 30 x 784, dense MNIST's 10 x 30), which the tests above only compare with the
 # matrix @ matrix case, the same kernel
-@pytest.mark.parametrize(
-    "k, n", [(k, n) for k in (1, 2, 7) for n in TILE_WIDTHS] + [(32, 5408), (30, 784), (10, 30)]
-)
+@pytest.mark.parametrize("k, n", [(k, n) for k in (1, 2, 7) for n in TILE_WIDTHS] + [(32, 5408), (30, 784), (10, 30)])
 def test_vector_at_matrix_is_the_fma_chain_exactly(k, n):
     # pins the reference the test above compares against
     rng = np.random.default_rng(k * 100 + n)
@@ -658,7 +659,9 @@ def test_policy_threads_the_batch_512_products_all_or_nothing(reset_matmul_threa
     # they gained end to end (or came out even); no 2- or 4-thread middle ground
     # (the count itself is the machine's parallelism, capped at 8)
     set_matmul_threading(0, 0)
-    counts = {shape: matmul_threads_for(*shape) for shape in (DENSE_BATCH_512, CONV_ACCUMULATE_512, CONV_TAIL_BATCH_512)}
+    counts = {
+        shape: matmul_threads_for(*shape) for shape in (DENSE_BATCH_512, CONV_ACCUMULATE_512, CONV_TAIL_BATCH_512)
+    }
     assert len(set(counts.values())) == 1, counts
     assert 1 <= counts[CONV_TAIL_BATCH_512] <= 8
     if len(os.sched_getaffinity(0)) >= 2:

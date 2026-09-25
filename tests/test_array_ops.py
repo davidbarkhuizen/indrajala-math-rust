@@ -120,4 +120,4 @@ def test_apply_accumulated_gradient_formula_matches_numpy():
 
 def test_mismatched_shapes_raise():
     with pytest.raises(ValueError):
-        Array([1.0, 2.0, 3.0]) + Array([1.0, 2.0])
+        _ = Array([1.0, 2.0, 3.0]) + Array([1.0, 2.0])

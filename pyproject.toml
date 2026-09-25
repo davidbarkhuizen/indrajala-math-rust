@@ -9,3 +9,11 @@ requires-python = ">=3.9"
 
 [tool.maturin]
 module-name = "indrajala_math_rust"
+
+# Lint and type-check tools, pinned in CI (.github/workflows/ci.yml) to indrajala-ml's versions.
+[tool.ruff]
+line-length = 120
+
+[tool.pyright]
+include = ["tests", "indrajala_math_rust.pyi"]
+typeCheckingMode = "standard"
