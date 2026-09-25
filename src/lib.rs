@@ -25,7 +25,7 @@ use fused::{
 };
 use linalg::{matmul_threads_for, outer, set_kernel_overrides, set_matmul_threading};
 use mnist::decode_mnist_pixels;
-use random::{bernoulli_mask, uniform};
+use random::{bernoulli_mask, seed, seed_at_import, uniform};
 use ufuncs::{argmax, array_relu, array_relu_mask, array_softmax, exp, sum_axis0};
 
 /// Proves the PyO3/maturin toolchain works end to end - importable and callable from Python,
@@ -48,6 +48,8 @@ fn indrajala_math_rust(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(array_relu, m)?)?;
     m.add_function(wrap_pyfunction!(array_relu_mask, m)?)?;
     m.add_function(wrap_pyfunction!(array_softmax, m)?)?;
+    m.add_function(wrap_pyfunction!(seed, m)?)?;
+    m.add_function(wrap_pyfunction!(random::random, m)?)?;
     m.add_function(wrap_pyfunction!(uniform, m)?)?;
     m.add_function(wrap_pyfunction!(bernoulli_mask, m)?)?;
     m.add_function(wrap_pyfunction!(decode_mnist_pixels, m)?)?;
@@ -83,5 +85,6 @@ fn indrajala_math_rust(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(max_pool_downstream_batch, m)?)?;
     m.add_class::<RustArray>()?;
     m.add_class::<ConvGeometry>()?;
+    seed_at_import();
     Ok(())
 }

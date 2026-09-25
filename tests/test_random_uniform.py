@@ -1,8 +1,7 @@
 """
-uniform() cannot be checked for bit-identical parity against numpy's Mersenne Twister (a
-hand-rolled PRNG never reproduces it) - so this checks range bounds, shape, and statistical
-properties (mean/variance within tolerance across a large N) instead, a deliberately weaker bar
-than this crate's other exact-match tests.
+uniform()'s range bounds, shape and statistical properties (mean/variance within tolerance across
+a large N). Its bit-identical parity with np.random.uniform is test_random_numpy_parity.py's;
+these hold for any sound generator, and scripts/rng_audit.py quality reruns them at scale.
 """
 
 import statistics
@@ -28,8 +27,7 @@ def test_uniform_draws_stay_within_the_requested_range():
 
 def test_uniform_mean_and_variance_are_statistically_plausible():
     # a uniform[low, high) distribution has mean (low+high)/2 and variance (high-low)^2/12 -
-    # checked within a generous tolerance across a large N, not per-draw equality (see this
-    # module's own docstring for why bit-identical parity isn't the achievable bar here).
+    # checked within a generous tolerance across a large N.
     low, high = -3.0, 3.0
     n = 20000
     arr = uniform(low, high, n)
