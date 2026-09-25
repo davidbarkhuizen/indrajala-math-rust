@@ -307,6 +307,39 @@ def test_layer_l2_apply_accumulated_gradient_is_the_papers_weight_decay_exactly(
     assert _bits(new_b.tolist()) == _bits([bv - learning_rate * (g / batch_size) for bv, g in zip(b, grad_b)])
 
 
+def _momentum_step(params, grads, velocity, momentum, learning_rate, batch_size):
+    new_velocity = [momentum * uv + g / batch_size for uv, g in zip(velocity, grads)]
+    return [pv - learning_rate * uv for pv, uv in zip(params, new_velocity)], new_velocity
+
+
+@pytest.mark.parametrize("seed", range(10))
+@pytest.mark.parametrize("batch_size", _APPLY_BATCH_SIZES)
+@pytest.mark.parametrize("momentum", [0.5, 0.9])
+def test_layer_momentum_apply_accumulated_gradient_is_the_papers_momentum_exactly(seed, batch_size, momentum):
+    # Goyal et al. 2017, eq. (9): u = m * u + g / B; w - lr * u, over several steps with a changing
+    # rate (as in warmup), where eq. (9) and eq. (10) differ
+    rng = random.Random(seed)
+    w, b, _, _ = _apply_inputs(rng)
+    m, n = len(w), len(w[0])
+    velocity_w, velocity_b = [[0.0] * n for _ in range(m)], [0.0] * m
+    got_w, got_b = Array(w), Array(b)
+    got_velocity_w, got_velocity_b = Array.zeros((m, n)), Array.zeros(m)
+    for learning_rate in [0.1, 0.4, 3.0]:
+        grad_w = [_vector_with_special_values(rng, n) for _ in range(m)]
+        grad_b = _vector_with_special_values(rng, m)
+        got_w, got_b, got_velocity_w, got_velocity_b = layer_momentum_apply_accumulated_gradient(
+            got_w, got_b, Array(grad_w), Array(grad_b), got_velocity_w, got_velocity_b,
+            momentum, learning_rate, batch_size,
+        )
+        rows = [_momentum_step(*args, momentum, learning_rate, batch_size) for args in zip(w, grad_w, velocity_w)]
+        w, velocity_w = [row for row, _ in rows], [uv for _, uv in rows]
+        b, velocity_b = _momentum_step(b, grad_b, velocity_b, momentum, learning_rate, batch_size)
+        assert [_bits(row) for row in got_w.tolist()] == [_bits(row) for row in w]
+        assert [_bits(row) for row in got_velocity_w.tolist()] == [_bits(row) for row in velocity_w]
+        assert _bits(got_b.tolist()) == _bits(b)
+        assert _bits(got_velocity_b.tolist()) == _bits(velocity_b)
+
+
 @pytest.mark.parametrize("seed", range(20))
 @pytest.mark.parametrize("learning_rate", [0.5, 0.1, 1e-3, 3.0])
 def test_layer_sgd_step_is_bit_identical_to_accumulate_into_zeros_then_apply(seed, learning_rate):
