@@ -483,12 +483,13 @@ pub fn layer_l2_apply_accumulated_gradient(
     Ok((new_w, new_b))
 }
 
-/// `MomentumArrayLayer.apply_accumulated_gradient`: `delta = learning_rate * grad / batch_size +
-/// momentum * prev_delta; param -= delta`. One previous-delta array per parameter tensor,
-/// shape-agnostic like `layer_apply_accumulated_gradient` (covers
-/// both the `W`/`grad_W`/`prev_delta_W` (2D) and `b`/`grad_b`/`prev_delta_b` (1D) cases via two
-/// calls from the Python caller, the same convention `layer_apply_accumulated_gradient` itself
-/// uses).
+/// `MomentumArrayLayer.apply_accumulated_gradient`: momentum as Goyal et al. 2017's eq. (9),
+/// `velocity = momentum * velocity + grad / batch_size; param -= learning_rate * velocity`. It
+/// replaces Rumelhart et al.'s eq. (10), which folds the rate into the velocity and so needs a
+/// correction when the rate changes. One velocity array per parameter tensor, shape-agnostic like
+/// `layer_apply_accumulated_gradient` (covers both the `W`/`grad_W`/`velocity_W` (2D) and
+/// `b`/`grad_b`/`velocity_b` (1D) cases via two calls from the Python caller, the same convention
+/// `layer_apply_accumulated_gradient` itself uses).
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
 pub fn layer_momentum_apply_accumulated_gradient(
@@ -496,44 +497,44 @@ pub fn layer_momentum_apply_accumulated_gradient(
     b: &RustArray,
     grad_w: &RustArray,
     grad_b: &RustArray,
-    prev_delta_w: &RustArray,
-    prev_delta_b: &RustArray,
+    velocity_w: &RustArray,
+    velocity_b: &RustArray,
     momentum: f64,
     learning_rate: f64,
     batch_size: usize,
 ) -> PyResult<(RustArray, RustArray, RustArray, RustArray)> {
     require_same_shape(w, grad_w, "layer_momentum_apply_accumulated_gradient (W, grad_W)")?;
-    require_same_shape(w, prev_delta_w, "layer_momentum_apply_accumulated_gradient (W, prev_delta_W)")?;
+    require_same_shape(w, velocity_w, "layer_momentum_apply_accumulated_gradient (W, velocity_W)")?;
     require_same_shape(b, grad_b, "layer_momentum_apply_accumulated_gradient (b, grad_b)")?;
-    require_same_shape(b, prev_delta_b, "layer_momentum_apply_accumulated_gradient (b, prev_delta_b)")?;
+    require_same_shape(b, velocity_b, "layer_momentum_apply_accumulated_gradient (b, velocity_b)")?;
     require_batch_size(batch_size, "layer_momentum_apply_accumulated_gradient")?;
-    let scale = learning_rate / (batch_size as f64);
+    let batch_size = batch_size as f64;
 
-    let new_delta_w_data: Vec<f64> = (0..w.data.len())
-        .map(|i| scale * grad_w.data[i] + momentum * prev_delta_w.data[i])
+    let new_velocity_w_data: Vec<f64> = (0..w.data.len())
+        .map(|i| momentum * velocity_w.data[i] + grad_w.data[i] / batch_size)
         .collect();
     let new_w = RustArray {
-        data: same_shape_elementwise(&w.data, &new_delta_w_data, |wv, dv| wv - dv),
+        data: same_shape_elementwise(&w.data, &new_velocity_w_data, |wv, uv| wv - learning_rate * uv),
         shape: w.shape,
     };
-    let new_prev_delta_w = RustArray {
-        data: new_delta_w_data,
+    let new_velocity_w = RustArray {
+        data: new_velocity_w_data,
         shape: w.shape,
     };
 
-    let new_delta_b_data: Vec<f64> = (0..b.data.len())
-        .map(|i| scale * grad_b.data[i] + momentum * prev_delta_b.data[i])
+    let new_velocity_b_data: Vec<f64> = (0..b.data.len())
+        .map(|i| momentum * velocity_b.data[i] + grad_b.data[i] / batch_size)
         .collect();
     let new_b = RustArray {
-        data: same_shape_elementwise(&b.data, &new_delta_b_data, |bv, dv| bv - dv),
+        data: same_shape_elementwise(&b.data, &new_velocity_b_data, |bv, uv| bv - learning_rate * uv),
         shape: b.shape,
     };
-    let new_prev_delta_b = RustArray {
-        data: new_delta_b_data,
+    let new_velocity_b = RustArray {
+        data: new_velocity_b_data,
         shape: b.shape,
     };
 
-    Ok((new_w, new_b, new_prev_delta_w, new_prev_delta_b))
+    Ok((new_w, new_b, new_velocity_w, new_velocity_b))
 }
 
 /// `ReLUArrayLayer.forward`: `max(0, self.W @ x + self.b)`, `x`/`b` both 1D. Inlines
