@@ -263,6 +263,50 @@ def test_apply_accumulated_gradient_rejects_a_zero_batch_size(name, call):
         call(w, b, z)
 
 
+# the batch sizes where the groupings of lr, g and B differ (not powers of two: 6, 96 is the last,
+# partial batch of a 60000-row epoch at B = 128 and 512) and where they agree (1 and powers of two)
+_APPLY_BATCH_SIZES = [1, 6, 96, 4, 128, 512]
+
+
+def _apply_inputs(rng):
+    m, n = rng.randint(1, 20), rng.randint(1, 30)
+    w = [_vector_with_special_values(rng, n) for _ in range(m)]
+    grad_w = [_vector_with_special_values(rng, n) for _ in range(m)]
+    return w, _vector_with_special_values(rng, m), grad_w, _vector_with_special_values(rng, m)
+
+
+@pytest.mark.parametrize("seed", range(10))
+@pytest.mark.parametrize("batch_size", _APPLY_BATCH_SIZES)
+@pytest.mark.parametrize("learning_rate", [0.1, 3.0])
+def test_layer_apply_accumulated_gradient_is_the_papers_sgd_exactly(seed, batch_size, learning_rate):
+    # Goyal et al. 2017, eq. (2): w - lr * (g / B), the mean gradient first, then the rate
+    w, b, grad_w, grad_b = _apply_inputs(random.Random(seed))
+    new_w, new_b = layer_apply_accumulated_gradient(
+        Array(w), Array(b), Array(grad_w), Array(grad_b), learning_rate, batch_size
+    )
+    expected_w = [[wv - learning_rate * (g / batch_size) for wv, g in zip(*rows)] for rows in zip(w, grad_w)]
+    assert [_bits(row) for row in new_w.tolist()] == [_bits(row) for row in expected_w]
+    assert _bits(new_b.tolist()) == _bits([bv - learning_rate * (g / batch_size) for bv, g in zip(b, grad_b)])
+
+
+@pytest.mark.parametrize("seed", range(10))
+@pytest.mark.parametrize("batch_size", _APPLY_BATCH_SIZES)
+@pytest.mark.parametrize("l2_lambda", [1e-4, 0.01])
+def test_layer_l2_apply_accumulated_gradient_is_the_papers_weight_decay_exactly(seed, batch_size, l2_lambda):
+    # Goyal et al. 2017, eq. (8): lambda * w added to the mean gradient, w - lr * (g / B + lambda * w);
+    # the bias is unregularized, so plain SGD
+    learning_rate = 0.1
+    w, b, grad_w, grad_b = _apply_inputs(random.Random(seed))
+    new_w, new_b = layer_l2_apply_accumulated_gradient(
+        Array(w), Array(b), Array(grad_w), Array(grad_b), l2_lambda, learning_rate, batch_size
+    )
+    expected_w = [
+        [wv - learning_rate * (g / batch_size + l2_lambda * wv) for wv, g in zip(*rows)] for rows in zip(w, grad_w)
+    ]
+    assert [_bits(row) for row in new_w.tolist()] == [_bits(row) for row in expected_w]
+    assert _bits(new_b.tolist()) == _bits([bv - learning_rate * (g / batch_size) for bv, g in zip(b, grad_b)])
+
+
 @pytest.mark.parametrize("seed", range(20))
 @pytest.mark.parametrize("learning_rate", [0.5, 0.1, 1e-3, 3.0])
 def test_layer_sgd_step_is_bit_identical_to_accumulate_into_zeros_then_apply(seed, learning_rate):
