@@ -72,3 +72,7 @@ Each `layer_*` function in `src/fused.rs` mirrors a method of indrajala-ml's
 and must stay numerically identical to it. Likewise each `conv_*`/`max_pool_*` function in
 `src/conv.rs` mirrors a method of `indrajala_ml/model/conv_array_layer.py`/`max_pool_array_layer.py`. Conv tensors cross the boundary as matrices
 (`Array` stays 1D/2D); `src/conv.rs`'s module comment gives the layouts.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
