@@ -704,7 +704,7 @@ const TILE_ROWS: usize = 2;
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn tiled_row_range_avx2_fma<const MODE: u8>(a_data: &[f64], b_data: &[f64], out: &mut [f64], panel: Panel) {
-    use std::arch::x86_64::{_mm256_fmadd_pd, _mm256_set1_pd};
+    use std::arch::x86_64::{_mm256_fmadd_pd, _mm256_loadu_pd, _mm256_set1_pd};
 
     let Panel {
         row_start,
@@ -737,7 +737,12 @@ unsafe fn tiled_row_range_avx2_fma<const MODE: u8>(a_data: &[f64], b_data: &[f64
                 }
                 for kk in k_start..k_end {
                     let b_row = b_ptr.add(kk * n + col);
-                    let b_tile = [load(b_row), load(b_row.add(4)), load(b_row.add(8)), load(b_row.add(12))];
+                    let b_tile = [
+                        _mm256_loadu_pd(b_row),
+                        _mm256_loadu_pd(b_row.add(4)),
+                        _mm256_loadu_pd(b_row.add(8)),
+                        _mm256_loadu_pd(b_row.add(12)),
+                    ];
                     for r in 0..TILE_ROWS {
                         let a_vec = _mm256_set1_pd(*a_ptr.add((row + r) * k + kk));
                         for j in 0..4 {
@@ -757,10 +762,10 @@ unsafe fn tiled_row_range_avx2_fma<const MODE: u8>(a_data: &[f64], b_data: &[f64
                 for (i, &a_value) in a_data[row * k + k_start..row * k + k_end].iter().enumerate() {
                     let a_vec = _mm256_set1_pd(a_value);
                     let b_row = b_ptr.add((k_start + i) * n + col);
-                    acc[0] = _mm256_fmadd_pd(a_vec, load(b_row), acc[0]);
-                    acc[1] = _mm256_fmadd_pd(a_vec, load(b_row.add(4)), acc[1]);
-                    acc[2] = _mm256_fmadd_pd(a_vec, load(b_row.add(8)), acc[2]);
-                    acc[3] = _mm256_fmadd_pd(a_vec, load(b_row.add(12)), acc[3]);
+                    acc[0] = _mm256_fmadd_pd(a_vec, _mm256_loadu_pd(b_row), acc[0]);
+                    acc[1] = _mm256_fmadd_pd(a_vec, _mm256_loadu_pd(b_row.add(4)), acc[1]);
+                    acc[2] = _mm256_fmadd_pd(a_vec, _mm256_loadu_pd(b_row.add(8)), acc[2]);
+                    acc[3] = _mm256_fmadd_pd(a_vec, _mm256_loadu_pd(b_row.add(12)), acc[3]);
                 }
                 for (j, &acc_lanes) in acc.iter().enumerate() {
                     store_lanes::<MODE>(out_at(row, col + 4 * j), acc_lanes);
@@ -772,7 +777,11 @@ unsafe fn tiled_row_range_avx2_fma<const MODE: u8>(a_data: &[f64], b_data: &[f64
             for row in block_start..block_end {
                 let mut acc = chain_start::<MODE>(out_at(row, col));
                 for (i, &a_value) in a_data[row * k + k_start..row * k + k_end].iter().enumerate() {
-                    acc = _mm256_fmadd_pd(_mm256_set1_pd(a_value), load(b_ptr.add((k_start + i) * n + col)), acc);
+                    acc = _mm256_fmadd_pd(
+                        _mm256_set1_pd(a_value),
+                        _mm256_loadu_pd(b_ptr.add((k_start + i) * n + col)),
+                        acc,
+                    );
                 }
                 store_lanes::<MODE>(out_at(row, col), acc);
             }
@@ -793,14 +802,6 @@ unsafe fn tiled_row_range_avx2_fma<const MODE: u8>(a_data: &[f64], b_data: &[f64
     }
 }
 
-/// 4 doubles from `ptr`. Safety: as `tiled_row_range_avx2_fma`.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-#[inline]
-unsafe fn load(ptr: *const f64) -> std::arch::x86_64::__m256d {
-    std::arch::x86_64::_mm256_loadu_pd(ptr)
-}
-
 /// 4 chains' starting values: the partials at `out` under `RESUME`, else 0.0. Safety: as
 /// `tiled_row_range_avx2_fma`; `out` points at 4 values of its `out`.
 #[cfg(target_arch = "x86_64")]
@@ -808,7 +809,7 @@ unsafe fn load(ptr: *const f64) -> std::arch::x86_64::__m256d {
 #[inline]
 unsafe fn chain_start<const MODE: u8>(out: *const f64) -> std::arch::x86_64::__m256d {
     if MODE == RESUME {
-        load(out)
+        std::arch::x86_64::_mm256_loadu_pd(out)
     } else {
         std::arch::x86_64::_mm256_setzero_pd()
     }
@@ -820,10 +821,10 @@ unsafe fn chain_start<const MODE: u8>(out: *const f64) -> std::arch::x86_64::__m
 #[target_feature(enable = "avx2,fma")]
 #[inline]
 unsafe fn store_lanes<const MODE: u8>(out: *mut f64, acc: std::arch::x86_64::__m256d) {
-    use std::arch::x86_64::{_mm256_add_pd, _mm256_storeu_pd};
+    use std::arch::x86_64::{_mm256_add_pd, _mm256_loadu_pd, _mm256_storeu_pd};
 
     if MODE == ADD {
-        _mm256_storeu_pd(out, _mm256_add_pd(load(out), acc));
+        _mm256_storeu_pd(out, _mm256_add_pd(_mm256_loadu_pd(out), acc));
     } else {
         _mm256_storeu_pd(out, acc);
     }
