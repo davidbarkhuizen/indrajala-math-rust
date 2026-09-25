@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import array
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Callable
@@ -141,7 +142,6 @@ INDEX_SEEDS: list[Any] = [
     False,
     np.int8(5),
     np.uint64(2**32 - 1),
-    np.bool_(True),  # numpy warns it is deprecated as an index, but still takes it
     np.array(5),
     np.array([5]),
     np.array([[5]]),
@@ -176,10 +176,24 @@ SEQUENCE_SEEDS: list[Any] = [
 
 
 @pytest.mark.parametrize("seed", INDEX_SEEDS + SEQUENCE_SEEDS, ids=repr)
-@pytest.mark.filterwarnings("ignore:In future, it will be an error for 'np.bool' scalars:DeprecationWarning")
 def test_every_accepted_seed_gives_numpys_stream(seed: Any):
     seed_both(seed)
     assert_identical(pa.random(700), np.random.random(700))
+
+
+@pytest.mark.filterwarnings("ignore:In future, it will be an error for 'np.bool' scalars:DeprecationWarning")
+def test_a_numpy_bool_seeds_as_the_installed_numpy_does():
+    # numpy 2.2 still takes np.bool_ as an index (deprecated) and seeds with 1; later numpy
+    # doesn't, and the 0-d sequence fails as "Seed array must be 1-d". seed follows
+    # operator.index, so it agrees with whichever numpy is installed.
+    try:
+        np.random.seed(np.bool_(True))
+    except ValueError as numpy_error:
+        with pytest.raises(ValueError, match=re.escape(str(numpy_error))):
+            pa.seed(np.bool_(True))
+    else:
+        pa.seed(np.bool_(True))
+        assert_identical(pa.random(700), np.random.random(700))
 
 
 def test_a_one_word_sequence_seeds_differently_from_the_int():
