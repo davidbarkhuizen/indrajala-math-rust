@@ -619,7 +619,8 @@ pub(crate) const RESUME: u8 = 2;
 /// The part of `a @ b` (`a` `M x K`, `b` `K x N`, both row-major) one `tiled_row_range` call
 /// computes: rows `row_start..row_end`, columns `col_start..col_end`, and `k` over
 /// `k_start..k_end`. Output `(row, col)` lives at `(row - row_start) * out_stride + col -
-/// col_start` of the call's `out`.
+/// col_start` of the call's `out`. Only `RESUME` calls take part of the columns or of `k`; the
+/// others must pass `Panel::whole`.
 #[derive(Clone, Copy)]
 pub(crate) struct Panel {
     pub(crate) row_start: usize,
@@ -664,6 +665,17 @@ impl Panel {
 /// row of the block, so the tile's `K x 16` panel of `b` is read from cache by all of them. The
 /// order of rows and tiles doesn't change any output's value.
 pub(crate) fn tiled_row_range<const MODE: u8>(a_data: &[f64], b_data: &[f64], out: &mut [f64], panel: Panel) {
+    debug_assert!(
+        MODE == RESUME
+            || (
+                panel.col_start,
+                panel.col_end,
+                panel.k_start,
+                panel.k_end,
+                panel.out_stride
+            ) == (0, panel.n, 0, panel.k, panel.n),
+        "only RESUME takes part of a product"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
@@ -718,6 +730,14 @@ unsafe fn tiled_row_range_avx2_fma<const MODE: u8>(a_data: &[f64], b_data: &[f64
         n,
         out_stride,
     } = panel;
+    // only RESUME computes part of a product; the others take the whole panel's columns, `k` and
+    // stride as known structure, which kept the whole-product callers 5-7% faster than runtime
+    // offsets (single-example conv forward and downstream)
+    let (col_start, col_end, k_start, k_end, out_stride) = if MODE == RESUME {
+        (col_start, col_end, k_start, k_end, out_stride)
+    } else {
+        (0, n, 0, k, n)
+    };
     let a_ptr = a_data.as_ptr();
     let b_ptr = b_data.as_ptr();
     let out_ptr = out.as_mut_ptr();
