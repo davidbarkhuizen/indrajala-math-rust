@@ -1,0 +1,7 @@
+# One pinned toolchain for local builds and CI, so `cargo fmt` and `cargo clippy` give the same
+# answers in both. rustup reads this file (an apt/distro cargo ignores it). Bump it deliberately,
+# in its own PR, fixing whatever the new clippy reports.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -17,7 +17,7 @@ pub fn decode_mnist_pixels(data: &[u8], record_size: usize) -> PyResult<RustArra
     if record_size == 0 {
         return Err(PyValueError::new_err("record_size must be at least 1"));
     }
-    if data.len() % record_size != 0 {
+    if !data.len().is_multiple_of(record_size) {
         return Err(PyValueError::new_err(format!(
             "data length {} is not a multiple of record_size {}",
             data.len(),

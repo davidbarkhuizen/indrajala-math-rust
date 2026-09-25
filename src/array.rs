@@ -66,17 +66,13 @@ impl RustArray {
         if let Ok(rows) = data.extract::<Vec<Vec<f64>>>() {
             let n_rows = rows.len();
             if n_rows == 0 {
-                return Err(PyValueError::new_err(
-                    "cannot construct a 2D array from zero rows",
-                ));
+                return Err(PyValueError::new_err("cannot construct a 2D array from zero rows"));
             }
             let n_cols = rows[0].len();
             let mut flat = Vec::with_capacity(n_rows * n_cols);
             for row in &rows {
                 if row.len() != n_cols {
-                    return Err(PyValueError::new_err(
-                        "every row must have the same length",
-                    ));
+                    return Err(PyValueError::new_err("every row must have the same length"));
                 }
                 flat.extend_from_slice(row);
             }
@@ -99,9 +95,7 @@ impl RustArray {
     fn from_rows(rows: &PyAny) -> PyResult<Self> {
         let n_rows = rows.len()?;
         if n_rows == 0 {
-            return Err(PyValueError::new_err(
-                "cannot construct a 2D array from zero rows",
-            ));
+            return Err(PyValueError::new_err("cannot construct a 2D array from zero rows"));
         }
         let n_cols = rows.get_item(0)?.len()?;
         let mut flat = Vec::with_capacity(n_rows * n_cols);
@@ -290,9 +284,9 @@ impl RustArray {
     fn resolve_index(&self, index: &PyAny) -> PyResult<usize> {
         match self.shape {
             Shape::Vector(n) => {
-                let i: usize = index.extract().map_err(|_| {
-                    PyTypeError::new_err("index into a 1D array must be an int")
-                })?;
+                let i: usize = index
+                    .extract()
+                    .map_err(|_| PyTypeError::new_err("index into a 1D array must be an int"))?;
                 if i >= n {
                     return Err(PyIndexError::new_err("index out of range"));
                 }
@@ -319,9 +313,7 @@ impl RustArray {
     fn resolve_contiguous_range(slice: &PySlice, len: usize) -> PyResult<(usize, usize)> {
         let indices = slice.indices(len as std::os::raw::c_long)?;
         if indices.step != 1 {
-            return Err(PyValueError::new_err(
-                "only contiguous (step=1) slices are supported",
-            ));
+            return Err(PyValueError::new_err("only contiguous (step=1) slices are supported"));
         }
         let start = indices.start.max(0) as usize;
         let stop = indices.stop.max(indices.start) as usize;

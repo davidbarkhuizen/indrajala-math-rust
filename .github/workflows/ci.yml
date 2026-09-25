@@ -14,12 +14,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # Installs rust-toolchain.toml's pinned toolchain (with rustfmt and clippy) before
+      # rust-cache, so the cache is keyed on it rather than the runner image's stable.
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Check formatting
+        run: cargo fmt --check
       # target/'s dependency builds (pyo3, syn, proc-macro2, ...; ~15 s uncached), keyed by
       # rust-cache on the toolchain, Cargo.lock and Cargo.toml; the crate itself always
       # recompiles. No separate `cargo check`: the maturin build below compiles everything anyway
       # and fails on the same errors - check only pre-built the shared proc-macro/build-script
       # dependencies, which rust-cache now restores instead.
       - uses: Swatinem/rust-cache@v2
+      # Lint levels are in Cargo.toml's [lints]; -D warnings fails the job on any warning.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
       # maturin pinned to match indrajala-ml's ./cli (maturin_version); numpy and pytest left
       # unpinned, so this CI checks the crate against the latest numpy while indrajala-ml's CI
       # checks it against that repo's pinned one.

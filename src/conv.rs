@@ -1,28 +1,28 @@
+//! Convolution and max pooling ops, one Rust call per `ConvArrayLayer`/`MaxPoolArrayLayer` method
+//! (indrajala-ml's `indrajala_ml/model/conv_array_layer.py`/`max_pool_array_layer.py`). The ops
+//! are batch ops, but each per-example operand may also be a 1D vector, meaning N = 1, and the
+//! per-example outputs then come back as vectors too: the single-example layer methods pass
+//! their arrays straight through, with no `(1, n)` reshape (which copies). A `(1, n)` matrix and
+//! an `n` vector hold the same flat buffer, so the two forms give the same values bit for bit.
+//! `RustArray` stays 1D/2D, and the 4D views exist only as index arithmetic here:
+//!
+//! - activations and deltas are `(N, C*H*W)` (or one `C*H*W` vector), channel-major (flat index
+//!   `c*H*W + r*W + col`);
+//! - the kernel matrix `W` is `(channel_count, C*k*k)`, each row in (channel, kernel row, kernel
+//!   col) order;
+//! - the cached im2col columns are `(N*P, C*k*k)`, `P = out_height * out_width`, row `n*P + p`
+//!   with `p` in row-major output order, columns in `W`-row order.
+//!
+//! Every conv reduction goes through `linalg::matmul_narrow` (the forward through its kernel, `tiled_row_range`, one
+//! example at a time), which gives `matmul`'s bits: the summation order is that file's one fixed grouping -
+//! machine-independent, and within `rtol` of numpy rather than bit-identical to it. Pooling does no arithmetic beyond
+//! the scatter-add, so it matches numpy exactly.
+
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::array::{RustArray, Shape};
 use crate::linalg::{matmul_narrow, tiled_row_range};
-
-/// Convolution and max pooling ops, one Rust call per `ConvArrayLayer`/`MaxPoolArrayLayer` method
-/// (indrajala-ml's `indrajala_ml/model/conv_array_layer.py`/`max_pool_array_layer.py`). The ops
-/// are batch ops, but each per-example operand may also be a 1D vector, meaning N = 1, and the
-/// per-example outputs then come back as vectors too: the single-example layer methods pass
-/// their arrays straight through, with no `(1, n)` reshape (which copies). A `(1, n)` matrix and
-/// an `n` vector hold the same flat buffer, so the two forms give the same values bit for bit.
-/// `RustArray` stays 1D/2D, and the 4D views exist only as index arithmetic here:
-///
-/// - activations and deltas are `(N, C*H*W)` (or one `C*H*W` vector), channel-major (flat index
-///   `c*H*W + r*W + col`);
-/// - the kernel matrix `W` is `(channel_count, C*k*k)`, each row in (channel, kernel row, kernel
-///   col) order;
-/// - the cached im2col columns are `(N*P, C*k*k)`, `P = out_height * out_width`, row `n*P + p`
-///   with `p` in row-major output order, columns in `W`-row order.
-///
-/// Every conv reduction goes through `linalg::matmul_narrow` (the forward through its kernel,
-/// `tiled_row_range`, one example at a time), which gives `matmul`'s bits: the
-/// summation order is that file's one fixed grouping - machine-independent, and within `rtol` of
-/// numpy rather than bit-identical to it. Pooling does no arithmetic beyond the scatter-add, so it matches numpy exactly.
 
 /// The shape arithmetic for one conv or pool layer, built once by the Python layer and passed to
 /// every call. Pooling uses it with `kernel_size = pool_size`.
@@ -114,7 +114,7 @@ impl ConvGeometry {
 
 pub(crate) fn require_matrix(arr: &RustArray, rows: Option<usize>, cols: usize, context: &str) -> PyResult<usize> {
     match arr.shape {
-        Shape::Matrix(r, c) if c == cols && rows.map_or(true, |expected| expected == r) => Ok(r),
+        Shape::Matrix(r, c) if c == cols && rows.is_none_or(|expected| expected == r) => Ok(r),
         shape => Err(PyValueError::new_err(format!(
             "{context}: expected a matrix of shape ({}, {cols}), got {:?}",
             rows.map_or("N".to_string(), |r| r.to_string()),
@@ -233,7 +233,16 @@ pub fn conv_forward_batch(
                 }
             }
         }
-        tiled_row_range::<false>(&cols[example * p * fan_in..], &w_t.data, &mut by_position, 0, p, fan_in, o, 1);
+        tiled_row_range::<false>(
+            &cols[example * p * fan_in..],
+            &w_t.data,
+            &mut by_position,
+            0,
+            p,
+            fan_in,
+            o,
+            1,
+        );
         for channel in 0..o {
             let bias = b.data[channel];
             a.extend((0..p).map(|position| (by_position[position * o + channel] + bias).max(0.0)));
@@ -297,7 +306,12 @@ pub fn conv_accumulate_gradient_batch(
     }
     let p = geometry.positions;
     let (n, _) = require_batch(delta_batch, o * p, "conv_accumulate_gradient_batch delta_batch")?;
-    require_matrix(cols, Some(n * p), geometry.fan_in, "conv_accumulate_gradient_batch cols")?;
+    require_matrix(
+        cols,
+        Some(n * p),
+        geometry.fan_in,
+        "conv_accumulate_gradient_batch cols",
+    )?;
 
     let by_channel = deltas_by_channel(delta_batch, n, o, p); // (O, N*P)
     let update = matmul_narrow(&by_channel, cols)?;
@@ -306,7 +320,11 @@ pub fn conv_accumulate_gradient_batch(
         .data
         .iter()
         .enumerate()
-        .map(|(channel, &gb)| gb + by_channel.data[channel * n * p..(channel + 1) * n * p].iter().sum::<f64>())
+        .map(|(channel, &gb)| {
+            gb + by_channel.data[channel * n * p..(channel + 1) * n * p]
+                .iter()
+                .sum::<f64>()
+        })
         .collect();
     Ok((new_grad_w, RustArray::from_vector(new_grad_b)))
 }
@@ -324,7 +342,11 @@ pub fn max_pool_forward_batch(x: &RustArray, geometry: &ConvGeometry) -> PyResul
     let (n, is_vector) = require_batch(x, g.input_size, "max_pool_forward_batch X")?;
     let size = g.input_channels * g.positions;
     let plane = g.input_height * g.input_width;
-    let pool_plane = if g.kernel_size == 2 && g.stride == 2 { max_pool_plane_2x2 } else { max_pool_plane };
+    let pool_plane = if g.kernel_size == 2 && g.stride == 2 {
+        max_pool_plane_2x2
+    } else {
+        max_pool_plane
+    };
 
     let mut a = vec![0.0; n * size];
     let mut argmax = vec![0.0; n * size];
@@ -337,7 +359,10 @@ pub fn max_pool_forward_batch(x: &RustArray, geometry: &ConvGeometry) -> PyResul
     {
         pool_plane(channel, g, a_plane, argmax_plane);
     }
-    Ok((batch_output(a, n, size, is_vector), batch_output(argmax, n, size, is_vector)))
+    Ok((
+        batch_output(a, n, size, is_vector),
+        batch_output(argmax, n, size, is_vector),
+    ))
 }
 
 /// One channel plane of `max_pool_forward_batch`, any window and stride. It walks each window's
@@ -479,8 +504,10 @@ fn max_pool_downstream_plane(
     out: &mut [f64],
 ) -> Result<(), f64> {
     let (s, w) = (g.stride, g.input_width);
-    for (out_row, (delta_row, slot_row)) in
-        deltas.chunks_exact(g.out_width).zip(slots.chunks_exact(g.out_width)).enumerate()
+    for (out_row, (delta_row, slot_row)) in deltas
+        .chunks_exact(g.out_width)
+        .zip(slots.chunks_exact(g.out_width))
+        .enumerate()
     {
         let row = &mut out[out_row * s * w..];
         for (out_col, (&d, &v)) in delta_row.iter().zip(slot_row).enumerate() {

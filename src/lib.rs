@@ -11,18 +11,16 @@ mod ufuncs;
 
 use array::RustArray;
 use conv::{
-    conv_accumulate_gradient_batch, conv_downstream_batch, conv_forward_batch,
-    max_pool_downstream_batch, max_pool_forward_batch, ConvGeometry,
+    conv_accumulate_gradient_batch, conv_downstream_batch, conv_forward_batch, max_pool_downstream_batch,
+    max_pool_forward_batch, ConvGeometry,
 };
 use fused::{
-    layer_accumulate_gradient, layer_accumulate_gradient_batch,
-    layer_adam_apply_accumulated_gradient, layer_apply_accumulated_gradient, layer_downstream,
-    layer_downstream_batch, layer_dropout_forward, layer_dropout_forward_batch,
-    layer_dropout_hidden_delta, layer_dropout_hidden_delta_batch, layer_forward,
-    layer_forward_batch, layer_hidden_delta, layer_hidden_delta_batch,
-    layer_l2_apply_accumulated_gradient, layer_momentum_apply_accumulated_gradient,
-    layer_output_delta, layer_relu_forward, layer_relu_forward_batch, layer_relu_hidden_delta,
-    layer_relu_hidden_delta_batch, layer_sgd_step, layer_softmax_forward,
+    layer_accumulate_gradient, layer_accumulate_gradient_batch, layer_adam_apply_accumulated_gradient,
+    layer_apply_accumulated_gradient, layer_downstream, layer_downstream_batch, layer_dropout_forward,
+    layer_dropout_forward_batch, layer_dropout_hidden_delta, layer_dropout_hidden_delta_batch, layer_forward,
+    layer_forward_batch, layer_hidden_delta, layer_hidden_delta_batch, layer_l2_apply_accumulated_gradient,
+    layer_momentum_apply_accumulated_gradient, layer_output_delta, layer_relu_forward, layer_relu_forward_batch,
+    layer_relu_hidden_delta, layer_relu_hidden_delta_batch, layer_sgd_step, layer_softmax_forward,
     layer_softmax_forward_batch, layer_softmax_output_delta,
 };
 use linalg::{matmul_threads_for, outer, set_matmul_threading};
