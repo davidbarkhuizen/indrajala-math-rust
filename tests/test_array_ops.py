@@ -100,7 +100,7 @@ def test_isub_mutates_in_place_and_matches_numpy():
 
 
 def test_apply_accumulated_gradient_formula_matches_numpy():
-    # W -= learning_rate * grad_W / batch_size - ArrayLayer.apply_accumulated_gradient's formula
+    # W -= learning_rate * (grad_W / batch_size) - ArrayLayer.apply_accumulated_gradient's formula
     rng = random.Random(1)
     w_data = _random_matrix(rng, 3, 4)
     grad_data = _random_matrix(rng, 3, 4)
@@ -109,11 +109,11 @@ def test_apply_accumulated_gradient_formula_matches_numpy():
 
     w = Array(w_data)
     grad_w = Array(grad_data)
-    w -= learning_rate * grad_w / batch_size
+    w -= learning_rate * (grad_w / batch_size)
 
     np_w = np.array(w_data)
     np_grad_w = np.array(grad_data)
-    np_w -= learning_rate * np_grad_w / batch_size
+    np_w -= learning_rate * (np_grad_w / batch_size)
 
     assert _to_numpy(w) == pytest.approx(np_w)
 

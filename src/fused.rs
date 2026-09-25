@@ -241,10 +241,11 @@ pub fn layer_accumulate_gradient_batch(
     Ok((new_grad_w, new_grad_b))
 }
 
-/// `ArrayLayer.apply_accumulated_gradient`: `self.W -= learning_rate * self._grad_W /
-/// batch_size; self.b -= learning_rate * self._grad_b / batch_size` - shape-agnostic (`W`/`grad_W`
-/// are always the same shape as each other, likewise `b`/`grad_b`), so one function covers both
-/// the single-example (`batch_size=1`) and batched caller.
+/// `ArrayLayer.apply_accumulated_gradient`: minibatch SGD in Goyal et al. 2017's grouping, eq. (2),
+/// the mean gradient first and then the rate: `self.W -= learning_rate * (self._grad_W /
+/// batch_size); self.b -= learning_rate * (self._grad_b / batch_size)` - shape-agnostic
+/// (`W`/`grad_W` are always the same shape as each other, likewise `b`/`grad_b`), so one function
+/// covers both the single-example (`batch_size=1`) and batched caller.
 #[pyfunction]
 pub fn layer_apply_accumulated_gradient(
     w: &RustArray,
@@ -257,13 +258,17 @@ pub fn layer_apply_accumulated_gradient(
     require_same_shape(w, grad_w, "layer_apply_accumulated_gradient (W, grad_W)")?;
     require_same_shape(b, grad_b, "layer_apply_accumulated_gradient (b, grad_b)")?;
     require_batch_size(batch_size, "layer_apply_accumulated_gradient")?;
-    let scale = learning_rate / (batch_size as f64);
+    let batch_size = batch_size as f64;
     let new_w = RustArray {
-        data: same_shape_elementwise(&w.data, &grad_w.data, |wv, gv| wv - scale * gv),
+        data: same_shape_elementwise(&w.data, &grad_w.data, |wv, gv| {
+            wv - learning_rate * (gv / batch_size)
+        }),
         shape: w.shape,
     };
     let new_b = RustArray {
-        data: same_shape_elementwise(&b.data, &grad_b.data, |bv, gv| bv - scale * gv),
+        data: same_shape_elementwise(&b.data, &grad_b.data, |bv, gv| {
+            bv - learning_rate * (gv / batch_size)
+        }),
         shape: b.shape,
     };
     Ok((new_w, new_b))
@@ -302,8 +307,8 @@ pub fn layer_sgd_step(
             b.shape
         )));
     }
-    // layer_apply_accumulated_gradient's scale, learning_rate / batch_size, is exactly
-    // learning_rate at batch_size=1
+    // layer_apply_accumulated_gradient's learning_rate * (g / batch_size) is exactly
+    // learning_rate * g at batch_size=1
     let scale = learning_rate;
     let x = &input_activation.data;
     let mut w_data = Vec::with_capacity(m * n);
@@ -442,8 +447,9 @@ pub fn layer_adam_apply_accumulated_gradient(
     Ok((new_w, new_b, new_m_w, new_v_w, new_m_b, new_v_b))
 }
 
-/// `L2ArrayLayer.apply_accumulated_gradient`: `W -= learning_rate * (grad_W / batch_size +
-/// l2_lambda * W); b -= learning_rate * grad_b / batch_size` (bias unregularized). No persistent
+/// `L2ArrayLayer.apply_accumulated_gradient`: weight decay as Goyal et al. 2017's eq. (8), `λW`
+/// added to the mean gradient: `W -= learning_rate * (grad_W / batch_size + l2_lambda * W);
+/// b -= learning_rate * (grad_b / batch_size)` (bias unregularized). No persistent
 /// per-parameter state at all (unlike
 /// `layer_adam_apply_accumulated_gradient`/`layer_momentum_apply_accumulated_gradient`), so this
 /// takes only `W`/`b`/`grad_W`/`grad_b` plus the scalar `l2_lambda` - the simplest fused op in
@@ -461,15 +467,17 @@ pub fn layer_l2_apply_accumulated_gradient(
     require_same_shape(w, grad_w, "layer_l2_apply_accumulated_gradient (W, grad_W)")?;
     require_same_shape(b, grad_b, "layer_l2_apply_accumulated_gradient (b, grad_b)")?;
     require_batch_size(batch_size, "layer_l2_apply_accumulated_gradient")?;
-    let scale = learning_rate / (batch_size as f64);
+    let batch_size = batch_size as f64;
     let new_w = RustArray {
         data: same_shape_elementwise(&w.data, &grad_w.data, |wv, gv| {
-            wv - scale * gv - learning_rate * l2_lambda * wv
+            wv - learning_rate * (gv / batch_size + l2_lambda * wv)
         }),
         shape: w.shape,
     };
     let new_b = RustArray {
-        data: same_shape_elementwise(&b.data, &grad_b.data, |bv, gv| bv - scale * gv),
+        data: same_shape_elementwise(&b.data, &grad_b.data, |bv, gv| {
+            bv - learning_rate * (gv / batch_size)
+        }),
         shape: b.shape,
     };
     Ok((new_w, new_b))
