@@ -28,13 +28,7 @@ fn scalar_elementwise(a: &[f64], scalar: f64, op: impl Fn(f64, f64) -> f64) -> V
 /// Broadcasts `vector` (length `cols`) across every row of a `rows x cols` matrix - the one
 /// broadcasting case this core needs, alongside plain same-shape elementwise addition
 /// (`X @ self.W.T + self.b`).
-fn broadcast_row(
-    matrix: &[f64],
-    rows: usize,
-    cols: usize,
-    vector: &[f64],
-    op: impl Fn(f64, f64) -> f64,
-) -> Vec<f64> {
+fn broadcast_row(matrix: &[f64], rows: usize, cols: usize, vector: &[f64], op: impl Fn(f64, f64) -> f64) -> Vec<f64> {
     let mut out = Vec::with_capacity(rows * cols);
     for row in 0..rows {
         for col in 0..cols {

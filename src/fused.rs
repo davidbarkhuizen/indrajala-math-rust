@@ -1,3 +1,10 @@
+//! One Rust function per `ArrayLayer` method, doing the entire computation in one call instead
+//! of composing it from several separate `Array` operator/ufunc calls in Python - each of those
+//! crosses the Python/Rust boundary and allocates a new `Array`, and call count (not per-call
+//! cost) dominates this crate's matmul-bound cost. Every function here mirrors one
+//! `indrajala_ml/model/array_layer.py` method's formula exactly - see that file for the
+//! reference this crate is checked against.
+
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -6,13 +13,6 @@ use crate::linalg::{matmul, matmul_add, matmul_nt};
 use crate::ops::same_shape_elementwise;
 use crate::random::draw_bernoulli_mask;
 use crate::ufuncs::{array_softmax, sum_axis0};
-
-/// One Rust function per `ArrayLayer` method, doing the entire computation in one call instead
-/// of composing it from several separate `Array` operator/ufunc calls in Python - each of those
-/// crosses the Python/Rust boundary and allocates a new `Array`, and call count (not per-call
-/// cost) dominates this crate's matmul-bound cost. Every function here mirrors one
-/// `indrajala_ml/model/array_layer.py` method's formula exactly - see that file for the
-/// reference this crate is checked against.
 
 fn require_same_shape(a: &RustArray, b: &RustArray, context: &str) -> PyResult<()> {
     if a.shape != b.shape {
@@ -81,20 +81,17 @@ pub fn layer_output_delta(a: &RustArray, reference: &RustArray) -> PyResult<Rust
         .zip(reference.data.iter())
         .map(|(&av, &rv)| (av - rv) * av * (1.0 - av))
         .collect();
-    Ok(RustArray {
-        data,
-        shape: a.shape,
-    })
+    Ok(RustArray { data, shape: a.shape })
 }
 
 /// `ArrayLayer.downstream`: `self.W.T @ self.delta`, the gradient a dense layer sends back to its
 /// input. Unlike `hidden_downstream` below it has no upstream activation to check against, so a
 /// conv or pool layer (which has no dense `W` of its own) can read it from the layer after it.
 ///
-/// Computed as `delta @ W`, the same product, so `W` is read row by row and never copied into a
-/// transpose (the copy was most of the call: 273 of 327 µs at 32 x 5408). It sums sequentially
-/// over `W`'s rows (`matmul`'s tiled kernel, as a one-row product), not with `dot_product`'s 4-lane grouping, so the result
-/// differs from `W.T @ delta` by a few ULPs, but is still the same on the scalar and AVX2 paths.
+/// Computed as `delta @ W`, the same product, so `W` is read row by row and never copied into a transpose (the copy was
+/// most of the call: 273 of 327 µs at 32 x 5408). It sums sequentially over `W`'s rows (`matmul`'s tiled kernel, as a
+/// one-row product), not with `dot_product`'s 4-lane grouping, so the result differs from `W.T @ delta` by a few ULPs,
+/// but is still the same on the scalar and AVX2 paths.
 #[pyfunction]
 pub fn layer_downstream(w: &RustArray, delta: &RustArray) -> PyResult<RustArray> {
     if !matches!(delta.shape, Shape::Vector(_)) {
@@ -116,12 +113,7 @@ pub fn layer_downstream_batch(w: &RustArray, delta_batch: &RustArray) -> PyResul
 /// against `a` - the downstream term shared by every `layer_*hidden_delta` below (plain sigmoid,
 /// ReLU, dropout); each differs only in what elementwise formula it applies on top, not in how
 /// the downstream matmul itself is computed.
-fn hidden_downstream(
-    next_w: &RustArray,
-    next_delta: &RustArray,
-    a: &RustArray,
-    context: &str,
-) -> PyResult<RustArray> {
+fn hidden_downstream(next_w: &RustArray, next_delta: &RustArray, a: &RustArray, context: &str) -> PyResult<RustArray> {
     let downstream = layer_downstream(next_w, next_delta)?;
     require_same_shape(&downstream, a, context)?;
     Ok(downstream)
@@ -144,11 +136,7 @@ fn hidden_downstream_batch(
 /// `ArrayLayer.compute_hidden_delta`: `(next_layer.W.T @ next_layer.delta) * self.a * (1 -
 /// self.a)`, single-example (`next_delta`/`a` both 1D).
 #[pyfunction]
-pub fn layer_hidden_delta(
-    next_w: &RustArray,
-    next_delta: &RustArray,
-    a: &RustArray,
-) -> PyResult<RustArray> {
+pub fn layer_hidden_delta(next_w: &RustArray, next_delta: &RustArray, a: &RustArray) -> PyResult<RustArray> {
     let downstream = hidden_downstream(next_w, next_delta, a, "layer_hidden_delta")?;
     let data = downstream
         .data
@@ -156,10 +144,7 @@ pub fn layer_hidden_delta(
         .zip(a.data.iter())
         .map(|(&d, &av)| d * av * (1.0 - av))
         .collect();
-    Ok(RustArray {
-        data,
-        shape: a.shape,
-    })
+    Ok(RustArray { data, shape: a.shape })
 }
 
 /// `ArrayLayer.compute_hidden_delta_batch`: `(next_layer.delta_batch @ next_layer.W) * self.A *
@@ -260,15 +245,11 @@ pub fn layer_apply_accumulated_gradient(
     require_batch_size(batch_size, "layer_apply_accumulated_gradient")?;
     let batch_size = batch_size as f64;
     let new_w = RustArray {
-        data: same_shape_elementwise(&w.data, &grad_w.data, |wv, gv| {
-            wv - learning_rate * (gv / batch_size)
-        }),
+        data: same_shape_elementwise(&w.data, &grad_w.data, |wv, gv| wv - learning_rate * (gv / batch_size)),
         shape: w.shape,
     };
     let new_b = RustArray {
-        data: same_shape_elementwise(&b.data, &grad_b.data, |bv, gv| {
-            bv - learning_rate * (gv / batch_size)
-        }),
+        data: same_shape_elementwise(&b.data, &grad_b.data, |bv, gv| bv - learning_rate * (gv / batch_size)),
         shape: b.shape,
     };
     Ok((new_w, new_b))
@@ -313,12 +294,7 @@ pub fn layer_sgd_step(
     let x = &input_activation.data;
     let mut w_data = Vec::with_capacity(m * n);
     for (w_row, &d) in w.data.chunks_exact(n.max(1)).zip(delta.data.iter()) {
-        w_data.extend(
-            w_row
-                .iter()
-                .zip(x.iter())
-                .map(|(&wv, &xj)| wv - scale * (0.0 + d * xj)),
-        );
+        w_data.extend(w_row.iter().zip(x.iter()).map(|(&wv, &xj)| wv - scale * (0.0 + d * xj)));
     }
     let b_data = b
         .data
@@ -326,10 +302,7 @@ pub fn layer_sgd_step(
         .zip(delta.data.iter())
         .map(|(&bv, &d)| bv - scale * (0.0 + d))
         .collect();
-    Ok((
-        RustArray::from_matrix(w_data, m, n),
-        RustArray::from_vector(b_data),
-    ))
+    Ok((RustArray::from_matrix(w_data, m, n), RustArray::from_vector(b_data)))
 }
 
 /// `AdamArrayLayer.apply_accumulated_gradient`: the Adam (Kingma & Ba, 2014) update rule, as one
@@ -475,9 +448,7 @@ pub fn layer_l2_apply_accumulated_gradient(
         shape: w.shape,
     };
     let new_b = RustArray {
-        data: same_shape_elementwise(&b.data, &grad_b.data, |bv, gv| {
-            bv - learning_rate * (gv / batch_size)
-        }),
+        data: same_shape_elementwise(&b.data, &grad_b.data, |bv, gv| bv - learning_rate * (gv / batch_size)),
         shape: b.shape,
     };
     Ok((new_w, new_b))
@@ -504,9 +475,17 @@ pub fn layer_momentum_apply_accumulated_gradient(
     batch_size: usize,
 ) -> PyResult<(RustArray, RustArray, RustArray, RustArray)> {
     require_same_shape(w, grad_w, "layer_momentum_apply_accumulated_gradient (W, grad_W)")?;
-    require_same_shape(w, velocity_w, "layer_momentum_apply_accumulated_gradient (W, velocity_W)")?;
+    require_same_shape(
+        w,
+        velocity_w,
+        "layer_momentum_apply_accumulated_gradient (W, velocity_W)",
+    )?;
     require_same_shape(b, grad_b, "layer_momentum_apply_accumulated_gradient (b, grad_b)")?;
-    require_same_shape(b, velocity_b, "layer_momentum_apply_accumulated_gradient (b, velocity_b)")?;
+    require_same_shape(
+        b,
+        velocity_b,
+        "layer_momentum_apply_accumulated_gradient (b, velocity_b)",
+    )?;
     require_batch_size(batch_size, "layer_momentum_apply_accumulated_gradient")?;
     let batch_size = batch_size as f64;
 
@@ -563,11 +542,7 @@ pub fn layer_relu_forward_batch(w: &RustArray, x: &RustArray, b: &RustArray) -> 
 /// inlines `array_relu_mask`'s own formula rather than calling it as a separate op, single-example
 /// (`next_delta`/`a` both 1D).
 #[pyfunction]
-pub fn layer_relu_hidden_delta(
-    next_w: &RustArray,
-    next_delta: &RustArray,
-    a: &RustArray,
-) -> PyResult<RustArray> {
+pub fn layer_relu_hidden_delta(next_w: &RustArray, next_delta: &RustArray, a: &RustArray) -> PyResult<RustArray> {
     let downstream = hidden_downstream(next_w, next_delta, a, "layer_relu_hidden_delta")?;
     let data = downstream
         .data
@@ -575,10 +550,7 @@ pub fn layer_relu_hidden_delta(
         .zip(a.data.iter())
         .map(|(&d, &av)| if av > 0.0 { d } else { 0.0 })
         .collect();
-    Ok(RustArray {
-        data,
-        shape: a.shape,
-    })
+    Ok(RustArray { data, shape: a.shape })
 }
 
 /// `ReLUArrayLayer.compute_hidden_delta_batch`: `(next_layer.delta_batch @ next_layer.W) *
@@ -674,11 +646,7 @@ pub fn layer_dropout_forward_batch(
 /// Shared by `layer_dropout_forward`/`layer_dropout_forward_batch` above - both differ only in
 /// how `base` (the pre-mask sigmoid) was computed (single-example matvec vs. batched matmul),
 /// not in how the mask is drawn and applied on top of it.
-fn dropout_forward_from_base(
-    base: &RustArray,
-    drop_probability: f64,
-    training: bool,
-) -> (RustArray, RustArray) {
+fn dropout_forward_from_base(base: &RustArray, drop_probability: f64, training: bool) -> (RustArray, RustArray) {
     let keep_probability = 1.0 - drop_probability;
     let size = base.data.len();
     if training {
@@ -780,7 +748,11 @@ fn dropout_hidden_delta_from_downstream(
         .zip(mask.data.iter())
         .map(|((&d, &base_value), &mask_value)| {
             let sigmoid_derivative = base_value * (1.0 - base_value);
-            let scale = if was_training { mask_value / keep_probability } else { 1.0 };
+            let scale = if was_training {
+                mask_value / keep_probability
+            } else {
+                1.0
+            };
             d * sigmoid_derivative * scale
         })
         .collect();

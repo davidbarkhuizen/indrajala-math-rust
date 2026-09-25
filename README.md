@@ -9,7 +9,9 @@ network layer ops (forward/backward passes, Adam/L2/momentum/dropout variants). 
 
 ## Build and test
 
-Requires a Rust toolchain (`cargo`) and Python >= 3.9. `maturin develop` installs into the
+Requires [rustup](https://rustup.rs) and Python >= 3.9. `rust-toolchain.toml` pins the Rust
+toolchain (with rustfmt and clippy), which rustup installs on first use; a distro `cargo` ignores
+the pin. `maturin develop` installs into the
 active virtualenv, so one must be active:
 
 ```
@@ -20,10 +22,20 @@ maturin develop --release   # rerun after any change under src/
 pytest tests/
 ```
 
-Always build with `--release`; a debug build is much slower. CI (`.github/workflows/ci.yml`) runs
-the same steps, plus `cargo check --release`, on every push and PR to `main`.
+Always build with `--release`; a debug build is much slower.
 
-`tests/` (~860 tests, about 15 s) checks each op against numpy and needs nothing from
+Before committing, format and lint:
+
+```
+cargo fmt
+cargo clippy --all-targets -- -D warnings
+```
+
+`rustfmt.toml` sets the line width (120); lint levels are in `Cargo.toml`'s `[lints]`. CI
+(`.github/workflows/ci.yml`) runs `cargo fmt --check`, the clippy command above and the build and
+test steps on every push and PR to `main`.
+
+`tests/` (~1,560 tests, about 20 s) checks each op against numpy and needs nothing from
 indrajala-ml. The tests that check the fused layer ops against indrajala-ml's numpy reference
 classes live in indrajala-ml's own `tests/`, so a change to `src/fused.rs` or `src/conv.rs` should
 also be tested there: in an indrajala-ml checkout, point `rust/` at the new commit, then

@@ -97,7 +97,13 @@ pub fn uniform(low: f64, high: f64, shape: &PyAny) -> PyResult<RustArray> {
 pub(crate) fn draw_bernoulli_mask(drop_probability: f64, size: usize) -> Vec<f64> {
     let mut rng = Xorshift128Plus::new(fresh_seed());
     (0..size)
-        .map(|_| if rng.next_unit_f64() >= drop_probability { 1.0 } else { 0.0 })
+        .map(|_| {
+            if rng.next_unit_f64() >= drop_probability {
+                1.0
+            } else {
+                0.0
+            }
+        })
         .collect()
 }
 

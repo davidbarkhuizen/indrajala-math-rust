@@ -1,0 +1,2 @@
+# indrajala-ml's Python line length (ruff), so both repos wrap at the same width.
+max_width = 120

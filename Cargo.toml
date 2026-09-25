@@ -12,3 +12,13 @@ crate-type = ["cdylib"]
 # `#[pymethods] impl RustArray` block instead of accreting every method into one growing
 # block in array.rs.
 pyo3 = { version = "0.20", features = ["extension-module", "multiple-pymethods"] }
+
+[lints.rust]
+# pyo3 0.20's #[pyclass]/#[pymethods] expansions define impls inside a const block, which rustc
+# >= 1.80 flags; later pyo3 releases no longer generate them.
+non_local_definitions = "allow"
+
+[lints.clippy]
+# The kernels index several fixed-size accumulators and tiles in lockstep with one loop
+# variable (acc[r][j], b_tile[j]), mirroring the math; iterator chains would obscure it.
+needless_range_loop = "allow"

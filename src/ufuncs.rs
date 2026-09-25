@@ -35,9 +35,7 @@ pub fn sum_axis0(arr: &RustArray) -> PyResult<RustArray> {
             }
             Ok(RustArray::from_vector(out))
         }
-        Shape::Vector(_) => Err(PyValueError::new_err(
-            "sum_axis0 requires a 2D array, got a 1D vector",
-        )),
+        Shape::Vector(_) => Err(PyValueError::new_err("sum_axis0 requires a 2D array, got a 1D vector")),
     }
 }
 

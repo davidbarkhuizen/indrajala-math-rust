@@ -11,11 +11,7 @@ use crate::array::{RustArray, Shape};
 /// machine's core count doesn't change at runtime.
 fn available_parallelism_cached() -> usize {
     static CACHED: OnceLock<usize> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-    })
+    *CACHED.get_or_init(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
 }
 
 /// The three matmul shape combinations `ArrayLayer`'s own formulas actually use - matrix @
@@ -116,7 +112,13 @@ fn dot_products_into(rows: &[f64], k: usize, v: &[f64], out: &mut [f64]) {
 /// Safety: as `dot_product_rows_avx2_fma`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn dot_product_blocks_avx2_fma<const R: usize>(rows: &[f64], k: usize, v: &[f64], out: &mut [f64], mut row: usize) -> usize {
+unsafe fn dot_product_blocks_avx2_fma<const R: usize>(
+    rows: &[f64],
+    k: usize,
+    v: &[f64],
+    out: &mut [f64],
+    mut row: usize,
+) -> usize {
     while row + R <= out.len() {
         let block = dot_product_rows_avx2_fma::<R>(&rows[row * k..(row + R) * k], k, v);
         out[row..row + R].copy_from_slice(&block);
@@ -220,8 +222,8 @@ unsafe fn dot_product_avx2_fma(a: &[f64], b: &[f64]) -> f64 {
 /// rows end to end, so results are bit-identical to the single-threaded path regardless of thread
 /// count or scheduling - summation order per output row is unaffected by which thread computes it.
 ///
-/// The flops check runs *before* anything else, including reading `available_parallelism_cached()`
-/// - measured directly, `std::thread::available_parallelism()` itself costs ~50us per call (not
+/// The flops check runs *before* anything else, including reading `available_parallelism_cached()`:
+/// measured directly, `std::thread::available_parallelism()` itself costs ~50us per call (not
 /// cached by the standard library, presumably a cgroup/proc filesystem read), which would have
 /// silently dominated every one of this codebase's actual small per-call matmuls (already
 /// measured in the tens of microseconds) if queried unconditionally on every dispatch. Cached
@@ -412,7 +414,8 @@ unsafe fn matmul_nt_blocks_avx2_fma(
         let out_block = &mut chunk[(row - row_start) * n..(row - row_start + NT_A_ROWS) * n];
         let mut col = 0;
         while col + NT_B_ROWS <= n {
-            let tile = dot_product_tile_avx2_fma::<NT_A_ROWS, NT_B_ROWS>(a_block, &b_data[col * k..(col + NT_B_ROWS) * k], k);
+            let tile =
+                dot_product_tile_avx2_fma::<NT_A_ROWS, NT_B_ROWS>(a_block, &b_data[col * k..(col + NT_B_ROWS) * k], k);
             for r in 0..NT_A_ROWS {
                 out_block[r * n + col..r * n + col + NT_B_ROWS].copy_from_slice(&tile[r]);
             }
@@ -420,7 +423,12 @@ unsafe fn matmul_nt_blocks_avx2_fma(
         }
         if col < n {
             for r in 0..NT_A_ROWS {
-                dot_products_into(&b_data[col * k..n * k], k, &a_block[r * k..(r + 1) * k], &mut out_block[r * n + col..(r + 1) * n]);
+                dot_products_into(
+                    &b_data[col * k..n * k],
+                    k,
+                    &a_block[r * k..(r + 1) * k],
+                    &mut out_block[r * n + col..(r + 1) * n],
+                );
             }
         }
         row += NT_A_ROWS;
@@ -428,14 +436,18 @@ unsafe fn matmul_nt_blocks_avx2_fma(
     row
 }
 
-/// `tile[r][c] = dot_product(b_rows[c], a_rows[r])` for `RA` consecutive `k`-wide rows of
-/// `a_rows` and `RB` of `b_rows`, as `dot_products_into(b_rows, k, a_rows[r])` computes it:
-/// accumulator `(r, c)` is exactly `dot_product_avx2_fma`'s `acc_vec` for that pair (the same loads, the same FMA operand order, the same `i`), and the
-/// lanes combine and the tail finishes as there. `RA * RB` accumulators plus `RA + RB` loads
-/// have to fit AVX2's 16 registers. Safety: as `dot_product_rows_avx2_fma`.
+/// `tile[r][c] = dot_product(b_rows[c], a_rows[r])` for `RA` consecutive `k`-wide rows of `a_rows` and `RB` of
+/// `b_rows`, as `dot_products_into(b_rows, k, a_rows[r])` computes it: accumulator `(r, c)` is exactly
+/// `dot_product_avx2_fma`'s `acc_vec` for that pair (the same loads, the same FMA operand order, the same `i`), and the
+/// lanes combine and the tail finishes as there. `RA * RB` accumulators plus `RA + RB` loads have to fit AVX2's 16
+/// registers. Safety: as `dot_product_rows_avx2_fma`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn dot_product_tile_avx2_fma<const RA: usize, const RB: usize>(a_rows: &[f64], b_rows: &[f64], k: usize) -> [[f64; RB]; RA] {
+unsafe fn dot_product_tile_avx2_fma<const RA: usize, const RB: usize>(
+    a_rows: &[f64],
+    b_rows: &[f64],
+    k: usize,
+) -> [[f64; RB]; RA] {
     use std::arch::x86_64::{_mm256_fmadd_pd, _mm256_loadu_pd, _mm256_setzero_pd, _mm256_storeu_pd};
 
     let a_ptr = a_rows.as_ptr();
@@ -457,7 +469,12 @@ unsafe fn dot_product_tile_avx2_fma<const RA: usize, const RB: usize>(a_rows: &[
         for c in 0..RB {
             let mut lanes = [0.0f64; 4];
             _mm256_storeu_pd(lanes.as_mut_ptr(), acc[r][c]);
-            out[r][c] = dot_product_tail(&b_rows[c * k..(c + 1) * k], &a_rows[r * k..(r + 1) * k], i, combine_lanes(lanes));
+            out[r][c] = dot_product_tail(
+                &b_rows[c * k..(c + 1) * k],
+                &a_rows[r * k..(r + 1) * k],
+                i,
+                combine_lanes(lanes),
+            );
         }
     }
     out
@@ -499,6 +516,10 @@ pub(crate) fn matmul_narrow(a: &RustArray, b: &RustArray) -> PyResult<RustArray>
 ///
 /// With `ADD`, every store adds the finished chain to the value already in `out_chunk` (`c +
 /// chain`) instead of overwriting it, which is the separate elementwise add's single rounding.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the kernel's operands and matmul dimensions, shared with its AVX2/FMA variant"
+)]
 pub(crate) fn tiled_row_range<const ADD: bool>(
     a_data: &[f64],
     b_data: &[f64],
@@ -512,14 +533,24 @@ pub(crate) fn tiled_row_range<const ADD: bool>(
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-            unsafe { tiled_row_range_avx2_fma::<ADD>(a_data, b_data, out_chunk, row_start, row_end, k, n, rows_per_block) };
+            unsafe {
+                tiled_row_range_avx2_fma::<ADD>(a_data, b_data, out_chunk, row_start, row_end, k, n, rows_per_block)
+            };
             return;
         }
     }
     tiled_row_range_scalar::<ADD>(a_data, b_data, out_chunk, row_start, row_end, k, n);
 }
 
-fn tiled_row_range_scalar<const ADD: bool>(a_data: &[f64], b_data: &[f64], out_chunk: &mut [f64], row_start: usize, row_end: usize, k: usize, n: usize) {
+fn tiled_row_range_scalar<const ADD: bool>(
+    a_data: &[f64],
+    b_data: &[f64],
+    out_chunk: &mut [f64],
+    row_start: usize,
+    row_end: usize,
+    k: usize,
+    n: usize,
+) {
     for row in row_start..row_end {
         let a_row = &a_data[row * k..(row + 1) * k];
         let out_row = &mut out_chunk[(row - row_start) * n..(row - row_start + 1) * n];
@@ -548,6 +579,10 @@ const TILE_ROWS: usize = 2;
 /// `row_start..row_end`, `b`'s `k x n` data, or `out_chunk`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "tiled_row_range's signature, which dispatches to it"
+)]
 unsafe fn tiled_row_range_avx2_fma<const ADD: bool>(
     a_data: &[f64],
     b_data: &[f64],
@@ -595,8 +630,12 @@ unsafe fn tiled_row_range_avx2_fma<const ADD: bool>(
                 row += TILE_ROWS;
             }
             for row in row..block_end {
-                let (mut acc0, mut acc1, mut acc2, mut acc3) =
-                    (_mm256_setzero_pd(), _mm256_setzero_pd(), _mm256_setzero_pd(), _mm256_setzero_pd());
+                let (mut acc0, mut acc1, mut acc2, mut acc3) = (
+                    _mm256_setzero_pd(),
+                    _mm256_setzero_pd(),
+                    _mm256_setzero_pd(),
+                    _mm256_setzero_pd(),
+                );
                 for (kk, &a_value) in a_data[row * k..(row + 1) * k].iter().enumerate() {
                     let a_vec = _mm256_set1_pd(a_value);
                     let b_row = b_ptr.add(kk * n + col);
@@ -654,10 +693,7 @@ unsafe fn store_lanes<const ADD: bool>(out: *mut f64, acc: std::arch::x86_64::__
 }
 
 fn shape_error(a_shape: Shape, b_shape: Shape) -> PyErr {
-    PyValueError::new_err(format!(
-        "cannot matmul arrays of shape {:?} and {:?}",
-        a_shape, b_shape
-    ))
+    PyValueError::new_err(format!("cannot matmul arrays of shape {:?} and {:?}", a_shape, b_shape))
 }
 
 #[pymethods]
