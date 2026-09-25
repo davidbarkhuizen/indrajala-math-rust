@@ -649,7 +649,7 @@ CONV_TAIL_BATCH_512 = (32, 512, 5408)
 
 
 def test_policy_runs_the_conv_mini_batch_32_tail_on_one_thread(reset_matmul_threading):
-    # threading it made the MNIST conv mini-batch 32 epoch 11% slower (stage 0 of the workplan)
+    # threading it (the old 4M-flop threshold) made the MNIST conv mini-batch 32 epoch 12% slower
     set_matmul_threading(0, 0)
     assert matmul_threads_for(*CONV_TAIL_BATCH_32) == 1
     assert matmul_threads_for(32, 5408, 32) == 1  # its forward, (32, 5408) @ W.T
