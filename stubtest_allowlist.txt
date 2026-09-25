@@ -1,0 +1,4 @@
+# mypy.stubtest entries that are artefacts of maturin's packaging, not API: the generated
+# __init__.py re-exports the compiled submodule's names (and its __all__).
+indrajala_math_rust.__all__
+indrajala_math_rust.indrajala_math_rust

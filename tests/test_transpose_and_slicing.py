@@ -29,10 +29,9 @@ def test_transpose_of_2d_swaps_axes():
 
 def test_transpose_of_transpose_round_trips():
     matrix = Array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
-    assert [
-        matrix.T.T[row, col] for row in range(3) for col in range(2)
-    ] == [matrix[row, col] for row in range(3) for col in range(2)]
-
+    assert [matrix.T.T[row, col] for row in range(3) for col in range(2)] == [
+        matrix[row, col] for row in range(3) for col in range(2)
+    ]
 
 
 @pytest.mark.parametrize(
@@ -44,6 +43,7 @@ def test_transpose_of_transpose_round_trips():
 def test_transpose_matches_numpy_at_block_edges(rows, cols):
     values = np.arange(rows * cols, dtype=float).reshape(rows, cols) + 0.5
     assert Array(values.tolist()).T.tolist() == values.T.tolist()
+
 
 def _hot_pixel_matrix(rows: int, cols: int, hot_row: int, hot_col: int) -> Array:
     grid = [[0.0] * cols for _ in range(rows)]
@@ -57,9 +57,7 @@ def test_full_row_slice_with_trailing_column_dropped_matches_mnist_shape():
     sliced = matrix[:, :-1]
     assert sliced.shape == (4, 4)
     # the hot pixel was in the dropped last column, so the slice is now all zeros
-    assert all(
-        sliced[row, col] == 0.0 for row in range(4) for col in range(4)
-    )
+    assert all(sliced[row, col] == 0.0 for row in range(4) for col in range(4))
 
 
 def test_slice_preserves_a_hot_pixel_still_inside_the_kept_range():

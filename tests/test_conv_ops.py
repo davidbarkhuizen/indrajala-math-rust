@@ -136,7 +136,7 @@ def test_geometry_rejects_invalid_arguments(arguments):
 def test_geometry_is_frozen():
     g = ConvGeometry(5, 5, 1, 3, 1)
     with pytest.raises(AttributeError):
-        g.stride = 2
+        g.stride = 2  # pyright: ignore[reportAttributeAccessIssue] - rejecting it is the test
 
 
 @pytest.mark.parametrize("shape", SHAPES)
@@ -149,7 +149,7 @@ def test_conv_forward_batch_matches_the_brute_force_definition(shape):
 
     # cols: row n*P + p in row-major output order, columns in W-row order - a pure copy of the
     # inputs each receptive field reads, so exactly equal
-    height, width, channels, k, _channel_count, s = shape
+    height, width, channels, k, _channel_count, _s = shape
     g = _geometry(shape)
     planes = X.reshape(BATCH_SIZE, channels, height, width)
     expected_cols = np.zeros((BATCH_SIZE * g.positions, g.fan_in))
@@ -180,9 +180,7 @@ FORWARD_EXTRA_CASES = [
 ]
 
 
-@pytest.mark.parametrize(
-    "shape, n", [(shape, n) for shape in SHAPES for n in (1, BATCH_SIZE)] + FORWARD_EXTRA_CASES
-)
+@pytest.mark.parametrize("shape, n", [(shape, n) for shape in SHAPES for n in (1, BATCH_SIZE)] + FORWARD_EXTRA_CASES)
 def test_conv_forward_batch_is_relu_of_the_matmul_scatter_exactly(shape, n):
     # A is relu(Z) with the ReLU applied during the scatter, and no Z is kept. Rebuild that from
     # its parts - the crate's own matmul (Array @) on the returned cols, the b add, the
@@ -264,9 +262,10 @@ def test_the_threaded_cases_are_over_the_threading_threshold():
     finally:
         set_matmul_threading(0, 0)
 
+
 def _backward_case(seed, shape, n):
     rng = np.random.default_rng(seed)
-    height, width, channels, k, channel_count, _s = shape
+    channel_count = shape[4]
     g = _geometry(shape)
     W = rng.uniform(-1.0, 1.0, size=(channel_count, g.fan_in))
     X = rng.uniform(-1.0, 1.0, size=(n, g.input_size))
@@ -275,15 +274,13 @@ def _backward_case(seed, shape, n):
     return W, X, delta, g
 
 
-@pytest.mark.parametrize(
-    "shape, n", [(shape, n) for shape in SHAPES for n in (1, BATCH_SIZE)] + BACKWARD_EXTRA_CASES
-)
+@pytest.mark.parametrize("shape, n", [(shape, n) for shape in SHAPES for n in (1, BATCH_SIZE)] + BACKWARD_EXTRA_CASES)
 def test_conv_downstream_batch_is_the_matmul_col2im_exactly(shape, n):
     # rebuild dX from its parts: the crate's own matmul (Array @) on the deltas regrouped to
     # (N*P, O), then col2im as a sequential scatter-add in the op's order (kernel offset outside
     # output position). The op computes D @ W with matmul_narrow, so this is its exact check
     W, _X, delta, g = _backward_case(8, shape, n)
-    o, p, k, fan_in = len(W), g.positions, g.kernel_size, g.fan_in
+    o, p, k = len(W), g.positions, g.kernel_size
     by_position = delta.reshape(n, o, p).transpose(0, 2, 1).reshape(n * p, o)
     dcols = _np(Array(by_position.tolist()) @ Array(W.tolist())).tolist()
 
@@ -294,15 +291,15 @@ def test_conv_downstream_batch_is_the_matmul_col2im_exactly(shape, n):
             column = (c * k + kr) * k + kc
             for out_row, out_col in itertools.product(range(g.out_height), range(g.out_width)):
                 row, col = out_row * g.stride + kr, out_col * g.stride + kc
-                out[(c * g.input_height + row) * g.input_width + col] += dcols[example * p + out_row * g.out_width + out_col][column]
+                out[(c * g.input_height + row) * g.input_width + col] += dcols[
+                    example * p + out_row * g.out_width + out_col
+                ][column]
 
     dX = conv_downstream_batch(Array(W.tolist()), Array(delta.tolist()), g)
     assert dX.tolist() == expected
 
 
-@pytest.mark.parametrize(
-    "shape, n", [(shape, n) for shape in SHAPES for n in (1, BATCH_SIZE)] + BACKWARD_EXTRA_CASES
-)
+@pytest.mark.parametrize("shape, n", [(shape, n) for shape in SHAPES for n in (1, BATCH_SIZE)] + BACKWARD_EXTRA_CASES)
 def test_conv_accumulate_gradient_batch_is_the_matmul_update_exactly(shape, n):
     # grad_W: grad_W0 + (the crate's own matmul of the deltas regrouped to (O, N*P) with cols),
     # one add per element. The op computes D @ cols with matmul_narrow, so this is its exact check

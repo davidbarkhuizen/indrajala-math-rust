@@ -5,6 +5,8 @@ softmax array-based class relies on it, the same "prove the primitive against nu
 building the layer" discipline test_array_relu.py's own array_relu check follows.
 """
 
+import math
+
 import numpy as np
 import pytest
 
@@ -52,7 +54,7 @@ def test_array_softmax_matches_numpy_for_large_magnitude_values_without_overflow
     expected = _numpy_softmax_1d(z)
     actual = _to_flat_list(array_softmax(Array(z.tolist())))
     assert actual == pytest.approx(expected.tolist(), rel=1e-9, abs=1e-12)
-    assert all(v == v for v in actual)  # no NaN
+    assert not any(math.isnan(v) for v in actual)
 
 
 def test_array_softmax_matches_numpy_row_wise_for_a_2d_matrix_across_a_random_sweep():

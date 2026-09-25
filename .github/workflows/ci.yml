@@ -29,18 +29,35 @@ jobs:
       # Lint levels are in Cargo.toml's [lints]; -D warnings fails the job on any warning.
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
-      # maturin pinned to match indrajala-ml's ./cli (maturin_version); numpy and pytest left
-      # unpinned, so this CI checks the crate against the latest numpy while indrajala-ml's CI
-      # checks it against that repo's pinned one.
+      # maturin, ruff and pyright pinned to match indrajala-ml's ./cli (maturin_version,
+      # ruff_version, pyright_version), mypy for its stubtest; numpy and pytest left unpinned, so
+      # this CI checks the crate against the latest numpy while indrajala-ml's CI checks it
+      # against that repo's pinned one.
       - name: Create venv and install Python deps
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install maturin==1.15.0 pytest numpy
+          pip install maturin==1.15.0 ruff==0.16.9 pyright==1.1.414 mypy==2.3.1 pytest numpy
+      - name: Ruff
+        run: |
+          source .venv/bin/activate
+          ruff check .
+          ruff format --check .
       - name: Build extension
         run: |
           source .venv/bin/activate
           maturin develop --release
+      # The built module against indrajala_math_rust.pyi: names, parameter names and kinds. Run
+      # outside the checkout, so it imports the installed package, not the repo's stub file.
+      - name: Stubtest
+        run: |
+          source .venv/bin/activate
+          cd "$RUNNER_TEMP" && python -m mypy.stubtest indrajala_math_rust --allowlist "$GITHUB_WORKSPACE/stubtest_allowlist.txt"
+      # The stub's types against the tests' real usage (pyproject's [tool.pyright]).
+      - name: Pyright
+        run: |
+          source .venv/bin/activate
+          pyright
       - name: Run tests
         run: |
           source .venv/bin/activate
