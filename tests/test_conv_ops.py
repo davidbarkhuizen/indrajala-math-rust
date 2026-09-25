@@ -22,6 +22,7 @@ from indrajala_math_rust import (
     layer_downstream,
     layer_downstream_batch,
     matmul_threads_for,
+    set_kernel_overrides,
     set_matmul_threading,
 )
 
@@ -260,6 +261,39 @@ def test_the_threaded_cases_are_over_the_threading_threshold():
             assert matmul_threads_for(rows, channel_count, g.fan_in) == 8  # downstream
             assert matmul_threads_for(channel_count, rows, g.fan_in) == 8  # accumulate
     finally:
+        set_matmul_threading(0, 0)
+
+
+# (shape, N) for set_kernel_overrides: fan_in 72 (16- and 4-wide tiles), 18 (a 16-wide tile and
+# a scalar tail) and 27 (16, 4, 4 and a tail), with 8, 5 and 6 output channels (whole, odd and
+# leftover row blocks)
+OVERRIDE_CASES = [((13, 13, 8, 3, 8, 1), 4), ((6, 6, 2, 3, 5, 1), 3), ((9, 7, 3, 3, 6, 2), 3)]
+
+
+@pytest.mark.parametrize("shape, n", OVERRIDE_CASES)
+def test_kernel_overrides_cannot_change_conv_bits(shape, n):
+    # every rows-per-block and slab size, unthreaded and split over threads (threshold 1), gives
+    # the default kernels' bits in all three ops: each output stays one FMA chain in increasing k
+    W, X, delta, g = _backward_case(11, shape, n)
+    W, X, delta = Array(W.tolist()), Array(X.tolist()), Array(delta.tolist())
+    b = Array(np.zeros(shape[4]).tolist())
+    grad_W0 = Array(np.zeros((shape[4], g.fan_in)).tolist())
+
+    def compute():
+        A, cols = conv_forward_batch(W, X, b, g)
+        dX = conv_downstream_batch(W, delta, g)
+        grad_W, _grad_b = conv_accumulate_gradient_batch(delta, cols, grad_W0, b, g)
+        return [A.tolist(), dX.tolist(), grad_W.tolist()]
+
+    try:
+        default = compute()
+        for threads, threshold in [(1, 2**62), (3, 1), (8, 1)]:
+            set_matmul_threading(threads, threshold)
+            for rows_per_block, k_block in itertools.product([1, 2, 3, 4, 8], [1, 5, 64, 2**40]):
+                set_kernel_overrides(rows_per_block, k_block)
+                assert compute() == default, (threads, rows_per_block, k_block)
+    finally:
+        set_kernel_overrides(0, 0)
         set_matmul_threading(0, 0)
 
 
