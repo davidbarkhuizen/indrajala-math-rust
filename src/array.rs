@@ -311,7 +311,7 @@ impl RustArray {
     /// rejects any step other than 1, since only contiguous slices are in scope (no fancy or
     /// boolean indexing).
     fn resolve_contiguous_range(slice: &Bound<'_, PySlice>, len: usize) -> PyResult<(usize, usize)> {
-        let indices = slice.indices(len as std::os::raw::c_long)?;
+        let indices = slice.indices(len as isize)?;
         if indices.step != 1 {
             return Err(PyValueError::new_err("only contiguous (step=1) slices are supported"));
         }
