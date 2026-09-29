@@ -9,7 +9,7 @@ network layer ops (forward/backward passes, Adam/L2/momentum/dropout variants). 
 
 ## Build and test
 
-Requires [rustup](https://rustup.rs) and Python >= 3.9. `rust-toolchain.toml` pins the Rust
+Requires [rustup](https://rustup.rs) and Python >= 3.14. `rust-toolchain.toml` pins the Rust
 toolchain (with rustfmt and clippy), which rustup installs on first use; a distro `cargo` ignores
 the pin. `maturin develop` installs into the
 active virtualenv, so one must be active:
