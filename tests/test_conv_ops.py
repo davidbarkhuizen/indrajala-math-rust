@@ -7,8 +7,8 @@ is independent of both this crate's im2col formulation and indrajala-ml's numpy 
 """
 
 import itertools
+import math
 import struct
-from fractions import Fraction
 
 import numpy as np
 import pytest
@@ -428,13 +428,6 @@ def test_layer_downstream_matches_numpy():
         layer_downstream_batch(Array(W.tolist()), Array.zeros((3, 7)))
 
 
-def _fma(a, b, c):
-    # a * b + c rounded once: Fraction arithmetic is exact and float(Fraction) rounds correctly
-    # (Python 3.10 has no math.fma). Exact zero sums don't arise from the uniform inputs below,
-    # so signed-zero rules don't need handling here
-    return float(Fraction(a) * Fraction(b) + Fraction(c))
-
-
 @pytest.mark.parametrize("m, n", [(1, 1), (1, 9), (9, 1), (4, 7), (10, 30), (30, 13), (37, 301)])
 def test_layer_downstream_is_a_sequential_fma_chain(m, n):
     # layer_downstream computes delta @ W as out[j] = fma(delta[k], W[k, j], out[j]) over k in
@@ -445,7 +438,7 @@ def test_layer_downstream_is_a_sequential_fma_chain(m, n):
     delta = rng.uniform(-1.0, 1.0, size=m).tolist()
     expected = [0.0] * n
     for k in range(m):
-        expected = [_fma(delta[k], W[k][j], expected[j]) for j in range(n)]
+        expected = [math.fma(delta[k], W[k][j], expected[j]) for j in range(n)]
 
     actual = layer_downstream(Array(W), Array(delta)).tolist()
 
