@@ -99,7 +99,7 @@ impl RustArray {
         }
         let n_cols = rows.get_item(0)?.len()?;
         let mut flat = Vec::with_capacity(n_rows * n_cols);
-        for row in rows.iter()? {
+        for row in rows.try_iter()? {
             let row = row?;
             if row.len()? != n_cols {
                 return Err(PyValueError::new_err("every row must have the same length"));
@@ -114,7 +114,7 @@ impl RustArray {
                     flat.push(value.extract::<f64>()?);
                 }
             } else {
-                for value in row.iter()? {
+                for value in row.try_iter()? {
                     flat.push(value?.extract::<f64>()?);
                 }
             }
@@ -161,10 +161,10 @@ impl RustArray {
     }
 
     #[getter]
-    fn shape(&self, py: Python<'_>) -> PyObject {
+    fn shape<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
         match self.shape {
-            Shape::Vector(n) => (n,).into_py(py),
-            Shape::Matrix(rows, cols) => (rows, cols).into_py(py),
+            Shape::Vector(n) => PyTuple::new(py, [n]),
+            Shape::Matrix(rows, cols) => PyTuple::new(py, [rows, cols]),
         }
     }
 
@@ -173,7 +173,7 @@ impl RustArray {
     /// contiguous 2D slice - the one slicing shape this core needs
     /// (`load_mnist_dataset_as_array`'s pixel-vs-label split), not general Python slice
     /// semantics: step must be 1, and there is no fancy/boolean indexing.
-    fn __getitem__(&self, py: Python<'_>, index: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    fn __getitem__<'py>(&self, py: Python<'py>, index: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         if let Shape::Matrix(rows, cols) = self.shape {
             if let Ok((row_slice, col_slice)) = index.extract::<(Bound<'_, PySlice>, Bound<'_, PySlice>)>() {
                 let (r0, r1) = Self::resolve_contiguous_range(&row_slice, rows)?;
@@ -184,11 +184,13 @@ impl RustArray {
                 for row in r0..r1 {
                     out.extend_from_slice(&self.data[row * cols + c0..row * cols + c1]);
                 }
-                return Ok(RustArray::from_matrix(out, new_rows, new_cols).into_py(py));
+                return Ok(RustArray::from_matrix(out, new_rows, new_cols)
+                    .into_pyobject(py)?
+                    .into_any());
             }
         }
         let flat_index = self.resolve_index(index)?;
-        Ok(self.data[flat_index].into_py(py))
+        Ok(self.data[flat_index].into_pyobject(py)?.into_any())
     }
 
     fn __setitem__(&mut self, index: &Bound<'_, PyAny>, value: f64) -> PyResult<()> {
@@ -207,14 +209,14 @@ impl RustArray {
     /// The inverse of `Array(nested_list)`/`Array(flat_list)` (see `new` above) - a flat Python
     /// list for a 1D array, a nested list of same-length lists for a 2D array. `save()`/`load()`
     /// round-trip weights through exactly this pair for JSON serialization.
-    fn tolist(&self, py: Python<'_>) -> PyObject {
+    fn tolist<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         match self.shape {
-            Shape::Vector(_) => self.data.clone().into_py(py),
+            Shape::Vector(_) => self.data.clone().into_pyobject(py),
             Shape::Matrix(rows, cols) => {
                 let nested: Vec<Vec<f64>> = (0..rows)
                     .map(|row| self.data[row * cols..(row + 1) * cols].to_vec())
                     .collect();
-                nested.into_py(py)
+                nested.into_pyobject(py)
             }
         }
     }

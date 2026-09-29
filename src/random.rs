@@ -221,12 +221,12 @@ impl DiscoveredSeed {
                 };
                 self.leaf(depth, word)
             } else {
-                self.sequence(depth, obj.iter()?.collect::<PyResult<_>>()?, Some(safe))
+                self.sequence(depth, obj.try_iter()?.collect::<PyResult<_>>()?, Some(safe))
             };
         }
         if safe_kind.is_none() && unsafe { pyo3::ffi::PyObject_CheckBuffer(obj.as_ptr()) } == 1 {
             // array.array, bytearray, memoryview: the buffer's format is the dtype
-            let view = py.import_bound("builtins")?.getattr("memoryview")?.call1((obj,))?;
+            let view = py.import("builtins")?.getattr("memoryview")?.call1((obj,))?;
             let format: String = view.getattr("format")?.extract()?;
             let code = format.trim_start_matches(['@', '=', '<', '>', '!']);
             let itemsize: usize = view.getattr("itemsize")?.extract()?;
@@ -236,11 +236,11 @@ impl DiscoveredSeed {
             return self.discover(&as_list, depth, Some(safe));
         }
         if unsafe { pyo3::ffi::PySequence_Check(obj.as_ptr()) } == 1 {
-            return self.sequence(depth, obj.iter()?.collect::<PyResult<_>>()?, safe_kind);
+            return self.sequence(depth, obj.try_iter()?.collect::<PyResult<_>>()?, safe_kind);
         }
         // a Python int within int64 is cast safely; anything else numpy holds as a float,
         // complex or object dtype, and none of those cast
-        let word = if safe_kind != Some(false) && obj.is_instance_of::<pyo3::types::PyLong>() {
+        let word = if safe_kind != Some(false) && obj.is_instance_of::<pyo3::types::PyInt>() {
             obj.extract::<i64>().ok()
         } else {
             None
@@ -292,7 +292,7 @@ pub fn seed(py: Python<'_>, seed: Option<Bound<'_, PyAny>>) -> PyResult<()> {
     if seed.hasattr("squeeze")? {
         seed = seed.call_method0("squeeze")?;
     }
-    let seeded = match py.import_bound("operator")?.getattr("index")?.call1((&seed,)) {
+    let seeded = match py.import("operator")?.getattr("index")?.call1((&seed,)) {
         Ok(index) => {
             let word: u32 = index.extract().map_err(|_| PyValueError::new_err(SEED_RANGE_MESSAGE))?;
             Mt19937::init_genrand(word)
