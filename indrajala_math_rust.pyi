@@ -2,9 +2,7 @@
 # against the built module by `python -m mypy.stubtest indrajala_math_rust` (CI), so a Rust
 # signature change that isn't mirrored here fails the build.
 
-from typing import Any, final, overload
-
-from typing_extensions import Self
+from typing import Any, Self, final, overload
 
 @final
 class Array:
