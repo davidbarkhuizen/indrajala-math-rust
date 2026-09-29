@@ -12,7 +12,7 @@ crate-type = ["cdylib"]
 # multiple-pymethods: lets each source file (array.rs, ops.rs, linalg.rs, ...) add its own
 # `#[pymethods] impl RustArray` block instead of accreting every method into one growing
 # block in array.rs.
-pyo3 = { version = "0.26", features = ["extension-module", "multiple-pymethods"] }
+pyo3 = { version = "0.27", features = ["extension-module", "multiple-pymethods"] }
 
 [lints.rust]
 # pyo3 0.20's #[pyclass]/#[pymethods] expansions define impls inside a const block, which rustc

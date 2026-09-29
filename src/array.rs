@@ -105,11 +105,11 @@ impl RustArray {
                 return Err(PyValueError::new_err("every row must have the same length"));
             }
             // tuples and lists are read by index, which is much faster than Python iteration
-            if let Ok(tuple) = row.downcast::<PyTuple>() {
+            if let Ok(tuple) = row.cast::<PyTuple>() {
                 for value in tuple.as_slice() {
                     flat.push(value.extract::<f64>()?);
                 }
-            } else if let Ok(list) = row.downcast::<PyList>() {
+            } else if let Ok(list) = row.cast::<PyList>() {
                 for value in list.iter() {
                     flat.push(value.extract::<f64>()?);
                 }
