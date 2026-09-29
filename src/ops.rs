@@ -5,7 +5,7 @@ use crate::array::{RustArray, Shape};
 
 /// Accepts a Python int or float as a scalar operand (`grad_W / batch_size` passes a Python
 /// int) - numpy itself accepts either for a scalar operation, so this core does too.
-fn extract_scalar(value: &PyAny) -> PyResult<f64> {
+fn extract_scalar(value: &Bound<'_, PyAny>) -> PyResult<f64> {
     if let Ok(v) = value.extract::<f64>() {
         return Ok(v);
     }
@@ -72,7 +72,7 @@ impl RustArray {
 
 #[pymethods]
 impl RustArray {
-    fn __add__(&self, other: &PyAny) -> PyResult<RustArray> {
+    fn __add__(&self, other: &Bound<'_, PyAny>) -> PyResult<RustArray> {
         if let Ok(other_ref) = other.extract::<PyRef<RustArray>>() {
             self.combine_with_array(&other_ref, |a, b| a + b, "add")
         } else {
@@ -84,7 +84,7 @@ impl RustArray {
         }
     }
 
-    fn __sub__(&self, other: &PyAny) -> PyResult<RustArray> {
+    fn __sub__(&self, other: &Bound<'_, PyAny>) -> PyResult<RustArray> {
         if let Ok(other_ref) = other.extract::<PyRef<RustArray>>() {
             self.combine_with_array(&other_ref, |a, b| a - b, "subtract")
         } else {
@@ -99,7 +99,7 @@ impl RustArray {
     /// `1.0 - self.a`-style reflected subtraction (a plain Python float on the left) -
     /// `compute_output_delta`'s own `(a - reference) * a * (1 - a)` formula needs this, not just
     /// array-minus-array.
-    fn __rsub__(&self, other: &PyAny) -> PyResult<RustArray> {
+    fn __rsub__(&self, other: &Bound<'_, PyAny>) -> PyResult<RustArray> {
         let scalar = extract_scalar(other)?;
         Ok(RustArray {
             data: scalar_elementwise(&self.data, scalar, |a, b| b - a),
@@ -107,7 +107,7 @@ impl RustArray {
         })
     }
 
-    fn __mul__(&self, other: &PyAny) -> PyResult<RustArray> {
+    fn __mul__(&self, other: &Bound<'_, PyAny>) -> PyResult<RustArray> {
         if let Ok(other_ref) = other.extract::<PyRef<RustArray>>() {
             self.combine_with_array(&other_ref, |a, b| a * b, "multiply")
         } else {
@@ -122,11 +122,11 @@ impl RustArray {
     /// `learning_rate * self._grad_W`-style reflected multiplication (a plain Python float on
     /// the left) - multiplication commutes, so this is exactly `__mul__` with the operands
     /// already in the right order for it.
-    fn __rmul__(&self, other: &PyAny) -> PyResult<RustArray> {
+    fn __rmul__(&self, other: &Bound<'_, PyAny>) -> PyResult<RustArray> {
         self.__mul__(other)
     }
 
-    fn __truediv__(&self, other: &PyAny) -> PyResult<RustArray> {
+    fn __truediv__(&self, other: &Bound<'_, PyAny>) -> PyResult<RustArray> {
         if let Ok(other_ref) = other.extract::<PyRef<RustArray>>() {
             self.combine_with_array(&other_ref, |a, b| a / b, "divide")
         } else {
@@ -141,7 +141,7 @@ impl RustArray {
     /// A true in-place op (mutates `self.data` directly, `&mut self` with a `()` return) -
     /// `self._grad_W += ...` every training step should not allocate a fresh Python object on
     /// every call.
-    fn __iadd__(&mut self, other: &PyAny) -> PyResult<()> {
+    fn __iadd__(&mut self, other: &Bound<'_, PyAny>) -> PyResult<()> {
         let result = self.__add__(other)?;
         self.data = result.data;
         self.shape = result.shape;
@@ -151,7 +151,7 @@ impl RustArray {
     /// Not required for correctness (Python falls back to `self = self.__sub__(other)` when
     /// `__isub__` is absent), implemented anyway to avoid an unnecessary allocation on every
     /// `apply_accumulated_gradient` call (`self.W -= ...`).
-    fn __isub__(&mut self, other: &PyAny) -> PyResult<()> {
+    fn __isub__(&mut self, other: &Bound<'_, PyAny>) -> PyResult<()> {
         let result = self.__sub__(other)?;
         self.data = result.data;
         self.shape = result.shape;

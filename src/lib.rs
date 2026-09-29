@@ -35,8 +35,11 @@ fn ping() -> PyResult<String> {
     Ok("pong".to_string())
 }
 
-#[pymodule]
-fn indrajala_math_rust(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+// gil_used: pyo3 >= 0.28 declares a module free-threading safe unless told otherwise. This one
+// hasn't been audited for free-threaded Python (Array's &mut self methods, the shared RNG
+// state), so it keeps the GIL on 3.13t/3.14t.
+#[pymodule(gil_used = true)]
+fn indrajala_math_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ping, m)?)?;
     m.add_function(wrap_pyfunction!(set_matmul_threading, m)?)?;
     m.add_function(wrap_pyfunction!(matmul_threads_for, m)?)?;
