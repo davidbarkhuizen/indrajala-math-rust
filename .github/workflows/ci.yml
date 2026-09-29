@@ -10,10 +10,10 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: "3.14"
       # Installs rust-toolchain.toml's pinned toolchain (with rustfmt and clippy) before
       # rust-cache, so the cache is keyed on it rather than the runner image's stable.
       - name: Install pinned Rust toolchain
