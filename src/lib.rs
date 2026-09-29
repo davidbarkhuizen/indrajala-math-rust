@@ -36,7 +36,7 @@ fn ping() -> PyResult<String> {
 }
 
 #[pymodule]
-fn indrajala_math_rust(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+fn indrajala_math_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ping, m)?)?;
     m.add_function(wrap_pyfunction!(set_matmul_threading, m)?)?;
     m.add_function(wrap_pyfunction!(matmul_threads_for, m)?)?;

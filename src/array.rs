@@ -19,7 +19,7 @@ impl Shape {
     }
 }
 
-pub(crate) fn parse_shape(shape: &PyAny) -> PyResult<Shape> {
+pub(crate) fn parse_shape(shape: &Bound<'_, PyAny>) -> PyResult<Shape> {
     if let Ok((rows, cols)) = shape.extract::<(usize, usize)>() {
         Ok(Shape::Matrix(rows, cols))
     } else if let Ok(n) = shape.extract::<usize>() {
@@ -62,7 +62,7 @@ impl RustArray {
     /// of same-length lists builds a 2D array - the two shapes this whole core ever needs, no
     /// more.
     #[new]
-    fn new(data: &PyAny) -> PyResult<Self> {
+    fn new(data: &Bound<'_, PyAny>) -> PyResult<Self> {
         if let Ok(rows) = data.extract::<Vec<Vec<f64>>>() {
             let n_rows = rows.len();
             if n_rows == 0 {
@@ -92,7 +92,7 @@ impl RustArray {
     /// nearly all of the difference is reading tuples and lists by index rather than through
     /// Python iteration. Same values and errors as `Array(nested)`.
     #[staticmethod]
-    fn from_rows(rows: &PyAny) -> PyResult<Self> {
+    fn from_rows(rows: &Bound<'_, PyAny>) -> PyResult<Self> {
         let n_rows = rows.len()?;
         if n_rows == 0 {
             return Err(PyValueError::new_err("cannot construct a 2D array from zero rows"));
@@ -152,7 +152,7 @@ impl RustArray {
     }
 
     #[staticmethod]
-    fn zeros(shape: &PyAny) -> PyResult<Self> {
+    fn zeros(shape: &Bound<'_, PyAny>) -> PyResult<Self> {
         let shape = parse_shape(shape)?;
         Ok(RustArray {
             data: vec![0.0; shape.size()],
@@ -173,11 +173,11 @@ impl RustArray {
     /// contiguous 2D slice - the one slicing shape this core needs
     /// (`load_mnist_dataset_as_array`'s pixel-vs-label split), not general Python slice
     /// semantics: step must be 1, and there is no fancy/boolean indexing.
-    fn __getitem__(&self, py: Python<'_>, index: &PyAny) -> PyResult<PyObject> {
+    fn __getitem__(&self, py: Python<'_>, index: &Bound<'_, PyAny>) -> PyResult<PyObject> {
         if let Shape::Matrix(rows, cols) = self.shape {
-            if let Ok((row_slice, col_slice)) = index.extract::<(&PySlice, &PySlice)>() {
-                let (r0, r1) = Self::resolve_contiguous_range(row_slice, rows)?;
-                let (c0, c1) = Self::resolve_contiguous_range(col_slice, cols)?;
+            if let Ok((row_slice, col_slice)) = index.extract::<(Bound<'_, PySlice>, Bound<'_, PySlice>)>() {
+                let (r0, r1) = Self::resolve_contiguous_range(&row_slice, rows)?;
+                let (c0, c1) = Self::resolve_contiguous_range(&col_slice, cols)?;
                 let new_rows = r1.saturating_sub(r0);
                 let new_cols = c1.saturating_sub(c0);
                 let mut out = Vec::with_capacity(new_rows * new_cols);
@@ -191,7 +191,7 @@ impl RustArray {
         Ok(self.data[flat_index].into_py(py))
     }
 
-    fn __setitem__(&mut self, index: &PyAny, value: f64) -> PyResult<()> {
+    fn __setitem__(&mut self, index: &Bound<'_, PyAny>, value: f64) -> PyResult<()> {
         let flat_index = self.resolve_index(index)?;
         self.data[flat_index] = value;
         Ok(())
@@ -257,7 +257,7 @@ impl RustArray {
     /// reshape-then-slice-then-astype chain already copies at the `.astype` step), so the
     /// simpler, correctness-preserving choice is made here rather than building view machinery
     /// nothing needs yet.
-    fn reshape(&self, shape: &PyAny) -> PyResult<Self> {
+    fn reshape(&self, shape: &Bound<'_, PyAny>) -> PyResult<Self> {
         let new_shape = parse_shape(shape)?;
         if new_shape.size() != self.data.len() {
             return Err(PyValueError::new_err(format!(
@@ -281,7 +281,7 @@ impl RustArray {
         }
     }
 
-    fn resolve_index(&self, index: &PyAny) -> PyResult<usize> {
+    fn resolve_index(&self, index: &Bound<'_, PyAny>) -> PyResult<usize> {
         match self.shape {
             Shape::Vector(n) => {
                 let i: usize = index
@@ -310,7 +310,7 @@ impl RustArray {
     /// slicing does (negative indices, an omitted stop, etc.), via `PySlice::indices` - but
     /// rejects any step other than 1, since only contiguous slices are in scope (no fancy or
     /// boolean indexing).
-    fn resolve_contiguous_range(slice: &PySlice, len: usize) -> PyResult<(usize, usize)> {
+    fn resolve_contiguous_range(slice: &Bound<'_, PySlice>, len: usize) -> PyResult<(usize, usize)> {
         let indices = slice.indices(len as std::os::raw::c_long)?;
         if indices.step != 1 {
             return Err(PyValueError::new_err("only contiguous (step=1) slices are supported"));

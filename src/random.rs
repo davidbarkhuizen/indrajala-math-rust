@@ -184,7 +184,7 @@ impl DiscoveredSeed {
         Ok(())
     }
 
-    fn sequence(&mut self, depth: usize, items: Vec<&PyAny>, safe_kind: Option<bool>) -> PyResult<()> {
+    fn sequence(&mut self, depth: usize, items: Vec<Bound<'_, PyAny>>, safe_kind: Option<bool>) -> PyResult<()> {
         if self.ndim.is_some_and(|ndim| depth >= ndim) {
             return Err(inhomogeneous(depth));
         }
@@ -194,14 +194,14 @@ impl DiscoveredSeed {
             None => self.dims.push(items.len()),
         }
         for item in items {
-            self.discover(item, depth + 1, safe_kind)?;
+            self.discover(&item, depth + 1, safe_kind)?;
         }
         Ok(())
     }
 
     /// Walks a seed the way `np.asarray` discovers its shape and dtype. `safe_kind` is set inside
     /// a buffer, whose format fixes the dtype of every element (`Some(false)`: none survive).
-    fn discover(&mut self, obj: &PyAny, depth: usize, safe_kind: Option<bool>) -> PyResult<()> {
+    fn discover(&mut self, obj: &Bound<'_, PyAny>, depth: usize, safe_kind: Option<bool>) -> PyResult<()> {
         let py = obj.py();
         let is_text = obj.is_instance_of::<pyo3::types::PyString>() || obj.is_instance_of::<pyo3::types::PyBytes>();
         if is_text {
@@ -226,14 +226,14 @@ impl DiscoveredSeed {
         }
         if safe_kind.is_none() && unsafe { pyo3::ffi::PyObject_CheckBuffer(obj.as_ptr()) } == 1 {
             // array.array, bytearray, memoryview: the buffer's format is the dtype
-            let view = py.import("builtins")?.getattr("memoryview")?.call1((obj,))?;
+            let view = py.import_bound("builtins")?.getattr("memoryview")?.call1((obj,))?;
             let format: String = view.getattr("format")?.extract()?;
             let code = format.trim_start_matches(['@', '=', '<', '>', '!']);
             let itemsize: usize = view.getattr("itemsize")?.extract()?;
             let safe = matches!(code, "?" | "b" | "h" | "i" | "l" | "q" | "n")
                 || (matches!(code, "B" | "H" | "I" | "L" | "Q" | "N") && itemsize < 8);
             let as_list = view.call_method0("tolist")?;
-            return self.discover(as_list, depth, Some(safe));
+            return self.discover(&as_list, depth, Some(safe));
         }
         if unsafe { pyo3::ffi::PySequence_Check(obj.as_ptr()) } == 1 {
             return self.sequence(depth, obj.iter()?.collect::<PyResult<_>>()?, safe_kind);
@@ -252,7 +252,7 @@ impl DiscoveredSeed {
 /// `np.random.seed`'s sequence path: `np.asarray(seed)`, non-empty, cast to int64 with
 /// `casting='safe'`, 1-D, every word in `[0, 2**32 - 1]` - checked in that order, so each
 /// rejection raises numpy's exception type.
-fn key_from_sequence(seed: &PyAny) -> PyResult<Vec<u32>> {
+fn key_from_sequence(seed: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
     let mut discovered = DiscoveredSeed::default();
     discovered.discover(seed, 0, None)?;
     if discovered.words.is_empty() {
@@ -280,7 +280,7 @@ fn key_from_sequence(seed: &PyAny) -> PyResult<Vec<u32>> {
 /// does.
 #[pyfunction]
 #[pyo3(signature = (seed=None))]
-pub fn seed(py: Python<'_>, seed: Option<&PyAny>) -> PyResult<()> {
+pub fn seed(py: Python<'_>, seed: Option<Bound<'_, PyAny>>) -> PyResult<()> {
     let Some(mut seed) = seed else {
         let mut state = locked_state();
         match state.as_mut() {
@@ -292,12 +292,12 @@ pub fn seed(py: Python<'_>, seed: Option<&PyAny>) -> PyResult<()> {
     if seed.hasattr("squeeze")? {
         seed = seed.call_method0("squeeze")?;
     }
-    let seeded = match py.import("operator")?.getattr("index")?.call1((seed,)) {
+    let seeded = match py.import_bound("operator")?.getattr("index")?.call1((&seed,)) {
         Ok(index) => {
             let word: u32 = index.extract().map_err(|_| PyValueError::new_err(SEED_RANGE_MESSAGE))?;
             Mt19937::init_genrand(word)
         }
-        Err(error) if error.is_instance_of::<PyTypeError>(py) => Mt19937::init_by_array(&key_from_sequence(seed)?),
+        Err(error) if error.is_instance_of::<PyTypeError>(py) => Mt19937::init_by_array(&key_from_sequence(&seed)?),
         Err(error) => return Err(error),
     };
     *locked_state() = Some(seeded);
@@ -313,7 +313,7 @@ fn shaped(data: Vec<f64>, shape: Shape) -> RustArray {
 
 /// `np.random.random(shape)`: uniform draws in `[0, 1)`, filled in C order.
 #[pyfunction]
-pub fn random(shape: &PyAny) -> PyResult<RustArray> {
+pub fn random(shape: &Bound<'_, PyAny>) -> PyResult<RustArray> {
     let shape = parse_shape(shape)?;
     let data = with_rng(|rng| (0..shape.size()).map(|_| rng.next_double()).collect());
     Ok(shaped(data, shape))
@@ -323,7 +323,7 @@ pub fn random(shape: &PyAny) -> PyResult<RustArray> {
 /// `range = high - low` computed once, filled in C order. A non-finite range raises numpy's
 /// `OverflowError`.
 #[pyfunction]
-pub fn uniform(low: f64, high: f64, shape: &PyAny) -> PyResult<RustArray> {
+pub fn uniform(low: f64, high: f64, shape: &Bound<'_, PyAny>) -> PyResult<RustArray> {
     let shape = parse_shape(shape)?;
     let range = high - low;
     if !range.is_finite() {
@@ -354,7 +354,7 @@ pub(crate) fn draw_bernoulli_mask(drop_probability: f64, size: usize) -> Vec<f64
 /// `(np.random.random(shape) >= drop_probability).astype(float)`: `draw_bernoulli_mask` as an
 /// array, so the mask can be checked against numpy on its own.
 #[pyfunction]
-pub fn bernoulli_mask(drop_probability: f64, shape: &PyAny) -> PyResult<RustArray> {
+pub fn bernoulli_mask(drop_probability: f64, shape: &Bound<'_, PyAny>) -> PyResult<RustArray> {
     let shape = parse_shape(shape)?;
     Ok(shaped(draw_bernoulli_mask(drop_probability, shape.size()), shape))
 }
