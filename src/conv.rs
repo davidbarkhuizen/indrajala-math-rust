@@ -26,7 +26,7 @@ use crate::linalg::{matmul_long_k, matmul_narrow, tiled_row_range, Panel, OVERWR
 
 /// The shape arithmetic for one conv or pool layer, built once by the Python layer and passed to
 /// every call. Pooling uses it with `kernel_size = pool_size`.
-#[pyclass(frozen)]
+#[pyclass(frozen, skip_from_py_object)]
 #[derive(Clone, Copy, Debug)]
 pub struct ConvGeometry {
     #[pyo3(get)]

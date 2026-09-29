@@ -35,7 +35,7 @@ pub(crate) fn parse_shape(shape: &Bound<'_, PyAny>) -> PyResult<Shape> {
 /// the Rust-side counterpart to a real numpy `ndarray`, restricted to the subset of numpy's
 /// interface this codebase actually uses. Named `Array`, not `PyArray`, to avoid colliding with
 /// real numpy's own type of that name.
-#[pyclass(name = "Array")]
+#[pyclass(name = "Array", skip_from_py_object)]
 #[derive(Clone)]
 pub struct RustArray {
     pub data: Vec<f64>,
