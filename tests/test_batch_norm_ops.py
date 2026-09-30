@@ -1,6 +1,8 @@
 """
-The dense batch-norm ops (`batch_norm_*`) and the bias-free linear ops before them (`linear_*`),
-against numpy transcriptions of indrajala-ml's README expressions (Batch normalization). The
+The batch-norm ops (`batch_norm_*`) and the bias-free linear ops before a dense one (`linear_*`),
+against numpy transcriptions of indrajala-ml's README expressions (Batch normalization). After a
+conv layer (`positions` > 1) the references work, as indrajala-ml's `BatchNormArrayLayer` does, on
+the `(N * P, C)` rows view of the channel-major `(N, C * P)` batch, which the ops never build. The
 batch-norm ops use only correctly rounded `+ - * /` and `sqrt` (and `exp` for the sigmoid), and
 each sum over the batch is a left fold in row order, so they are compared by bits. `exp` isn't
 correctly rounded: numpy's `np.exp` picks its implementation by CPU, and can differ from Rust's
@@ -29,6 +31,9 @@ RATE = 0.1
 ACTIVATIONS = ["sigmoid", "relu"]
 # a batch of 2 is the smallest in training; 33 rows cross numpy's pairwise-summation block of 8
 SHAPES = [(2, 1), (3, 2), (8, 5), (33, 7)]
+# (examples, channels, positions) after a conv layer: one channel, a 1-position edge, and more
+CONV_SHAPES = [(2, 1, 4), (3, 2, 9), (2, 3, 1), (5, 4, 16), (4, 6, 25)]
+CASES = [(rows, cols, 1) for rows, cols in SHAPES] + CONV_SHAPES
 
 
 def _numpy(array: Array) -> np.ndarray:
@@ -48,27 +53,40 @@ def _fold(values: np.ndarray) -> np.ndarray:
     return out
 
 
+def _rows(values: np.ndarray, positions: int) -> np.ndarray:
+    # channel-major (N, C * P) as (N * P, C), BatchNormArrayLayer._rows
+    n = values.shape[0]
+    return values.reshape(n, -1, positions).transpose(0, 2, 1).reshape(n * positions, -1)
+
+
+def _flat(rows: np.ndarray, positions: int) -> np.ndarray:
+    # _rows' inverse
+    n = rows.shape[0] // positions
+    return rows.reshape(n, positions, -1).transpose(0, 2, 1).reshape(n, -1)
+
+
 def _activate(y: np.ndarray, activation: str) -> np.ndarray:
     # the crate's exp, Rust's f64::exp, which the ops call; np.exp can differ in the last bit
     return 1.0 / (1.0 + _numpy(exp(Array((-y).tolist())))) if activation == "sigmoid" else np.maximum(0.0, y)
 
 
-def _case(rows: int, cols: int, seed: int) -> dict[str, np.ndarray]:
+def _case(rows: int, cols: int, seed: int, positions: int = 1) -> dict[str, np.ndarray]:
+    # cols channels of positions values each per example
     rng = np.random.default_rng(seed)
     return {
-        "x": rng.uniform(-3.0, 3.0, (rows, cols)),
+        "x": rng.uniform(-3.0, 3.0, (rows, cols * positions)),
         "gamma": rng.uniform(0.5, 1.5, cols),
         "beta": rng.uniform(-0.5, 0.5, cols),
         "running_mean": rng.uniform(-1.0, 1.0, cols),
         "running_var": rng.uniform(0.5, 2.0, cols),
-        "delta": rng.uniform(-1.0, 1.0, (rows, cols)),
+        "delta": rng.uniform(-1.0, 1.0, (rows, cols * positions)),
         "grad_gamma": rng.uniform(-1.0, 1.0, cols),
         "grad_beta": rng.uniform(-1.0, 1.0, cols),
     }
 
 
-def _training_reference(c: dict[str, np.ndarray], activation: str) -> dict[str, np.ndarray]:
-    x = c["x"]
+def _training_reference(c: dict[str, np.ndarray], activation: str, positions: int = 1) -> dict[str, np.ndarray]:
+    x = _rows(c["x"], positions)
     m = x.shape[0]
     mu = _fold(x) / m
     d = x - mu
@@ -77,9 +95,9 @@ def _training_reference(c: dict[str, np.ndarray], activation: str) -> dict[str, 
     std = np.sqrt(var + EPSILON)
     xhat = d / std
     return {
-        "a": _activate(c["gamma"] * xhat + c["beta"], activation),
-        "xhat": xhat,
-        "d": d,
+        "a": _flat(_activate(c["gamma"] * xhat + c["beta"], activation), positions),
+        "xhat": _flat(xhat, positions),
+        "d": _flat(d, positions),
         "var": var,
         "std": std,
         "running_mean": (1 - RATE) * c["running_mean"] + RATE * mu,
@@ -87,18 +105,20 @@ def _training_reference(c: dict[str, np.ndarray], activation: str) -> dict[str, 
     }
 
 
-def _downstream_reference(delta: np.ndarray, gamma: np.ndarray, t: dict[str, np.ndarray]) -> np.ndarray:
-    d, var, std = t["d"], t["var"], t["std"]
-    m = delta.shape[0]
-    dxhat = delta * gamma
+def _downstream_reference(
+    delta: np.ndarray, gamma: np.ndarray, t: dict[str, np.ndarray], positions: int = 1
+) -> np.ndarray:
+    d, var, std = _rows(t["d"], positions), t["var"], t["std"]
+    m = d.shape[0]
+    dxhat = _rows(delta, positions) * gamma
     inv_std = 1 / std
     inv_std3 = inv_std / (var + EPSILON)
     dvar = _fold(dxhat * d * -0.5 * inv_std3)
     dmu = _fold(dxhat * -inv_std) + dvar * _fold(-2 * d) / m
-    return dxhat * inv_std + dvar * (2 * d) / m + dmu / m
+    return _flat(dxhat * inv_std + dvar * (2 * d) / m + dmu / m, positions)
 
 
-def _training(c: dict[str, np.ndarray], activation: str) -> dict[str, np.ndarray]:
+def _training(c: dict[str, np.ndarray], activation: str, positions: int = 1) -> dict[str, np.ndarray]:
     names = ["a", "xhat", "d", "var", "std", "running_mean", "running_var"]
     result = batch_norm_forward_batch(
         Array(c["x"].tolist()),
@@ -109,45 +129,48 @@ def _training(c: dict[str, np.ndarray], activation: str) -> dict[str, np.ndarray
         EPSILON,
         RATE,
         activation,
+        positions,
     )
     return {name: _numpy(array) for name, array in zip(names, result)}
 
 
 @pytest.mark.parametrize("activation", ACTIVATIONS)
-@pytest.mark.parametrize("rows, cols", SHAPES)
+@pytest.mark.parametrize("rows, cols, positions", CASES)
 @pytest.mark.parametrize("seed", range(5))
-def test_the_training_forward_pass_is_the_readmes_by_bits(activation: str, rows: int, cols: int, seed: int):
-    c = _case(rows, cols, seed)
-    expected = _training_reference(c, activation)
-    actual = _training(c, activation)
+def test_the_training_forward_pass_is_the_readmes_by_bits(
+    activation: str, rows: int, cols: int, positions: int, seed: int
+):
+    c = _case(rows, cols, seed, positions)
+    expected = _training_reference(c, activation, positions)
+    actual = _training(c, activation, positions)
     for name, values in expected.items():
         assert _bits(actual[name]) == _bits(values), name
 
 
 @pytest.mark.parametrize("activation", ACTIVATIONS)
-@pytest.mark.parametrize("rows, cols", SHAPES)
+@pytest.mark.parametrize("rows, cols, positions", CASES)
 def test_the_inference_forward_pass_is_the_readmes_by_bits_for_a_batch_and_each_row(
-    activation: str, rows: int, cols: int
+    activation: str, rows: int, cols: int, positions: int
 ):
-    c = _case(rows, cols, 7)
-    xhat = (c["x"] - c["running_mean"]) / np.sqrt(c["running_var"] + EPSILON)
-    expected = _activate(c["gamma"] * xhat + c["beta"], activation)
+    c = _case(rows, cols, 7, positions)
+    xhat = (_rows(c["x"], positions) - c["running_mean"]) / np.sqrt(c["running_var"] + EPSILON)
+    expected = _flat(_activate(c["gamma"] * xhat + c["beta"], activation), positions)
     gamma, beta, mean, var = (Array(c[name].tolist()) for name in ("gamma", "beta", "running_mean", "running_var"))
 
-    batch = batch_norm_forward(Array(c["x"].tolist()), gamma, beta, mean, var, EPSILON, activation)
+    batch = batch_norm_forward(Array(c["x"].tolist()), gamma, beta, mean, var, EPSILON, activation, positions)
     assert _bits(_numpy(batch)) == _bits(expected)
     for i in range(rows):
-        row = batch_norm_forward(Array(c["x"][i].tolist()), gamma, beta, mean, var, EPSILON, activation)
-        assert row.shape == (cols,)
+        row = batch_norm_forward(Array(c["x"][i].tolist()), gamma, beta, mean, var, EPSILON, activation, positions)
+        assert row.shape == (cols * positions,)
         assert _bits(_numpy(row)) == _bits(expected[i])
 
 
-@pytest.mark.parametrize("rows, cols", SHAPES)
+@pytest.mark.parametrize("rows, cols, positions", CASES)
 @pytest.mark.parametrize("seed", range(5))
-def test_the_downstream_is_the_chain_rule_term_by_term_by_bits(rows: int, cols: int, seed: int):
-    c = _case(rows, cols, seed)
-    t = _training(c, "sigmoid")
-    expected = _downstream_reference(c["delta"], c["gamma"], t)
+def test_the_downstream_is_the_chain_rule_term_by_term_by_bits(rows: int, cols: int, positions: int, seed: int):
+    c = _case(rows, cols, seed, positions)
+    t = _training(c, "sigmoid", positions)
+    expected = _downstream_reference(c["delta"], c["gamma"], t, positions)
     actual = batch_norm_downstream_batch(
         Array(c["delta"].tolist()),
         Array(c["gamma"].tolist()),
@@ -155,6 +178,7 @@ def test_the_downstream_is_the_chain_rule_term_by_term_by_bits(rows: int, cols: 
         Array(t["var"].tolist()),
         Array(t["std"].tolist()),
         EPSILON,
+        positions,
     )
     assert _bits(_numpy(actual)) == _bits(expected)
 
@@ -179,16 +203,17 @@ def test_the_downstream_matches_a_finite_difference_of_the_normalized_output():
             assert dx[i, j] == pytest.approx((loss(up) - loss(down)) / (2 * h), rel=1e-6, abs=1e-8)
 
 
-@pytest.mark.parametrize("rows, cols", SHAPES)
-def test_accumulate_adds_the_folded_gamma_and_beta_gradients_by_bits(rows: int, cols: int):
-    c = _case(rows, cols, 3)
-    t = _training(c, "relu")
+@pytest.mark.parametrize("rows, cols, positions", CASES)
+def test_accumulate_adds_the_folded_gamma_and_beta_gradients_by_bits(rows: int, cols: int, positions: int):
+    c = _case(rows, cols, 3, positions)
+    t = _training(c, "relu", positions)
     grad_gamma, grad_beta = batch_norm_accumulate_gradient_batch(
         Array(c["delta"].tolist()), Array(t["xhat"].tolist()), Array(c["grad_gamma"].tolist()),
-        Array(c["grad_beta"].tolist()),
+        Array(c["grad_beta"].tolist()), positions,
     )  # fmt: skip
-    assert _bits(_numpy(grad_gamma)) == _bits(c["grad_gamma"] + _fold(c["delta"] * t["xhat"]))
-    assert _bits(_numpy(grad_beta)) == _bits(c["grad_beta"] + _fold(c["delta"]))
+    delta, xhat = _rows(c["delta"], positions), _rows(t["xhat"], positions)
+    assert _bits(_numpy(grad_gamma)) == _bits(c["grad_gamma"] + _fold(delta * xhat))
+    assert _bits(_numpy(grad_beta)) == _bits(c["grad_beta"] + _fold(delta))
 
 
 def test_a_column_of_negative_zeros_sums_to_positive_zero():
@@ -216,10 +241,24 @@ def test_mismatched_feature_counts_are_refused():
     two, three = Array.zeros(2), Array.zeros(3)
     with pytest.raises(ValueError, match="gamma"):
         batch_norm_forward(x, three, two, two, two, EPSILON, "relu")
-    with pytest.raises(ValueError, match="2D batch of 3 features"):
+    with pytest.raises(ValueError, match="2D batch of 3 channels x 1 positions"):
         batch_norm_forward_batch(x, three, three, three, three, EPSILON, RATE, "relu")
     with pytest.raises(ValueError, match="xhat"):
         batch_norm_accumulate_gradient_batch(x, Array([[1.0, 2.0]]), two, two)
+
+
+def test_mismatched_positions_are_refused():
+    # 2 values per example: 1 channel of 2 positions, not 1 channel of 3 or 2 channels of 2
+    x, one, two = Array([[1.0, 2.0], [3.0, 4.0]]), Array.zeros(1), Array.zeros(2)
+    with pytest.raises(ValueError, match="1 channels x 3 positions"):
+        batch_norm_forward(x, one, one, one, one, EPSILON, "relu", 3)
+    with pytest.raises(ValueError, match="2 channels x 2 positions"):
+        batch_norm_forward_batch(x, two, two, two, two, EPSILON, RATE, "relu", 2)
+    with pytest.raises(ValueError, match="2D batch of 1 channels x 3 positions"):
+        batch_norm_downstream_batch(x, one, x, one, one, EPSILON, 3)
+    with pytest.raises(ValueError, match="positions of 1 or more"):
+        batch_norm_accumulate_gradient_batch(x, x, one, one, 0)
+    batch_norm_forward_batch(x, one, one, one, Array([1.0]), EPSILON, RATE, "relu", 2)  # 1 channel of 2
 
 
 @pytest.mark.parametrize("rows, size, input_size", [(1, 3, 4), (6, 5, 7), (40, 16, 33)])

@@ -155,13 +155,24 @@ def conv_downstream_batch(w: Array, delta_batch: Array, geometry: ConvGeometry) 
 def conv_accumulate_gradient_batch(
     delta_batch: Array, cols: Array, grad_w: Array, grad_b: Array, geometry: ConvGeometry
 ) -> tuple[Array, Array]: ...
+def conv_linear_forward_batch(w: Array, x: Array, geometry: ConvGeometry) -> tuple[Array, Array]: ...
+def conv_linear_accumulate_gradient_batch(
+    delta_batch: Array, cols: Array, grad_w: Array, geometry: ConvGeometry
+) -> Array: ...
 def max_pool_forward_batch(x: Array, geometry: ConvGeometry) -> tuple[Array, Array]: ...
 def max_pool_downstream_batch(delta_batch: Array, argmax: Array, geometry: ConvGeometry) -> Array: ...
 def linear_forward(w: Array, x: Array) -> Array: ...
 def linear_forward_batch(w: Array, x: Array) -> Array: ...
 def linear_accumulate_gradient_batch(delta_batch: Array, input_activation_batch: Array, grad_w: Array) -> Array: ...
 def batch_norm_forward(
-    x: Array, gamma: Array, beta: Array, running_mean: Array, running_var: Array, epsilon: float, activation: str
+    x: Array,
+    gamma: Array,
+    beta: Array,
+    running_mean: Array,
+    running_var: Array,
+    epsilon: float,
+    activation: str,
+    positions: int = 1,
 ) -> Array: ...
 def batch_norm_forward_batch(
     x: Array,
@@ -172,10 +183,11 @@ def batch_norm_forward_batch(
     epsilon: float,
     running_rate: float,
     activation: str,
+    positions: int = 1,
 ) -> tuple[Array, Array, Array, Array, Array, Array, Array]: ...
 def batch_norm_downstream_batch(
-    delta_batch: Array, gamma: Array, d: Array, var: Array, std: Array, epsilon: float
+    delta_batch: Array, gamma: Array, d: Array, var: Array, std: Array, epsilon: float, positions: int = 1
 ) -> Array: ...
 def batch_norm_accumulate_gradient_batch(
-    delta_batch: Array, xhat: Array, grad_gamma: Array, grad_beta: Array
+    delta_batch: Array, xhat: Array, grad_gamma: Array, grad_beta: Array, positions: int = 1
 ) -> tuple[Array, Array]: ...
