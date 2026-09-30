@@ -118,7 +118,9 @@ def _downstream_reference(
     return _flat(dxhat * inv_std + dvar * (2 * d) / m + dmu / m, positions)
 
 
-def _training(c: dict[str, np.ndarray], activation: str, positions: int = 1) -> dict[str, np.ndarray]:
+def _training(
+    c: dict[str, np.ndarray], activation: str, positions: int = 1, group_size: int | None = None
+) -> dict[str, np.ndarray]:
     names = ["a", "xhat", "d", "var", "std", "running_mean", "running_var"]
     result = batch_norm_forward_batch(
         Array(c["x"].tolist()),
@@ -130,8 +132,30 @@ def _training(c: dict[str, np.ndarray], activation: str, positions: int = 1) -> 
         RATE,
         activation,
         positions,
+        group_size,
     )
     return {name: _numpy(array) for name, array in zip(names, result)}
+
+
+def _group_ranges(rows: int, group_size: int) -> list[tuple[int, int]]:
+    # ghost groups: runs of group_size examples in row order, the last one the remainder
+    return [(first, min(first + group_size, rows)) for first in range(0, rows, group_size)]
+
+
+def _ghost_reference(
+    c: dict[str, np.ndarray], activation: str, positions: int, group_size: int
+) -> dict[str, np.ndarray]:
+    # each group is a batch of its own, the running averages carried from one to the next;
+    # var and std are group-major
+    running_mean, running_var = c["running_mean"], c["running_var"]
+    parts: list[dict[str, np.ndarray]] = []
+    for first, end in _group_ranges(c["x"].shape[0], group_size):
+        group = {**c, "x": c["x"][first:end], "running_mean": running_mean, "running_var": running_var}
+        part = _training_reference(group, activation, positions)
+        running_mean, running_var = part["running_mean"], part["running_var"]
+        parts.append(part)
+    stacked = {name: np.concatenate([part[name] for part in parts]) for name in ("a", "xhat", "d", "var", "std")}
+    return {**stacked, "running_mean": running_mean, "running_var": running_var}
 
 
 @pytest.mark.parametrize("activation", ACTIVATIONS)
@@ -214,6 +238,81 @@ def test_accumulate_adds_the_folded_gamma_and_beta_gradients_by_bits(rows: int, 
     delta, xhat = _rows(c["delta"], positions), _rows(t["xhat"], positions)
     assert _bits(_numpy(grad_gamma)) == _bits(c["grad_gamma"] + _fold(delta * xhat))
     assert _bits(_numpy(grad_beta)) == _bits(c["grad_beta"] + _fold(delta))
+
+
+# (rows, cols, positions, group_size): groups that divide the batch, a remainder group, and
+# conv groups
+GHOST_CASES = [(4, 3, 1, 2), (8, 5, 1, 4), (7, 2, 1, 4), (34, 7, 1, 8), (6, 2, 4, 2), (5, 4, 9, 3), (8, 3, 1, 3)]
+
+
+@pytest.mark.parametrize("activation", ACTIVATIONS)
+@pytest.mark.parametrize("rows, cols, positions, group_size", GHOST_CASES)
+def test_each_ghost_group_is_a_batch_of_its_own_by_bits(
+    activation: str, rows: int, cols: int, positions: int, group_size: int
+):
+    c = _case(rows, cols, 13, positions)
+    expected = _ghost_reference(c, activation, positions, group_size)
+    actual = _training(c, activation, positions, group_size)
+    for name, values in expected.items():
+        assert _bits(actual[name]) == _bits(values), name
+
+
+@pytest.mark.parametrize("rows, cols, positions", CASES)
+@pytest.mark.parametrize("extra", [0, 1, 10])
+def test_one_ghost_group_is_plain_batch_norm_by_bits(rows: int, cols: int, positions: int, extra: int):
+    c = _case(rows, cols, 5, positions)
+    plain = _training(c, "sigmoid", positions)
+    grouped = _training(c, "sigmoid", positions, rows + extra)
+    for name, values in plain.items():
+        assert _bits(grouped[name]) == _bits(values), name
+
+
+@pytest.mark.parametrize("rows, cols, positions, group_size", GHOST_CASES)
+def test_the_ghost_downstream_is_each_groups_by_bits(rows: int, cols: int, positions: int, group_size: int):
+    c = _case(rows, cols, 17, positions)
+    t = _training(c, "relu", positions, group_size)
+    parts = []
+    for g, (first, end) in enumerate(_group_ranges(rows, group_size)):
+        group = {
+            "d": t["d"][first:end],
+            "var": t["var"][g * cols : (g + 1) * cols],
+            "std": t["std"][g * cols : (g + 1) * cols],
+        }
+        parts.append(_downstream_reference(c["delta"][first:end], c["gamma"], group, positions))
+    actual = batch_norm_downstream_batch(
+        Array(c["delta"].tolist()), Array(c["gamma"].tolist()), Array(t["d"].tolist()), Array(t["var"].tolist()),
+        Array(t["std"].tolist()), EPSILON, positions, group_size,
+    )  # fmt: skip
+    assert _bits(_numpy(actual)) == _bits(np.concatenate(parts))
+
+
+def test_ghost_groups_refuse_a_last_group_of_one():
+    c = _case(5, 2, 0)
+    with pytest.raises(ValueError, match="the last of 1"):
+        _training(c, "sigmoid", 1, 2)
+    t = _training(c, "sigmoid", 1, 3)
+    with pytest.raises(ValueError, match="the last of 1"):
+        batch_norm_downstream_batch(
+            Array(c["delta"].tolist()), Array(c["gamma"].tolist()), Array(t["d"].tolist()), Array(t["var"].tolist()),
+            Array(t["std"].tolist()), EPSILON, 1, 2,
+        )  # fmt: skip
+
+
+@pytest.mark.parametrize("group_size", [0, 1])
+def test_a_group_size_under_2_is_refused(group_size: int):
+    with pytest.raises(ValueError, match="group_size of 2 or more"):
+        _training(_case(4, 2, 0), "relu", 1, group_size)
+
+
+def test_the_downstream_refuses_statistics_for_other_groups():
+    # one group's var and std for a batch of two groups
+    c = _case(4, 2, 0)
+    t = _training(c, "sigmoid")
+    with pytest.raises(ValueError, match="var of shape"):
+        batch_norm_downstream_batch(
+            Array(c["delta"].tolist()), Array(c["gamma"].tolist()), Array(t["d"].tolist()), Array(t["var"].tolist()),
+            Array(t["std"].tolist()), EPSILON, 1, 2,
+        )  # fmt: skip
 
 
 def test_a_column_of_negative_zeros_sums_to_positive_zero():
