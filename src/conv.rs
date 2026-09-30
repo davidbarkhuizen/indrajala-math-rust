@@ -214,9 +214,7 @@ pub fn conv_forward_batch(
         )));
     }
     let (n, is_vector) = require_batch(x, geometry.input_size, "conv_forward_batch X")?;
-    Ok(products_forward(w, x, geometry, o, n, is_vector, |z, channel| {
-        (z + b.data[channel]).max(0.0)
-    }))
+    Ok(products_forward(w, x, geometry, o, n, is_vector, Some(&b.data)))
 }
 
 /// `LinearConvArrayLayer.forward_batch`: `conv_forward_batch`'s products without the bias and the
@@ -229,11 +227,11 @@ pub fn conv_linear_forward_batch(
 ) -> PyResult<(RustArray, RustArray)> {
     let o = channel_count(w, geometry, "conv_linear_forward_batch")?;
     let (n, is_vector) = require_batch(x, geometry.input_size, "conv_linear_forward_batch X")?;
-    Ok(products_forward(w, x, geometry, o, n, is_vector, |z, _| z))
+    Ok(products_forward(w, x, geometry, o, n, is_vector, None))
 }
 
-/// The forward ops' shared body (see `conv_forward_batch`): each product goes through
-/// `epilogue(z, channel)` as it is appended to `A`.
+/// The forward ops' shared body (see `conv_forward_batch`): with `bias`, each product is appended
+/// to `A` as `max(z + bias[channel], 0)`, the bias read once per channel; without, as it is.
 fn products_forward(
     w: &RustArray,
     x: &RustArray,
@@ -241,7 +239,7 @@ fn products_forward(
     o: usize,
     n: usize,
     is_vector: bool,
-    epilogue: impl Fn(f64, usize) -> f64,
+    bias: Option<&[f64]>,
 ) -> (RustArray, RustArray) {
     let g = geometry;
     let (p, k, fan_in) = (g.positions, g.kernel_size, g.fan_in);
@@ -269,7 +267,14 @@ fn products_forward(
             Panel::whole(0, p, fan_in, o, 1),
         );
         for channel in 0..o {
-            a.extend((0..p).map(|position| epilogue(by_position[position * o + channel], channel)));
+            let products = (0..p).map(|position| by_position[position * o + channel]);
+            match bias {
+                Some(bias) => {
+                    let bias = bias[channel];
+                    a.extend(products.map(|z| (z + bias).max(0.0)));
+                }
+                None => a.extend(products),
+            }
         }
     }
     let cols = RustArray::from_matrix(cols, n * p, fan_in);
