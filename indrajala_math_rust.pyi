@@ -184,9 +184,17 @@ def batch_norm_forward_batch(
     running_rate: float,
     activation: str,
     positions: int = 1,
+    group_size: int | None = None,
 ) -> tuple[Array, Array, Array, Array, Array, Array, Array]: ...
 def batch_norm_downstream_batch(
-    delta_batch: Array, gamma: Array, d: Array, var: Array, std: Array, epsilon: float, positions: int = 1
+    delta_batch: Array,
+    gamma: Array,
+    d: Array,
+    var: Array,
+    std: Array,
+    epsilon: float,
+    positions: int = 1,
+    group_size: int | None = None,
 ) -> Array: ...
 def batch_norm_accumulate_gradient_batch(
     delta_batch: Array, xhat: Array, grad_gamma: Array, grad_beta: Array, positions: int = 1
