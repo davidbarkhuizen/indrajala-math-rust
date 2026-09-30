@@ -2,7 +2,9 @@
 The dense batch-norm ops (`batch_norm_*`) and the bias-free linear ops before them (`linear_*`),
 against numpy transcriptions of indrajala-ml's README expressions (Batch normalization). The
 batch-norm ops use only correctly rounded `+ - * /` and `sqrt` (and `exp` for the sigmoid), and
-each sum over the batch is a left fold in row order, so they are compared by bits. The linear ops
+each sum over the batch is a left fold in row order, so they are compared by bits. `exp` isn't
+correctly rounded: numpy's `np.exp` picks its implementation by CPU, and can differ from Rust's
+`f64::exp` in the last bit, so the sigmoid references take the crate's `exp`. The linear ops
 are the dense layer's products, `W @ x` and `grad_W + delta.T @ X`, without its bias.
 """
 
@@ -15,6 +17,7 @@ from indrajala_math_rust import (
     batch_norm_downstream_batch,
     batch_norm_forward,
     batch_norm_forward_batch,
+    exp,
     layer_accumulate_gradient_batch,
     linear_accumulate_gradient_batch,
     linear_forward,
@@ -46,7 +49,8 @@ def _fold(values: np.ndarray) -> np.ndarray:
 
 
 def _activate(y: np.ndarray, activation: str) -> np.ndarray:
-    return 1.0 / (1.0 + np.exp(-y)) if activation == "sigmoid" else np.maximum(0.0, y)
+    # the crate's exp, Rust's f64::exp, which the ops call; np.exp can differ in the last bit
+    return 1.0 / (1.0 + _numpy(exp(Array((-y).tolist())))) if activation == "sigmoid" else np.maximum(0.0, y)
 
 
 def _case(rows: int, cols: int, seed: int) -> dict[str, np.ndarray]:
