@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 mod array;
+mod batch_norm;
 mod conv;
 mod fused;
 mod linalg;
@@ -10,6 +11,10 @@ mod random;
 mod ufuncs;
 
 use array::RustArray;
+use batch_norm::{
+    batch_norm_accumulate_gradient_batch, batch_norm_downstream_batch, batch_norm_forward, batch_norm_forward_batch,
+    linear_accumulate_gradient_batch, linear_forward, linear_forward_batch,
+};
 use conv::{
     conv_accumulate_gradient_batch, conv_downstream_batch, conv_forward_batch, max_pool_downstream_batch,
     max_pool_forward_batch, ConvGeometry,
@@ -86,6 +91,13 @@ fn indrajala_math_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(conv_accumulate_gradient_batch, m)?)?;
     m.add_function(wrap_pyfunction!(max_pool_forward_batch, m)?)?;
     m.add_function(wrap_pyfunction!(max_pool_downstream_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(linear_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(linear_forward_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(linear_accumulate_gradient_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(batch_norm_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(batch_norm_forward_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(batch_norm_downstream_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(batch_norm_accumulate_gradient_batch, m)?)?;
     m.add_class::<RustArray>()?;
     m.add_class::<ConvGeometry>()?;
     seed_at_import();
