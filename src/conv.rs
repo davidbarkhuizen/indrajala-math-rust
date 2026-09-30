@@ -214,33 +214,6 @@ pub fn conv_forward_batch(
         )));
     }
     let (n, is_vector) = require_batch(x, geometry.input_size, "conv_forward_batch X")?;
-    Ok(products_forward(w, x, geometry, o, n, is_vector, Some(&b.data)))
-}
-
-/// `LinearConvArrayLayer.forward_batch`: `conv_forward_batch`'s products without the bias and the
-/// ReLU, the pre-activations a batch-norm layer normalizes. Returns `(A, cols)` as that op does.
-#[pyfunction]
-pub fn conv_linear_forward_batch(
-    w: &RustArray,
-    x: &RustArray,
-    geometry: &ConvGeometry,
-) -> PyResult<(RustArray, RustArray)> {
-    let o = channel_count(w, geometry, "conv_linear_forward_batch")?;
-    let (n, is_vector) = require_batch(x, geometry.input_size, "conv_linear_forward_batch X")?;
-    Ok(products_forward(w, x, geometry, o, n, is_vector, None))
-}
-
-/// The forward ops' shared body (see `conv_forward_batch`): with `bias`, each product is appended
-/// to `A` as `max(z + bias[channel], 0)`, the bias read once per channel; without, as it is.
-fn products_forward(
-    w: &RustArray,
-    x: &RustArray,
-    geometry: &ConvGeometry,
-    o: usize,
-    n: usize,
-    is_vector: bool,
-    bias: Option<&[f64]>,
-) -> (RustArray, RustArray) {
     let g = geometry;
     let (p, k, fan_in) = (g.positions, g.kernel_size, g.fan_in);
 
@@ -267,18 +240,58 @@ fn products_forward(
             Panel::whole(0, p, fan_in, o, 1),
         );
         for channel in 0..o {
-            let products = (0..p).map(|position| by_position[position * o + channel]);
-            match bias {
-                Some(bias) => {
-                    let bias = bias[channel];
-                    a.extend(products.map(|z| (z + bias).max(0.0)));
-                }
-                None => a.extend(products),
-            }
+            let bias = b.data[channel];
+            a.extend((0..p).map(|position| (by_position[position * o + channel] + bias).max(0.0)));
         }
     }
     let cols = RustArray::from_matrix(cols, n * p, fan_in);
-    (batch_output(a, n, o * p, is_vector), cols)
+    Ok((batch_output(a, n, o * p, is_vector), cols))
+}
+
+/// `LinearConvArrayLayer.forward_batch`: `conv_forward_batch`'s products without the bias and the
+/// ReLU, the pre-activations a batch-norm layer normalizes. Returns `(A, cols)` as that op does.
+///
+/// Its own copy of `conv_forward_batch`'s body, not a shared helper: with the body shared, the
+/// conv mini-batch op profile put `conv_forward_batch` 8-17% above its unshared form.
+#[pyfunction]
+pub fn conv_linear_forward_batch(
+    w: &RustArray,
+    x: &RustArray,
+    geometry: &ConvGeometry,
+) -> PyResult<(RustArray, RustArray)> {
+    let o = channel_count(w, geometry, "conv_linear_forward_batch")?;
+    let (n, is_vector) = require_batch(x, geometry.input_size, "conv_linear_forward_batch X")?;
+    let g = geometry;
+    let (p, k, fan_in) = (g.positions, g.kernel_size, g.fan_in);
+
+    let w_t = w.transpose(); // (C*k*k, O)
+    let mut cols = Vec::with_capacity(n * p * fan_in);
+    let mut by_position = vec![0.0; p * o]; // one example's (P, O)
+    let mut a = Vec::with_capacity(n * o * p);
+    for example in 0..n {
+        let input = &x.data[example * g.input_size..(example + 1) * g.input_size];
+        for out_row in 0..g.out_height {
+            for out_col in 0..g.out_width {
+                for c in 0..g.input_channels {
+                    for kr in 0..k {
+                        let start = g.input_index(c, out_row, out_col, kr, 0);
+                        cols.extend_from_slice(&input[start..start + k]);
+                    }
+                }
+            }
+        }
+        tiled_row_range::<OVERWRITE>(
+            &cols[example * p * fan_in..],
+            &w_t.data,
+            &mut by_position,
+            Panel::whole(0, p, fan_in, o, 1),
+        );
+        for channel in 0..o {
+            a.extend((0..p).map(|position| by_position[position * o + channel]));
+        }
+    }
+    let cols = RustArray::from_matrix(cols, n * p, fan_in);
+    Ok((batch_output(a, n, o * p, is_vector), cols))
 }
 
 /// `ConvArrayLayer._downstream`: `dcols = D @ W` with `matmul_narrow`, `D` the deltas regrouped to
