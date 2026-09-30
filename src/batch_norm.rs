@@ -1,12 +1,21 @@
-//! Dense batch normalization (Ioffe & Szegedy 2015) and the bias-free linear layer before it: one
-//! Rust function per method of indrajala-ml's `indrajala_ml/model/batch_norm_array_layer.py` and
-//! `linear_array_layer.py`, as `fused.rs` is for `array_layer.py`. Each normalizes every feature
-//! (column) over the batch (rows).
+//! Batch normalization (Ioffe & Szegedy 2015) and the bias-free linear layer before a dense one:
+//! one Rust function per method of indrajala-ml's `indrajala_ml/model/batch_norm_array_layer.py`
+//! and `linear_array_layer.py`, as `fused.rs` is for `array_layer.py`. (The bias-free conv layer's
+//! ops are `conv.rs`'s `conv_linear_*`.)
+//!
+//! Each batch-norm function normalizes every channel over the batch. After a dense layer a
+//! channel is a feature, a column of the `(N, C)` batch, and `positions` is 1. After a conv layer
+//! the batch is its channel-major `(N, C*P)`, `positions` is `P`, and a channel's values are its
+//! `P` positions in every example: `BatchNormArrayLayer`'s `(N*P, C)` view, which the functions
+//! never build. They index the channel-major layout in place, example by example, channel by
+//! channel, position by position, so each channel still meets its values in the view's row order,
+//! the README's (example, position) order. At `positions = 1` that is the dense layer's row order.
+//! `xhat` and `d` come back in the input's layout, as the numpy layer's `_flat` would give them.
 //!
 //! The batch-norm functions compute indrajala-ml's README expressions (Batch normalization), in
 //! their grouping, left to right, with only IEEE 754's correctly rounded `+ - * /` and `sqrt`: no
-//! `mul_add` and no `powf`. Every sum over the batch is a left fold from `0.0` in row order, as
-//! `sum_axis0`. So given the same inputs they compute numpy's bits.
+//! `mul_add` and no `powf`. Every sum over the batch is a left fold from `0.0` in that order, as
+//! `sum_axis0` is for a dense batch. So given the same inputs they compute numpy's bits.
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -41,23 +50,23 @@ impl Activation {
     }
 }
 
-/// `(rows, cols)` of a batch: a 2D array, `cols` wide.
-fn batch_shape(x: &RustArray, cols: usize, context: &str) -> PyResult<(usize, usize)> {
+/// A batch's example count: a 2D array `channels * positions` wide.
+fn batch_rows(x: &RustArray, channels: usize, positions: usize, context: &str) -> PyResult<usize> {
     match x.shape {
-        Shape::Matrix(rows, n) if n == cols => Ok((rows, n)),
+        Shape::Matrix(rows, n) if n == channels * positions => Ok(rows),
         shape => Err(PyValueError::new_err(format!(
-            "{context} requires a 2D batch of {cols} features, got shape {shape:?}"
+            "{context} requires a 2D batch of {channels} channels x {positions} positions, got shape {shape:?}"
         ))),
     }
 }
 
-/// The per-feature parameters and statistics: each 1D, one value per feature.
-fn require_features(arrays: &[(&RustArray, &str)], cols: usize, context: &str) -> PyResult<()> {
+/// The per-channel parameters and statistics: each 1D, one value per channel.
+fn require_channels(arrays: &[(&RustArray, &str)], channels: usize, context: &str) -> PyResult<()> {
     for (array, name) in arrays {
-        if array.shape != Shape::Vector(cols) {
+        if array.shape != Shape::Vector(channels) {
             return Err(PyValueError::new_err(format!(
                 "{context} requires {name} of shape {:?}, got {:?}",
-                Shape::Vector(cols),
+                Shape::Vector(channels),
                 array.shape
             )));
         }
@@ -65,20 +74,60 @@ fn require_features(arrays: &[(&RustArray, &str)], cols: usize, context: &str) -
     Ok(())
 }
 
-/// Each column's sum over the rows, a left fold from `0.0` in row order: `sum_axis0`'s order.
-fn sum_rows(data: &[f64], cols: usize) -> Vec<f64> {
-    let mut out = vec![0.0; cols];
-    for row in data.chunks_exact(cols.max(1)) {
-        for (acc, &v) in out.iter_mut().zip(row.iter()) {
-            *acc += v;
+fn require_positions(positions: usize, context: &str) -> PyResult<()> {
+    if positions < 1 {
+        return Err(PyValueError::new_err(format!(
+            "{context} requires positions of 1 or more, got 0"
+        )));
+    }
+    Ok(())
+}
+
+/// Each channel's sum over its values, a left fold from `0.0` in (example, position) order: for a
+/// dense batch (`positions = 1`), `sum_axis0`'s row order.
+fn sum_channels(data: &[f64], channels: usize, positions: usize) -> Vec<f64> {
+    let mut out = vec![0.0; channels];
+    for example in data.chunks_exact((channels * positions).max(1)) {
+        for (acc, channel) in out.iter_mut().zip(example.chunks_exact(positions)) {
+            for &v in channel {
+                *acc += v;
+            }
         }
     }
     out
 }
 
-/// Each value of a row-major `rows x cols` batch through `f(value, column)`.
-fn map_columns(data: &[f64], cols: usize, f: impl Fn(f64, usize) -> f64) -> Vec<f64> {
-    data.iter().enumerate().map(|(i, &v)| f(v, i % cols)).collect()
+/// Each value of a channel-major batch through `f(value, channel)`.
+fn map_channels(data: &[f64], channels: usize, positions: usize, f: impl Fn(f64, usize) -> f64) -> Vec<f64> {
+    let mut out = Vec::with_capacity(data.len());
+    for example in data.chunks_exact((channels * positions).max(1)) {
+        for (j, channel) in example.chunks_exact(positions).enumerate() {
+            out.extend(channel.iter().map(|&v| f(v, j)));
+        }
+    }
+    out
+}
+
+/// Each pair of values of two same-shaped channel-major batches through `f(u, v, channel)`.
+fn zip_channels(
+    u: &[f64],
+    v: &[f64],
+    channels: usize,
+    positions: usize,
+    f: impl Fn(f64, f64, usize) -> f64,
+) -> Vec<f64> {
+    let width = (channels * positions).max(1);
+    let mut out = Vec::with_capacity(u.len());
+    for (u_example, v_example) in u.chunks_exact(width).zip(v.chunks_exact(width)) {
+        for (j, (u_channel, v_channel)) in u_example
+            .chunks_exact(positions)
+            .zip(v_example.chunks_exact(positions))
+            .enumerate()
+        {
+            out.extend(u_channel.iter().zip(v_channel).map(|(&a, &b)| f(a, b, j)));
+        }
+    }
+    out
 }
 
 /// `LinearArrayLayer.forward`: `self.W @ x`, `x` 1D, `linear_preactivation` without the bias.
@@ -111,11 +160,12 @@ pub fn linear_accumulate_gradient_batch(
     matmul_add(grad_w, &delta_batch.transpose(), input_activation_batch)
 }
 
-/// `BatchNormArrayLayer._inference`, a single example (`x` 1D) or a batch (`x` 2D): `xhat =
-/// (x - running_mean) / sqrt(running_var + eps)`, then `gamma * xhat + beta` and the activation.
-/// The running averages don't move.
+/// `BatchNormArrayLayer._inference`, a single example (`x` 1D) or a batch (`x` 2D), each
+/// `channels * positions` values: `xhat = (x - running_mean) / sqrt(running_var + eps)`, then
+/// `gamma * xhat + beta` and the activation, per channel. The running averages don't move.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
+#[pyo3(signature = (x, gamma, beta, running_mean, running_var, epsilon, activation, positions=1))]
 pub fn batch_norm_forward(
     x: &RustArray,
     gamma: &RustArray,
@@ -124,38 +174,50 @@ pub fn batch_norm_forward(
     running_var: &RustArray,
     epsilon: f64,
     activation: &str,
+    positions: usize,
 ) -> PyResult<RustArray> {
     let context = "batch_norm_forward";
     let activation = Activation::parse(activation, context)?;
-    let cols = match x.shape {
+    require_positions(positions, context)?;
+    let channels = gamma.data.len();
+    let width = match x.shape {
         Shape::Vector(n) | Shape::Matrix(_, n) => n,
     };
-    require_features(
+    if width != channels * positions {
+        return Err(PyValueError::new_err(format!(
+            "{context} requires x of {channels} channels x {positions} positions per example (gamma's length), \
+             got shape {:?}",
+            x.shape
+        )));
+    }
+    require_channels(
         &[
-            (gamma, "gamma"),
             (beta, "beta"),
             (running_mean, "running_mean"),
             (running_var, "running_var"),
         ],
-        cols,
+        channels,
         context,
     )?;
     let std: Vec<f64> = running_var.data.iter().map(|&v| (v + epsilon).sqrt()).collect();
-    let data = map_columns(&x.data, cols.max(1), |v, j| {
+    let data = map_channels(&x.data, channels, positions, |v, j| {
         let xhat = (v - running_mean.data[j]) / std[j];
         activation.apply(gamma.data[j] * xhat + beta.data[j])
     });
     Ok(RustArray { data, shape: x.shape })
 }
 
-/// `BatchNormArrayLayer.forward_batch` in training, `x` 2D (`batch, features`), batch 2 or more:
-/// Algorithm 1 with the batch's statistics, then the activation, and the running averages moved.
+/// `BatchNormArrayLayer.forward_batch` in training, `x` 2D (`batch, channels * positions`), batch
+/// 2 or more: Algorithm 1 with the batch's statistics, `m = batch * positions` values per
+/// channel, then the activation, and the running averages moved.
 ///
 /// Returns `(a, xhat, d, var, std, running_mean, running_var)`: the activations, what the
-/// backward pass reads (`xhat`, `d = x - mu`, `var` and `std = sqrt(var + eps)`, per feature), and
-/// the new running averages, the running variance taking the unbiased `ss / (m - 1)`.
+/// backward pass reads (`xhat` and `d = x - mu` in `x`'s layout, `var` and `std = sqrt(var +
+/// eps)` per channel), and the new running averages, the running variance taking the unbiased
+/// `ss / (m - 1)`.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 #[pyfunction]
+#[pyo3(signature = (x, gamma, beta, running_mean, running_var, epsilon, running_rate, activation, positions=1))]
 pub fn batch_norm_forward_batch(
     x: &RustArray,
     gamma: &RustArray,
@@ -165,6 +227,7 @@ pub fn batch_norm_forward_batch(
     epsilon: f64,
     running_rate: f64,
     activation: &str,
+    positions: usize,
 ) -> PyResult<(
     RustArray,
     RustArray,
@@ -176,16 +239,16 @@ pub fn batch_norm_forward_batch(
 )> {
     let context = "batch_norm_forward_batch";
     let activation = Activation::parse(activation, context)?;
-    let cols = gamma.data.len();
-    let (rows, cols) = batch_shape(x, cols, context)?;
-    require_features(
+    require_positions(positions, context)?;
+    let channels = gamma.data.len();
+    let rows = batch_rows(x, channels, positions, context)?;
+    require_channels(
         &[
-            (gamma, "gamma"),
             (beta, "beta"),
             (running_mean, "running_mean"),
             (running_var, "running_var"),
         ],
-        cols,
+        channels,
         context,
     )?;
     if rows < 2 {
@@ -193,27 +256,29 @@ pub fn batch_norm_forward_batch(
             "{context} requires a batch of 2 or more in training, got {rows}"
         )));
     }
-    let m = rows as f64;
+    let (c, p) = (channels, positions);
+    let m = (rows * p) as f64;
 
-    let mu: Vec<f64> = sum_rows(&x.data, cols).iter().map(|&s| s / m).collect();
-    let d = map_columns(&x.data, cols, |v, j| v - mu[j]);
-    let ss = sum_rows(&d.iter().map(|&v| v * v).collect::<Vec<f64>>(), cols);
+    let mu: Vec<f64> = sum_channels(&x.data, c, p).iter().map(|&s| s / m).collect();
+    let d = map_channels(&x.data, c, p, |v, j| v - mu[j]);
+    let ss = sum_channels(&d.iter().map(|&v| v * v).collect::<Vec<f64>>(), c, p);
     let var: Vec<f64> = ss.iter().map(|&s| s / m).collect();
     let std: Vec<f64> = var.iter().map(|&v| (v + epsilon).sqrt()).collect();
-    let xhat = map_columns(&d, cols, |v, j| v / std[j]);
-    let a = map_columns(&xhat, cols, |v, j| activation.apply(gamma.data[j] * v + beta.data[j]));
+    let xhat = map_channels(&d, c, p, |v, j| v / std[j]);
+    let a = map_channels(&xhat, c, p, |v, j| activation.apply(gamma.data[j] * v + beta.data[j]));
 
-    let new_running_mean: Vec<f64> = (0..cols)
+    let new_running_mean: Vec<f64> = (0..c)
         .map(|j| (1.0 - running_rate) * running_mean.data[j] + running_rate * mu[j])
         .collect();
-    let new_running_var: Vec<f64> = (0..cols)
+    let new_running_var: Vec<f64> = (0..c)
         .map(|j| (1.0 - running_rate) * running_var.data[j] + running_rate * (ss[j] / (m - 1.0)))
         .collect();
 
+    let width = c * p;
     Ok((
-        RustArray::from_matrix(a, rows, cols),
-        RustArray::from_matrix(xhat, rows, cols),
-        RustArray::from_matrix(d, rows, cols),
+        RustArray::from_matrix(a, rows, width),
+        RustArray::from_matrix(xhat, rows, width),
+        RustArray::from_matrix(d, rows, width),
         RustArray::from_vector(var),
         RustArray::from_vector(std),
         RustArray::from_vector(new_running_mean),
@@ -223,8 +288,10 @@ pub fn batch_norm_forward_batch(
 
 /// `BatchNormArrayLayer.downstream_batch`: `dl/dx`, the linear layer's delta, from `delta_batch`
 /// (`dl/dy`, the activation's derivative already applied) by the paper's § 3 chain rule, term by
-/// term. `d`, `var` and `std` are `batch_norm_forward_batch`'s.
+/// term. `d`, `var` and `std` are `batch_norm_forward_batch`'s, with the same `positions`.
+#[allow(clippy::too_many_arguments)]
 #[pyfunction]
+#[pyo3(signature = (delta_batch, gamma, d, var, std, epsilon, positions=1))]
 pub fn batch_norm_downstream_batch(
     delta_batch: &RustArray,
     gamma: &RustArray,
@@ -232,60 +299,56 @@ pub fn batch_norm_downstream_batch(
     var: &RustArray,
     std: &RustArray,
     epsilon: f64,
+    positions: usize,
 ) -> PyResult<RustArray> {
     let context = "batch_norm_downstream_batch";
-    let cols = gamma.data.len();
-    let (rows, cols) = batch_shape(delta_batch, cols, context)?;
-    require_features(&[(gamma, "gamma"), (var, "var"), (std, "std")], cols, context)?;
+    require_positions(positions, context)?;
+    let channels = gamma.data.len();
+    let rows = batch_rows(delta_batch, channels, positions, context)?;
+    require_channels(&[(var, "var"), (std, "std")], channels, context)?;
     if d.shape != delta_batch.shape {
         return Err(PyValueError::new_err(format!(
             "{context} requires d of shape {:?}, got {:?}",
             delta_batch.shape, d.shape
         )));
     }
-    let m = rows as f64;
+    let (c, p) = (channels, positions);
+    let m = (rows * p) as f64;
 
-    let dxhat = map_columns(&delta_batch.data, cols, |v, j| v * gamma.data[j]);
+    let dxhat = map_channels(&delta_batch.data, c, p, |v, j| v * gamma.data[j]);
     let inv_std: Vec<f64> = std.data.iter().map(|&s| 1.0 / s).collect();
-    let inv_std3: Vec<f64> = (0..cols).map(|j| inv_std[j] / (var.data[j] + epsilon)).collect();
-    let dvar_terms: Vec<f64> = dxhat
-        .iter()
-        .zip(d.data.iter())
-        .enumerate()
-        .map(|(i, (&g, &dv))| g * dv * -0.5 * inv_std3[i % cols])
-        .collect();
-    let dvar = sum_rows(&dvar_terms, cols);
-    let dmu_terms = map_columns(&dxhat, cols, |g, j| g * -inv_std[j]);
+    let inv_std3: Vec<f64> = (0..c).map(|j| inv_std[j] / (var.data[j] + epsilon)).collect();
+    let dvar_terms = zip_channels(&dxhat, &d.data, c, p, |g, dv, j| g * dv * -0.5 * inv_std3[j]);
+    let dvar = sum_channels(&dvar_terms, c, p);
+    let dmu_terms = map_channels(&dxhat, c, p, |g, j| g * -inv_std[j]);
     let d_terms: Vec<f64> = d.data.iter().map(|&dv| -2.0 * dv).collect();
-    let dmu_sum = sum_rows(&dmu_terms, cols);
-    let d_sum = sum_rows(&d_terms, cols);
-    let dmu: Vec<f64> = (0..cols).map(|j| dmu_sum[j] + dvar[j] * d_sum[j] / m).collect();
+    let dmu_sum = sum_channels(&dmu_terms, c, p);
+    let d_sum = sum_channels(&d_terms, c, p);
+    let dmu: Vec<f64> = (0..c).map(|j| dmu_sum[j] + dvar[j] * d_sum[j] / m).collect();
 
-    let dx = dxhat
-        .iter()
-        .zip(d.data.iter())
-        .enumerate()
-        .map(|(i, (&g, &dv))| {
-            let j = i % cols;
-            g * inv_std[j] + dvar[j] * (2.0 * dv) / m + dmu[j] / m
-        })
-        .collect();
-    Ok(RustArray::from_matrix(dx, rows, cols))
+    let dx = zip_channels(&dxhat, &d.data, c, p, |g, dv, j| {
+        g * inv_std[j] + dvar[j] * (2.0 * dv) / m + dmu[j] / m
+    });
+    Ok(RustArray::from_matrix(dx, rows, c * p))
 }
 
 /// `BatchNormArrayLayer.accumulate_gradient_batch`: `grad_gamma += sum(delta * xhat)` and
-/// `grad_beta += sum(delta)` over the batch. Returns the updated `(grad_gamma, grad_beta)`.
+/// `grad_beta += sum(delta)` over each channel's values. Returns the updated `(grad_gamma,
+/// grad_beta)`.
 #[pyfunction]
+#[pyo3(signature = (delta_batch, xhat, grad_gamma, grad_beta, positions=1))]
 pub fn batch_norm_accumulate_gradient_batch(
     delta_batch: &RustArray,
     xhat: &RustArray,
     grad_gamma: &RustArray,
     grad_beta: &RustArray,
+    positions: usize,
 ) -> PyResult<(RustArray, RustArray)> {
     let context = "batch_norm_accumulate_gradient_batch";
-    let cols = grad_gamma.data.len();
-    batch_shape(delta_batch, cols, context)?;
-    require_features(&[(grad_gamma, "grad_gamma"), (grad_beta, "grad_beta")], cols, context)?;
+    require_positions(positions, context)?;
+    let channels = grad_gamma.data.len();
+    batch_rows(delta_batch, channels, positions, context)?;
+    require_channels(&[(grad_beta, "grad_beta")], channels, context)?;
     if xhat.shape != delta_batch.shape {
         return Err(PyValueError::new_err(format!(
             "{context} requires xhat of shape {:?}, got {:?}",
@@ -298,8 +361,8 @@ pub fn batch_norm_accumulate_gradient_batch(
         .zip(xhat.data.iter())
         .map(|(&dv, &xv)| dv * xv)
         .collect();
-    let gamma_sum = sum_rows(&products, cols);
-    let beta_sum = sum_rows(&delta_batch.data, cols);
+    let gamma_sum = sum_channels(&products, channels, positions);
+    let beta_sum = sum_channels(&delta_batch.data, channels, positions);
     let new_grad_gamma = grad_gamma.data.iter().zip(gamma_sum).map(|(&g, s)| g + s).collect();
     let new_grad_beta = grad_beta.data.iter().zip(beta_sum).map(|(&g, s)| g + s).collect();
     Ok((

@@ -46,7 +46,7 @@ tests catches wrong types.
 CI (`.github/workflows/ci.yml`) runs all of these, and the build and test steps, on every push and
 PR to `main`.
 
-`tests/` (~1,810 tests, about 15 s) checks each op against numpy and needs nothing from
+`tests/` (~1,950 tests, about 15 s) checks each op against numpy and needs nothing from
 indrajala-ml. The tests that check the fused layer ops against indrajala-ml's numpy reference
 classes live in indrajala-ml's own `tests/`, so a change to `src/fused.rs` or `src/conv.rs` should
 also be tested there: in an indrajala-ml checkout, point `rust/` at the new commit, then
@@ -65,13 +65,13 @@ also be tested there: in an indrajala-ml checkout, point `rust/` at the new comm
 | `src/random.rs` | `seed`, `random`, `uniform`, `bernoulli_mask`: numpy's legacy `np.random` (MT19937) in a separate state; after `seed(s)`, bit-identical to numpy's draws after `np.random.seed(s)` |
 | `src/mnist.rs` | `decode_mnist_pixels`: raw MNIST records to normalised pixels |
 | `src/fused.rs` | `layer_*`: one call per `ArrayLayer` method (forward, deltas, downstream, gradient accumulate/apply), single-example and `_batch` |
-| `src/conv.rs` | `ConvGeometry`; `conv_*_batch`/`max_pool_*_batch`: one call per `ConvArrayLayer`/`MaxPoolArrayLayer` method (forward, downstream, gradient accumulate), batch-only |
-| `src/batch_norm.rs` | `linear_*`, `batch_norm_*`: one call per `LinearArrayLayer`/`BatchNormArrayLayer` method (dense batch normalization: forward in training and inference, downstream, gradient accumulate) |
+| `src/conv.rs` | `ConvGeometry`; `conv_*_batch`/`max_pool_*_batch`: one call per `ConvArrayLayer`/`MaxPoolArrayLayer` method (forward, downstream, gradient accumulate), batch-only; `conv_linear_*_batch`, `LinearConvArrayLayer`'s bias-free forward and accumulate |
+| `src/batch_norm.rs` | `linear_*`, `batch_norm_*`: one call per `LinearArrayLayer`/`BatchNormArrayLayer` method (batch normalization, dense or per conv channel with `positions`: forward in training and inference, downstream, gradient accumulate) |
 
 Each `layer_*` function in `src/fused.rs` mirrors a method of indrajala-ml's
 `indrajala_ml/model/array_layer.py` or one of its ReLU/softmax/dropout/Adam/L2/momentum variants,
 and must stay numerically identical to it. Likewise each `conv_*`/`max_pool_*` function in
-`src/conv.rs` mirrors a method of `indrajala_ml/model/conv_array_layer.py`/`max_pool_array_layer.py`, and each `linear_*`/`batch_norm_*` function in `src/batch_norm.rs` one of `linear_array_layer.py`/`batch_norm_array_layer.py`. Conv tensors cross the boundary as matrices
+`src/conv.rs` mirrors a method of `indrajala_ml/model/conv_array_layer.py`/`max_pool_array_layer.py`, each `conv_linear_*` function one of its `LinearConvArrayLayer`, and each `linear_*`/`batch_norm_*` function in `src/batch_norm.rs` one of `linear_array_layer.py`/`batch_norm_array_layer.py`. Conv tensors cross the boundary as matrices
 (`Array` stays 1D/2D); `src/conv.rs`'s module comment gives the layouts.
 
 ## License

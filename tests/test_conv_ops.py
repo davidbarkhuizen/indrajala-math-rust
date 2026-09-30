@@ -1,6 +1,7 @@
 """
 ConvGeometry and the conv ops (conv_forward_batch, conv_downstream_batch,
-conv_accumulate_gradient_batch), plus layer_downstream/layer_downstream_batch. Checked against a
+conv_accumulate_gradient_batch, and the bias-free conv_linear_forward_batch and
+conv_linear_accumulate_gradient_batch), plus layer_downstream/layer_downstream_batch. Checked against a
 brute-force numpy reference written from the definition of a 'valid' strided convolution -
 nested loops over example, output position, channel and kernel offset, no im2col - so the check
 is independent of both this crate's im2col formulation and indrajala-ml's numpy ConvArrayLayer.
@@ -19,6 +20,8 @@ from indrajala_math_rust import (
     conv_accumulate_gradient_batch,
     conv_downstream_batch,
     conv_forward_batch,
+    conv_linear_accumulate_gradient_batch,
+    conv_linear_forward_batch,
     layer_downstream,
     layer_downstream_batch,
     matmul_threads_for,
@@ -352,6 +355,41 @@ def test_conv_accumulate_gradient_batch_is_the_matmul_update_exactly(shape, n):
     assert grad_W.tolist() == expected.tolist()
 
 
+@pytest.mark.parametrize("shape, n", [(shape, n) for shape in SHAPES for n in (1, BATCH_SIZE)] + FORWARD_EXTRA_CASES)
+def test_conv_linear_forward_batch_is_the_conv_products_without_bias_or_relu_exactly(shape, n):
+    # the same products and cols as conv_forward_batch, with nothing added or clipped: the ReLU op
+    # with a zero bias is its np.maximum, bit for bit
+    rng = np.random.default_rng(11)
+    height, width, channels, k, channel_count, _s = shape
+    W = Array(rng.uniform(-1.0, 1.0, size=(channel_count, channels * k * k)).tolist())
+    X = Array(rng.uniform(-1.0, 1.0, size=(n, channels * height * width)).tolist())
+    g = _geometry(shape)
+    Z, cols = conv_linear_forward_batch(W, X, g)
+
+    by_position = _np(cols @ W.T)  # (N*P, O), the same matmul call
+    assert (
+        _np(Z).tolist() == by_position.reshape(n, g.positions, channel_count).transpose(0, 2, 1).reshape(n, -1).tolist()
+    )
+    A, relu_cols = conv_forward_batch(W, X, Array.zeros(channel_count), g)
+    assert cols.tolist() == relu_cols.tolist()
+    assert A.tolist() == np.maximum(0.0, _np(Z)).tolist()
+
+    z_vec, cols_vec = conv_linear_forward_batch(W, Array(X.tolist()[0]), g)
+    assert z_vec.shape == (channel_count * g.positions,)
+    assert z_vec.tolist() == Z.tolist()[0]
+    assert cols_vec.tolist() == cols.tolist()[: g.positions]
+
+
+@pytest.mark.parametrize("shape, n", [(shape, n) for shape in SHAPES for n in (1, BATCH_SIZE)] + BACKWARD_EXTRA_CASES)
+def test_conv_linear_accumulate_gradient_batch_is_the_conv_grad_w_exactly(shape, n):
+    W, X, delta, g = _backward_case(12, shape, n)
+    W, delta = Array(W.tolist()), Array(delta.tolist())
+    _Z, cols = conv_linear_forward_batch(W, Array(X.tolist()), g)
+    grad_W0 = Array(np.random.default_rng(13).uniform(-1.0, 1.0, size=W.shape).tolist())
+    expected, _grad_b = conv_accumulate_gradient_batch(delta, cols, grad_W0, Array.zeros(W.shape[0]), g)
+    assert conv_linear_accumulate_gradient_batch(delta, cols, grad_W0, g).tolist() == expected.tolist()
+
+
 @pytest.mark.parametrize("shape", SHAPES)
 def test_conv_downstream_batch_matches_the_brute_force_definition(shape):
     W, _b, _X, delta = _random_case(1, shape)
@@ -409,6 +447,14 @@ def test_conv_ops_reject_mismatched_shapes():
         conv_accumulate_gradient_batch(Array.zeros((3, 18)), Array.zeros((26, 9)), W, b, g)  # cols rows
     with pytest.raises(ValueError):
         conv_accumulate_gradient_batch(Array.zeros((3, 18)), Array.zeros((27, 9)), W, Array.zeros(3), g)
+    with pytest.raises(ValueError):
+        conv_linear_forward_batch(Array.zeros((2, 8)), X, g)  # W columns != fan_in
+    with pytest.raises(ValueError):
+        conv_linear_forward_batch(W, Array.zeros((3, 24)), g)  # X columns != input_size
+    with pytest.raises(ValueError):
+        conv_linear_accumulate_gradient_batch(Array.zeros((3, 18)), Array.zeros((26, 9)), W, g)  # cols rows
+    with pytest.raises(ValueError):
+        conv_linear_accumulate_gradient_batch(Array.zeros((3, 17)), Array.zeros((27, 9)), W, g)  # delta columns
 
 
 def test_layer_downstream_matches_numpy():

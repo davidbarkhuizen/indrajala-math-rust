@@ -248,6 +248,52 @@ pub fn conv_forward_batch(
     Ok((batch_output(a, n, o * p, is_vector), cols))
 }
 
+/// `LinearConvArrayLayer.forward_batch`: `conv_forward_batch`'s products without the bias and the
+/// ReLU, the pre-activations a batch-norm layer normalizes. Returns `(A, cols)` as that op does.
+///
+/// Its own copy of `conv_forward_batch`'s body, not a shared helper: with the body shared, the
+/// conv mini-batch op profile put `conv_forward_batch` 8-17% above its unshared form.
+#[pyfunction]
+pub fn conv_linear_forward_batch(
+    w: &RustArray,
+    x: &RustArray,
+    geometry: &ConvGeometry,
+) -> PyResult<(RustArray, RustArray)> {
+    let o = channel_count(w, geometry, "conv_linear_forward_batch")?;
+    let (n, is_vector) = require_batch(x, geometry.input_size, "conv_linear_forward_batch X")?;
+    let g = geometry;
+    let (p, k, fan_in) = (g.positions, g.kernel_size, g.fan_in);
+
+    let w_t = w.transpose(); // (C*k*k, O)
+    let mut cols = Vec::with_capacity(n * p * fan_in);
+    let mut by_position = vec![0.0; p * o]; // one example's (P, O)
+    let mut a = Vec::with_capacity(n * o * p);
+    for example in 0..n {
+        let input = &x.data[example * g.input_size..(example + 1) * g.input_size];
+        for out_row in 0..g.out_height {
+            for out_col in 0..g.out_width {
+                for c in 0..g.input_channels {
+                    for kr in 0..k {
+                        let start = g.input_index(c, out_row, out_col, kr, 0);
+                        cols.extend_from_slice(&input[start..start + k]);
+                    }
+                }
+            }
+        }
+        tiled_row_range::<OVERWRITE>(
+            &cols[example * p * fan_in..],
+            &w_t.data,
+            &mut by_position,
+            Panel::whole(0, p, fan_in, o, 1),
+        );
+        for channel in 0..o {
+            a.extend((0..p).map(|position| by_position[position * o + channel]));
+        }
+    }
+    let cols = RustArray::from_matrix(cols, n * p, fan_in);
+    Ok((batch_output(a, n, o * p, is_vector), cols))
+}
+
 /// `ConvArrayLayer._downstream`: `dcols = D @ W` with `matmul_narrow`, `D` the deltas regrouped to
 /// `(N*P, O)`, then col2im as a scatter-add. The loop runs kernel offset `(kr, kc)` outside
 /// output position, so each input accumulates its contributions in the same order as numpy's
@@ -300,29 +346,64 @@ pub fn conv_accumulate_gradient_batch(
             grad_b.shape
         )));
     }
-    let p = geometry.positions;
-    let (n, _) = require_batch(delta_batch, o * p, "conv_accumulate_gradient_batch delta_batch")?;
-    require_matrix(
+    let (by_channel, new_grad_w) = accumulate_w(
+        delta_batch,
         cols,
-        Some(n * p),
-        geometry.fan_in,
-        "conv_accumulate_gradient_batch cols",
+        grad_w,
+        geometry,
+        o,
+        [
+            "conv_accumulate_gradient_batch delta_batch",
+            "conv_accumulate_gradient_batch cols",
+        ],
     )?;
-
-    let by_channel = deltas_by_channel(delta_batch, n, o, p); // (O, N*P)
-    let update = matmul_long_k(&by_channel, cols)?;
-    let new_grad_w = grad_w.combine_with_array(&update, |g, u| g + u, "add")?;
+    let np = by_channel.data.len() / o.max(1);
     let new_grad_b = grad_b
         .data
         .iter()
         .enumerate()
-        .map(|(channel, &gb)| {
-            gb + by_channel.data[channel * n * p..(channel + 1) * n * p]
-                .iter()
-                .sum::<f64>()
-        })
+        .map(|(channel, &gb)| gb + by_channel.data[channel * np..(channel + 1) * np].iter().sum::<f64>())
         .collect();
     Ok((new_grad_w, RustArray::from_vector(new_grad_b)))
+}
+
+/// `LinearConvArrayLayer.accumulate_gradient_batch`: `conv_accumulate_gradient_batch`'s `grad_W`,
+/// without its `grad_b`. Returns the updated `grad_W`.
+#[pyfunction]
+pub fn conv_linear_accumulate_gradient_batch(
+    delta_batch: &RustArray,
+    cols: &RustArray,
+    grad_w: &RustArray,
+    geometry: &ConvGeometry,
+) -> PyResult<RustArray> {
+    let o = channel_count(grad_w, geometry, "conv_linear_accumulate_gradient_batch")?;
+    let contexts = [
+        "conv_linear_accumulate_gradient_batch delta_batch",
+        "conv_linear_accumulate_gradient_batch cols",
+    ];
+    Ok(accumulate_w(delta_batch, cols, grad_w, geometry, o, contexts)?.1)
+}
+
+/// The accumulate ops' shared `grad_W + D @ cols`, returning `D`, the deltas regrouped to `(O,
+/// N*P)`, with it. `contexts` name `delta_batch` and `cols` in errors: literals, so a call that
+/// succeeds allocates nothing beyond the arrays (formatting them per call moved the op profile's
+/// page faults between ops).
+fn accumulate_w(
+    delta_batch: &RustArray,
+    cols: &RustArray,
+    grad_w: &RustArray,
+    geometry: &ConvGeometry,
+    o: usize,
+    [delta_context, cols_context]: [&str; 2],
+) -> PyResult<(RustArray, RustArray)> {
+    let p = geometry.positions;
+    let (n, _) = require_batch(delta_batch, o * p, delta_context)?;
+    require_matrix(cols, Some(n * p), geometry.fan_in, cols_context)?;
+
+    let by_channel = deltas_by_channel(delta_batch, n, o, p); // (O, N*P)
+    let update = matmul_long_k(&by_channel, cols)?;
+    let new_grad_w = grad_w.combine_with_array(&update, |g, u| g + u, "add")?;
+    Ok((by_channel, new_grad_w))
 }
 
 /// `MaxPoolArrayLayer.forward_batch`: each channel pooled independently over `kernel_size`-square

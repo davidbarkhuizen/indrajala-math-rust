@@ -16,8 +16,8 @@ use batch_norm::{
     linear_accumulate_gradient_batch, linear_forward, linear_forward_batch,
 };
 use conv::{
-    conv_accumulate_gradient_batch, conv_downstream_batch, conv_forward_batch, max_pool_downstream_batch,
-    max_pool_forward_batch, ConvGeometry,
+    conv_accumulate_gradient_batch, conv_downstream_batch, conv_forward_batch, conv_linear_accumulate_gradient_batch,
+    conv_linear_forward_batch, max_pool_downstream_batch, max_pool_forward_batch, ConvGeometry,
 };
 use fused::{
     layer_accumulate_gradient, layer_accumulate_gradient_batch, layer_adam_apply_accumulated_gradient,
@@ -89,6 +89,8 @@ fn indrajala_math_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(conv_forward_batch, m)?)?;
     m.add_function(wrap_pyfunction!(conv_downstream_batch, m)?)?;
     m.add_function(wrap_pyfunction!(conv_accumulate_gradient_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(conv_linear_forward_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(conv_linear_accumulate_gradient_batch, m)?)?;
     m.add_function(wrap_pyfunction!(max_pool_forward_batch, m)?)?;
     m.add_function(wrap_pyfunction!(max_pool_downstream_batch, m)?)?;
     m.add_function(wrap_pyfunction!(linear_forward, m)?)?;
