@@ -333,8 +333,17 @@ pub fn conv_accumulate_gradient_batch(
             grad_b.shape
         )));
     }
-    let (by_channel, new_grad_w) =
-        accumulate_w(delta_batch, cols, grad_w, geometry, o, "conv_accumulate_gradient_batch")?;
+    let (by_channel, new_grad_w) = accumulate_w(
+        delta_batch,
+        cols,
+        grad_w,
+        geometry,
+        o,
+        [
+            "conv_accumulate_gradient_batch delta_batch",
+            "conv_accumulate_gradient_batch cols",
+        ],
+    )?;
     let np = by_channel.data.len() / o.max(1);
     let new_grad_b = grad_b
         .data
@@ -354,24 +363,29 @@ pub fn conv_linear_accumulate_gradient_batch(
     grad_w: &RustArray,
     geometry: &ConvGeometry,
 ) -> PyResult<RustArray> {
-    let context = "conv_linear_accumulate_gradient_batch";
-    let o = channel_count(grad_w, geometry, context)?;
-    Ok(accumulate_w(delta_batch, cols, grad_w, geometry, o, context)?.1)
+    let o = channel_count(grad_w, geometry, "conv_linear_accumulate_gradient_batch")?;
+    let contexts = [
+        "conv_linear_accumulate_gradient_batch delta_batch",
+        "conv_linear_accumulate_gradient_batch cols",
+    ];
+    Ok(accumulate_w(delta_batch, cols, grad_w, geometry, o, contexts)?.1)
 }
 
 /// The accumulate ops' shared `grad_W + D @ cols`, returning `D`, the deltas regrouped to `(O,
-/// N*P)`, with it.
+/// N*P)`, with it. `contexts` name `delta_batch` and `cols` in errors: literals, so a call that
+/// succeeds allocates nothing beyond the arrays (formatting them per call moved the op profile's
+/// page faults between ops).
 fn accumulate_w(
     delta_batch: &RustArray,
     cols: &RustArray,
     grad_w: &RustArray,
     geometry: &ConvGeometry,
     o: usize,
-    context: &str,
+    [delta_context, cols_context]: [&str; 2],
 ) -> PyResult<(RustArray, RustArray)> {
     let p = geometry.positions;
-    let (n, _) = require_batch(delta_batch, o * p, &format!("{context} delta_batch"))?;
-    require_matrix(cols, Some(n * p), geometry.fan_in, &format!("{context} cols"))?;
+    let (n, _) = require_batch(delta_batch, o * p, delta_context)?;
+    require_matrix(cols, Some(n * p), geometry.fan_in, cols_context)?;
 
     let by_channel = deltas_by_channel(delta_batch, n, o, p); // (O, N*P)
     let update = matmul_long_k(&by_channel, cols)?;
