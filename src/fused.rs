@@ -776,3 +776,149 @@ fn dropout_hidden_delta_from_downstream(
         shape: base_activation.shape,
     }
 }
+
+/// `AffineArrayLayer.forward`: `self.W @ x + self.b` with no activation, the affine layer that ends
+/// a residual block's body (indrajala-ml's residual-connections workplan, D4): `linear_preactivation`
+/// itself, so its bits are the pre-activation every `layer_*forward` computes.
+#[pyfunction]
+pub fn affine_forward(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
+    linear_preactivation(w, x, b)
+}
+
+/// `AffineArrayLayer.forward_batch`: `X @ self.W.T + self.b`, `linear_preactivation_batch`, so row
+/// `i` is bit-identical to `affine_forward(w, X[i], b)`.
+#[pyfunction]
+pub fn affine_forward_batch(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
+    linear_preactivation_batch(w, x, b)
+}
+
+/// `downstream + skip`, elementwise, shape-checked against `skip`: the downstream of a residual
+/// block's fork (its body's first layer's, `downstream`) plus the identity path's (its add's delta,
+/// `skip`), shared by every `layer_*hidden_delta_skip` below. One IEEE addition per element, so the
+/// operand order can't move bits.
+fn with_skip(downstream: RustArray, skip: &RustArray, context: &str) -> PyResult<RustArray> {
+    require_same_shape(&downstream, skip, context)?;
+    Ok(RustArray {
+        data: same_shape_elementwise(&downstream.data, &skip.data, |d, s| d + s),
+        shape: downstream.shape,
+    })
+}
+
+/// `ArrayLayer.compute_hidden_delta` when the next layer is a residual block's fork: `(body_w.T @
+/// body_delta + skip) * self.a * (1 - self.a)`, `body_w`/`body_delta` the body's first layer's and
+/// `skip` the block's add's delta - `layer_hidden_delta` with the skip term added to the downstream
+/// before the sigmoid's derivative, in one call. Single-example (`body_delta`/`skip`/`a` all 1D).
+#[pyfunction]
+pub fn layer_hidden_delta_skip(
+    body_w: &RustArray,
+    body_delta: &RustArray,
+    skip: &RustArray,
+    a: &RustArray,
+) -> PyResult<RustArray> {
+    let downstream = hidden_downstream(body_w, body_delta, a, "layer_hidden_delta_skip")?;
+    let downstream = with_skip(downstream, skip, "layer_hidden_delta_skip")?;
+    let data = same_shape_elementwise(&downstream.data, &a.data, |d, av| d * av * (1.0 - av));
+    Ok(RustArray { data, shape: a.shape })
+}
+
+/// `layer_hidden_delta_skip`, batched: `(body_delta_batch @ body_w + skip_batch) * self.A * (1 -
+/// self.A)`.
+#[pyfunction]
+pub fn layer_hidden_delta_skip_batch(
+    body_w: &RustArray,
+    body_delta_batch: &RustArray,
+    skip_batch: &RustArray,
+    a_batch: &RustArray,
+) -> PyResult<RustArray> {
+    let downstream = hidden_downstream_batch(body_w, body_delta_batch, a_batch, "layer_hidden_delta_skip_batch")?;
+    let downstream = with_skip(downstream, skip_batch, "layer_hidden_delta_skip_batch")?;
+    let data = same_shape_elementwise(&downstream.data, &a_batch.data, |d, av| d * av * (1.0 - av));
+    Ok(RustArray {
+        data,
+        shape: a_batch.shape,
+    })
+}
+
+/// `ReLUArrayLayer.compute_hidden_delta` when the next layer is a residual block's fork: `(body_w.T
+/// @ body_delta + skip) * (self.a > 0.0)`, `layer_relu_hidden_delta` with the skip term.
+#[pyfunction]
+pub fn layer_relu_hidden_delta_skip(
+    body_w: &RustArray,
+    body_delta: &RustArray,
+    skip: &RustArray,
+    a: &RustArray,
+) -> PyResult<RustArray> {
+    let downstream = hidden_downstream(body_w, body_delta, a, "layer_relu_hidden_delta_skip")?;
+    let downstream = with_skip(downstream, skip, "layer_relu_hidden_delta_skip")?;
+    let data = same_shape_elementwise(&downstream.data, &a.data, |d, av| if av > 0.0 { d } else { 0.0 });
+    Ok(RustArray { data, shape: a.shape })
+}
+
+/// `layer_relu_hidden_delta_skip`, batched: `(body_delta_batch @ body_w + skip_batch) * (self.A >
+/// 0.0)`.
+#[pyfunction]
+pub fn layer_relu_hidden_delta_skip_batch(
+    body_w: &RustArray,
+    body_delta_batch: &RustArray,
+    skip_batch: &RustArray,
+    a_batch: &RustArray,
+) -> PyResult<RustArray> {
+    let downstream = hidden_downstream_batch(body_w, body_delta_batch, a_batch, "layer_relu_hidden_delta_skip_batch")?;
+    let downstream = with_skip(downstream, skip_batch, "layer_relu_hidden_delta_skip_batch")?;
+    let data = same_shape_elementwise(&downstream.data, &a_batch.data, |d, av| if av > 0.0 { d } else { 0.0 });
+    Ok(RustArray {
+        data,
+        shape: a_batch.shape,
+    })
+}
+
+/// `DropoutArrayLayer.compute_hidden_delta` when the next layer is a residual block's fork:
+/// `layer_dropout_hidden_delta` with the skip term added to the downstream before the sigmoid's
+/// derivative and the mask's scale.
+#[pyfunction]
+pub fn layer_dropout_hidden_delta_skip(
+    body_w: &RustArray,
+    body_delta: &RustArray,
+    skip: &RustArray,
+    base_activation: &RustArray,
+    mask: &RustArray,
+    keep_probability: f64,
+    was_training: bool,
+) -> PyResult<RustArray> {
+    let downstream = hidden_downstream(body_w, body_delta, base_activation, "layer_dropout_hidden_delta_skip")?;
+    let downstream = with_skip(downstream, skip, "layer_dropout_hidden_delta_skip")?;
+    Ok(dropout_hidden_delta_from_downstream(
+        &downstream,
+        base_activation,
+        mask,
+        keep_probability,
+        was_training,
+    ))
+}
+
+/// `layer_dropout_hidden_delta_skip`, batched.
+#[pyfunction]
+pub fn layer_dropout_hidden_delta_skip_batch(
+    body_w: &RustArray,
+    body_delta_batch: &RustArray,
+    skip_batch: &RustArray,
+    base_activation_batch: &RustArray,
+    mask_batch: &RustArray,
+    keep_probability: f64,
+    was_training: bool,
+) -> PyResult<RustArray> {
+    let downstream = hidden_downstream_batch(
+        body_w,
+        body_delta_batch,
+        base_activation_batch,
+        "layer_dropout_hidden_delta_skip_batch",
+    )?;
+    let downstream = with_skip(downstream, skip_batch, "layer_dropout_hidden_delta_skip_batch")?;
+    Ok(dropout_hidden_delta_from_downstream(
+        &downstream,
+        base_activation_batch,
+        mask_batch,
+        keep_probability,
+        was_training,
+    ))
+}
