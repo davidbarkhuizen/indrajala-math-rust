@@ -46,7 +46,7 @@ tests catches wrong types.
 CI (`.github/workflows/ci.yml`) runs all of these, and the build and test steps, on every push and
 PR to `main`.
 
-`tests/` (~1,950 tests, about 15 s) checks each op against numpy and needs nothing from
+`tests/` (~2,150 tests, about 15 s) checks each op against numpy and needs nothing from
 indrajala-ml. The tests that check the fused layer ops against indrajala-ml's numpy reference
 classes live in indrajala-ml's own `tests/`, so a change to `src/fused.rs` or `src/conv.rs` should
 also be tested there: in an indrajala-ml checkout, point `rust/` at the new commit, then
@@ -63,8 +63,9 @@ also be tested there: in an indrajala-ml checkout, point `rust/` at the new comm
 | `src/linalg.rs` | `@` (matmul), `outer`; `set_matmul_threading(max_threads, threshold_flops)`, a test/benchmark override of the matmul threading (0 = default); `matmul_threads_for(m, k, n)`, the thread count the policy picks for an `(m, k) @ (k, n)` product |
 | `src/ufuncs.rs` | `exp`, `sum_axis0`, `argmax`, `array_relu`, `array_relu_mask`, `array_softmax` |
 | `src/random.rs` | `seed`, `random`, `uniform`, `bernoulli_mask`: numpy's legacy `np.random` (MT19937) in a separate state; after `seed(s)`, bit-identical to numpy's draws after `np.random.seed(s)` |
+| `src/generator.rs` | `SeedSequence`, `Generator`, `default_rng`: numpy's `default_rng` (`Generator(PCG64(SeedSequence(seed)))`), each generator its own state; bit-identical to numpy's draws from the same seed, with numpy's `bit_generator.state` as its `state` |
 | `src/mnist.rs` | `decode_mnist_pixels`: raw MNIST records to normalised pixels |
-| `src/fused.rs` | `layer_*`: one call per `ArrayLayer` method (forward, deltas, downstream, gradient accumulate/apply), single-example and `_batch` |
+| `src/fused.rs` | `layer_*`: one call per `ArrayLayer` method (forward, deltas, downstream, gradient accumulate/apply), single-example and `_batch`; the dropout forwards draw their mask from an optional `rng: Generator`, else from `random.rs`'s global |
 | `src/conv.rs` | `ConvGeometry`; `conv_*_batch`/`max_pool_*_batch`: one call per `ConvArrayLayer`/`MaxPoolArrayLayer` method (forward, downstream, gradient accumulate), batch-only; `conv_linear_*_batch`, `LinearConvArrayLayer`'s bias-free forward and accumulate |
 | `src/batch_norm.rs` | `linear_*`, `batch_norm_*`: one call per `LinearArrayLayer`/`BatchNormArrayLayer` method (batch normalization, dense or per conv channel with `positions`: forward in training and inference, downstream, gradient accumulate) |
 

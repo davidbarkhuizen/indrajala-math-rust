@@ -9,6 +9,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::array::{RustArray, Shape};
+use crate::generator::Generator;
 use crate::linalg::{matmul, matmul_add, matmul_nt};
 use crate::ops::same_shape_elementwise;
 use crate::random::draw_bernoulli_mask;
@@ -604,7 +605,8 @@ pub fn layer_softmax_output_delta(a: &RustArray, reference: &RustArray) -> PyRes
 }
 
 /// `DropoutArrayLayer.forward`: `sigmoid(self.W @ x + self.b)`, with a training-time
-/// inverted-dropout mask drawn internally (`random.rs`'s `draw_bernoulli_mask`). Returns
+/// inverted-dropout mask drawn internally, from `rng` if given, else from `random.rs`'s global
+/// MT19937 (`draw_bernoulli_mask`). Returns
 /// `(a, mask, base_activation)`: `DropoutRustArrayLayer`
 /// keeps `mask`/`base_activation` around as this layer's own forward-time snapshots for
 /// `layer_dropout_hidden_delta` below, the same role `_mask`/`_base_activation` play on the
@@ -612,16 +614,18 @@ pub fn layer_softmax_output_delta(a: &RustArray, reference: &RustArray) -> PyRes
 /// and `a == base_activation` exactly, no rescale - matching `DropoutNode.forward`'s own
 /// eval-mode no-op.
 #[pyfunction]
+#[pyo3(signature = (w, x, b, drop_probability, training, rng=None))]
 pub fn layer_dropout_forward(
     w: &RustArray,
     x: &RustArray,
     b: &RustArray,
     drop_probability: f64,
     training: bool,
+    rng: Option<PyRefMut<'_, Generator>>,
 ) -> PyResult<(RustArray, RustArray, RustArray)> {
     let z = linear_preactivation(w, x, b)?;
     let base = sigmoid(&z);
-    let (a, mask) = dropout_forward_from_base(&base, drop_probability, training);
+    let (a, mask) = dropout_forward_from_base(&base, drop_probability, training, rng);
     Ok((a, mask, base))
 }
 
@@ -630,27 +634,38 @@ pub fn layer_dropout_forward(
 /// `batch_size * size` buffer) - matching `forward`'s own per-example-independent-draw
 /// requirement, not one mask shared across the batch. `X` 2D (`batch, input_size`).
 #[pyfunction]
+#[pyo3(signature = (w, x, b, drop_probability, training, rng=None))]
 pub fn layer_dropout_forward_batch(
     w: &RustArray,
     x: &RustArray,
     b: &RustArray,
     drop_probability: f64,
     training: bool,
+    rng: Option<PyRefMut<'_, Generator>>,
 ) -> PyResult<(RustArray, RustArray, RustArray)> {
     let z = linear_preactivation_batch(w, x, b)?;
     let base = sigmoid(&z);
-    let (a, mask) = dropout_forward_from_base(&base, drop_probability, training);
+    let (a, mask) = dropout_forward_from_base(&base, drop_probability, training, rng);
     Ok((a, mask, base))
 }
 
 /// Shared by `layer_dropout_forward`/`layer_dropout_forward_batch` above - both differ only in
 /// how `base` (the pre-mask sigmoid) was computed (single-example matvec vs. batched matmul),
-/// not in how the mask is drawn and applied on top of it.
-fn dropout_forward_from_base(base: &RustArray, drop_probability: f64, training: bool) -> (RustArray, RustArray) {
+/// not in how the mask is drawn and applied on top of it. The mask comes from `rng` (a PCG64
+/// `Generator`) when one is passed, else from `random.rs`'s global MT19937.
+fn dropout_forward_from_base(
+    base: &RustArray,
+    drop_probability: f64,
+    training: bool,
+    rng: Option<PyRefMut<'_, Generator>>,
+) -> (RustArray, RustArray) {
     let keep_probability = 1.0 - drop_probability;
     let size = base.data.len();
     if training {
-        let mask_data = draw_bernoulli_mask(drop_probability, size);
+        let mask_data = match rng {
+            Some(mut rng) => rng.draw_bernoulli_mask(drop_probability, size),
+            None => draw_bernoulli_mask(drop_probability, size),
+        };
         let a_data: Vec<f64> = base
             .data
             .iter()
