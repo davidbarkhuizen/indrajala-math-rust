@@ -4,6 +4,7 @@ mod array;
 mod batch_norm;
 mod conv;
 mod fused;
+mod generator;
 mod linalg;
 mod mnist;
 mod ops;
@@ -28,6 +29,7 @@ use fused::{
     layer_relu_hidden_delta, layer_relu_hidden_delta_batch, layer_sgd_step, layer_softmax_forward,
     layer_softmax_forward_batch, layer_softmax_output_delta,
 };
+use generator::{default_rng, Generator, SeedSequence};
 use linalg::{matmul_threads_for, outer, set_kernel_overrides, set_matmul_threading};
 use mnist::decode_mnist_pixels;
 use random::{bernoulli_mask, seed, seed_at_import, uniform};
@@ -60,6 +62,7 @@ fn indrajala_math_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(random::random, m)?)?;
     m.add_function(wrap_pyfunction!(uniform, m)?)?;
     m.add_function(wrap_pyfunction!(bernoulli_mask, m)?)?;
+    m.add_function(wrap_pyfunction!(default_rng, m)?)?;
     m.add_function(wrap_pyfunction!(decode_mnist_pixels, m)?)?;
     m.add_function(wrap_pyfunction!(layer_forward, m)?)?;
     m.add_function(wrap_pyfunction!(layer_forward_batch, m)?)?;
@@ -102,6 +105,8 @@ fn indrajala_math_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(batch_norm_accumulate_gradient_batch, m)?)?;
     m.add_class::<RustArray>()?;
     m.add_class::<ConvGeometry>()?;
+    m.add_class::<SeedSequence>()?;
+    m.add_class::<Generator>()?;
     seed_at_import();
     Ok(())
 }

@@ -104,7 +104,14 @@ impl Mt19937 {
         y ^= (y << 15) & 0xefc6_0000;
         y ^ (y >> 18)
     }
+}
 
+/// A generator's doubles in `[0, 1)`: this file's MT19937 and `generator.rs`'s PCG64.
+pub(crate) trait DoubleSource {
+    fn next_double(&mut self) -> f64;
+}
+
+impl DoubleSource for Mt19937 {
     /// numpy's `random_double`: 27 + 26 bits of two draws, 53 random mantissa bits in `[0, 1)`.
     fn next_double(&mut self) -> f64 {
         let a = self.next_u32() >> 5;
@@ -304,7 +311,7 @@ pub fn seed(py: Python<'_>, seed: Option<Bound<'_, PyAny>>) -> PyResult<()> {
     Ok(())
 }
 
-fn shaped(data: Vec<f64>, shape: Shape) -> RustArray {
+pub(crate) fn shaped(data: Vec<f64>, shape: Shape) -> RustArray {
     match shape {
         Shape::Vector(_) => RustArray::from_vector(data),
         Shape::Matrix(rows, cols) => RustArray::from_matrix(data, rows, cols),
@@ -338,17 +345,20 @@ pub fn uniform(low: f64, high: f64, shape: &Bound<'_, PyAny>) -> PyResult<RustAr
 /// call as the matmul and sigmoid, so it is a plain `Vec<f64>`; `bernoulli_mask` below is its
 /// Python-visible form.
 pub(crate) fn draw_bernoulli_mask(drop_probability: f64, size: usize) -> Vec<f64> {
-    with_rng(|rng| {
-        (0..size)
-            .map(|_| {
-                if rng.next_double() >= drop_probability {
-                    1.0
-                } else {
-                    0.0
-                }
-            })
-            .collect()
-    })
+    with_rng(|rng| bernoulli_values(rng, drop_probability, size))
+}
+
+/// `size` mask entries drawn from `rng`, one double each: 1.0 where it is `>= drop_probability`.
+pub(crate) fn bernoulli_values(rng: &mut impl DoubleSource, drop_probability: f64, size: usize) -> Vec<f64> {
+    (0..size)
+        .map(|_| {
+            if rng.next_double() >= drop_probability {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .collect()
 }
 
 /// `(np.random.random(shape) >= drop_probability).astype(float)`: `draw_bernoulli_mask` as an
