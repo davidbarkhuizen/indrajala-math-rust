@@ -2,6 +2,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::array::{RustArray, Shape};
+use crate::fused::dropout_hidden_delta_from_downstream;
 use crate::ops::same_shape_elementwise;
 
 /// Elementwise `e^x` over a whole array - mirrors `array_layer.sigmoid`'s own reliance on
@@ -66,6 +67,52 @@ pub fn array_relu_mask(downstream: &RustArray, a: &RustArray) -> PyResult<RustAr
         data: same_shape_elementwise(&downstream.data, &a.data, |d, av| if av > 0.0 { d } else { 0.0 }),
         shape: downstream.shape,
     })
+}
+
+/// `downstream * a * (1 - a)` - the sigmoid's derivative applied to a downstream that a dense
+/// layer's fused `layer_hidden_delta*` can't compute, because the next layer has no `W` to read
+/// (a `LayerNorm`, or a residual fork whose body starts with one: indrajala-ml's layer-norm and
+/// attention workplan, D5). The fused ops' elementwise expression, in their grouping, so given the
+/// same downstream it computes their bits. Shape-agnostic, as `array_relu_mask`.
+#[pyfunction]
+pub fn array_sigmoid_mask(downstream: &RustArray, a: &RustArray) -> PyResult<RustArray> {
+    if downstream.shape != a.shape {
+        return Err(PyValueError::new_err(format!(
+            "array_sigmoid_mask requires matching shapes, got {:?} and {:?}",
+            downstream.shape, a.shape
+        )));
+    }
+    Ok(RustArray {
+        data: same_shape_elementwise(&downstream.data, &a.data, |d, av| d * av * (1.0 - av)),
+        shape: downstream.shape,
+    })
+}
+
+/// `downstream * base_activation * (1 - base_activation) * scale`, `scale = mask /
+/// keep_probability` if `was_training` else `1.0` - the dropout layer's hidden delta from a
+/// downstream it was handed, as `array_sigmoid_mask` is the sigmoid layer's (D5): the fused
+/// `layer_dropout_hidden_delta*` ops' own elementwise expression. Shape-agnostic.
+#[pyfunction]
+pub fn array_dropout_mask(
+    downstream: &RustArray,
+    base_activation: &RustArray,
+    mask: &RustArray,
+    keep_probability: f64,
+    was_training: bool,
+) -> PyResult<RustArray> {
+    if downstream.shape != base_activation.shape || mask.shape != base_activation.shape {
+        return Err(PyValueError::new_err(format!(
+            "array_dropout_mask requires matching shapes, got {:?}, {:?} and {:?}",
+            downstream.shape, base_activation.shape, mask.shape
+        )));
+    }
+    Ok(dropout_hidden_delta_from_downstream(
+        downstream,
+        base_activation,
+        mask,
+        keep_probability,
+        was_training,
+    ))
 }
 
 /// Numerically-stable softmax normalization - `SoftmaxArrayLayer.forward`/`forward_batch`'s own
