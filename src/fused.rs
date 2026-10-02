@@ -747,9 +747,10 @@ pub fn layer_dropout_hidden_delta_batch(
     ))
 }
 
-/// Shared by `layer_dropout_hidden_delta`/`layer_dropout_hidden_delta_batch` above - both differ
-/// only in how `downstream` was computed, not in the elementwise formula applied on top of it.
-fn dropout_hidden_delta_from_downstream(
+/// Shared by `layer_dropout_hidden_delta`/`layer_dropout_hidden_delta_batch` above and by
+/// `ufuncs.rs`'s `array_dropout_mask` - they differ only in how `downstream` was computed, not in
+/// the elementwise formula applied on top of it.
+pub(crate) fn dropout_hidden_delta_from_downstream(
     downstream: &RustArray,
     base_activation: &RustArray,
     mask: &RustArray,

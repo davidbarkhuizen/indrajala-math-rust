@@ -1,17 +1,23 @@
 use pyo3::prelude::*;
 
 mod array;
+mod attention;
 mod batch_norm;
 mod conv;
 mod fused;
 mod generator;
+mod layer_norm;
 mod linalg;
 mod mnist;
 mod ops;
 mod random;
+mod tokens;
 mod ufuncs;
 
 use array::RustArray;
+use attention::{
+    attention_accumulate_gradient_batch, attention_downstream_batch, attention_forward, attention_forward_batch,
+};
 use batch_norm::{
     batch_norm_accumulate_gradient_batch, batch_norm_downstream_batch, batch_norm_forward, batch_norm_forward_batch,
     linear_accumulate_gradient_batch, linear_forward, linear_forward_batch,
@@ -32,10 +38,16 @@ use fused::{
     layer_softmax_forward_batch, layer_softmax_output_delta,
 };
 use generator::{default_rng, Generator, SeedSequence};
+use layer_norm::{
+    layer_norm_accumulate_gradient_batch, layer_norm_downstream_batch, layer_norm_forward, layer_norm_forward_batch,
+};
 use linalg::{matmul_threads_for, outer, set_kernel_overrides, set_matmul_threading};
 use mnist::decode_mnist_pixels;
 use random::{bernoulli_mask, seed, seed_at_import, uniform};
-use ufuncs::{argmax, array_relu, array_relu_mask, array_softmax, exp, sum_axis0};
+use tokens::{patches_downstream, patches_forward, token_mean_downstream, token_mean_forward};
+use ufuncs::{
+    argmax, array_dropout_mask, array_relu, array_relu_mask, array_sigmoid_mask, array_softmax, exp, sum_axis0,
+};
 
 /// Proves the PyO3/maturin toolchain works end to end - importable and callable from Python,
 /// nothing array-specific.
@@ -59,6 +71,8 @@ fn indrajala_math_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(argmax, m)?)?;
     m.add_function(wrap_pyfunction!(array_relu, m)?)?;
     m.add_function(wrap_pyfunction!(array_relu_mask, m)?)?;
+    m.add_function(wrap_pyfunction!(array_sigmoid_mask, m)?)?;
+    m.add_function(wrap_pyfunction!(array_dropout_mask, m)?)?;
     m.add_function(wrap_pyfunction!(array_softmax, m)?)?;
     m.add_function(wrap_pyfunction!(seed, m)?)?;
     m.add_function(wrap_pyfunction!(random::random, m)?)?;
@@ -113,6 +127,18 @@ fn indrajala_math_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(batch_norm_forward_batch, m)?)?;
     m.add_function(wrap_pyfunction!(batch_norm_downstream_batch, m)?)?;
     m.add_function(wrap_pyfunction!(batch_norm_accumulate_gradient_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(patches_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(patches_downstream, m)?)?;
+    m.add_function(wrap_pyfunction!(token_mean_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(token_mean_downstream, m)?)?;
+    m.add_function(wrap_pyfunction!(layer_norm_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(layer_norm_forward_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(layer_norm_downstream_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(layer_norm_accumulate_gradient_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(attention_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(attention_forward_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(attention_downstream_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(attention_accumulate_gradient_batch, m)?)?;
     m.add_class::<RustArray>()?;
     m.add_class::<ConvGeometry>()?;
     m.add_class::<SeedSequence>()?;
