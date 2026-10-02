@@ -73,9 +73,9 @@ also be tested there: in an indrajala-ml checkout, point `rust/` at the new comm
 | `src/attention.rs` | `attention_*`: one call per pass of `AttentionArrayLayer` (forward, single and batch; downstream, which also returns `dQ, dK, dV`; gradient accumulate), composed of the crate's dense ops, `@` and `array_softmax` |
 
 Each `layer_*` function in `src/fused.rs` mirrors a method of indrajala-ml's
-`indrajala_ml/model/array_layer.py` or one of its ReLU/softmax/dropout/Adam/L2/momentum variants,
+`indrajala_ml/model/layers/numpy/array_layer.py` or one of its ReLU/softmax/dropout/Adam/L2/momentum variants,
 and must stay numerically identical to it. Likewise each `conv_*`/`max_pool_*` function in
-`src/conv.rs` mirrors a method of `indrajala_ml/model/conv_array_layer.py`/`max_pool_array_layer.py`, each `conv_linear_*` function one of its `LinearConvArrayLayer`, each `linear_*`/`batch_norm_*` function in `src/batch_norm.rs` one of `linear_array_layer.py`/`batch_norm_array_layer.py`, and each function in `src/tokens.rs`, `src/layer_norm.rs` and `src/attention.rs` one of `token_array_layer.py`, `layer_norm_array_layer.py` or `attention_array_layer.py`. Conv tensors cross the boundary as matrices
+`src/conv.rs` mirrors a method of `indrajala_ml/model/layers/numpy/conv_array_layer.py`/`max_pool_array_layer.py`, each `conv_linear_*` function one of its `LinearConvArrayLayer`, each `linear_*`/`batch_norm_*` function in `src/batch_norm.rs` one of `linear_array_layer.py`/`batch_norm_array_layer.py`, and each function in `src/tokens.rs`, `src/layer_norm.rs` and `src/attention.rs` one of `token_array_layer.py`, `layer_norm_array_layer.py` or `attention_array_layer.py`. Conv tensors cross the boundary as matrices
 (`Array` stays 1D/2D); `src/conv.rs`'s module comment gives the layouts.
 
 ## License

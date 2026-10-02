@@ -1,5 +1,5 @@
 //! Batch normalization (Ioffe & Szegedy 2015) and the bias-free linear layer before a dense one:
-//! one Rust function per method of indrajala-ml's `indrajala_ml/model/batch_norm_array_layer.py`
+//! one Rust function per method of indrajala-ml's `indrajala_ml/model/layers/numpy/batch_norm_array_layer.py`
 //! and `linear_array_layer.py`, as `fused.rs` is for `array_layer.py`. (The bias-free conv layer's
 //! ops are `conv.rs`'s `conv_linear_*`.)
 //!

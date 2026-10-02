@@ -1,5 +1,5 @@
 //! Single-head self-attention (indrajala-ml's layer-norm and attention workplan, D6 and D9): one
-//! Rust function per pass of `AttentionArrayLayer` in `indrajala_ml/model/attention_array_layer.py`,
+//! Rust function per pass of `AttentionArrayLayer` in `indrajala_ml/model/layers/numpy/attention_array_layer.py`,
 //! each one call, so a pass crosses the Python/Rust boundary once. The expressions are
 //! indrajala-ml's README's (Layer norm and attention), in their grouping:
 //!

@@ -1,5 +1,5 @@
 //! Convolution and max pooling ops, one Rust call per `ConvArrayLayer`/`MaxPoolArrayLayer` method
-//! (indrajala-ml's `indrajala_ml/model/conv_array_layer.py`/`max_pool_array_layer.py`). The ops
+//! (indrajala-ml's `indrajala_ml/model/layers/numpy/conv_array_layer.py`/`max_pool_array_layer.py`). The ops
 //! are batch ops, but each per-example operand may also be a 1D vector, meaning N = 1, and the
 //! per-example outputs then come back as vectors too: the single-example layer methods pass
 //! their arrays straight through, with no `(1, n)` reshape (which copies). A `(1, n)` matrix and
@@ -193,7 +193,7 @@ fn deltas_by_channel(delta: &RustArray, n: usize, o: usize, p: usize) -> RustArr
 /// as `ConvArrayLayer._cols` is. The pre-activation `Z` is never stored: nothing in the backward
 /// pass reads it (`array_relu_mask` masks on `A`).
 ///
-/// Per example, not over the whole batch (indrajala-ml's docs/optimizations/implemented.md):
+/// Per example, not over the whole batch:
 /// at N = 32 the whole-batch `cols`, product and `A` are 1.4-1.6 MB each, past L2, and zeroing
 /// them and then scattering into `A` made the op cost 1.5-2.8x its N single-example calls. Here
 /// only `cols` and `A` are batch-sized, and each is written once, in order; the example's slab

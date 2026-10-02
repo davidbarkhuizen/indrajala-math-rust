@@ -2,7 +2,7 @@
 //! of composing it from several separate `Array` operator/ufunc calls in Python - each of those
 //! crosses the Python/Rust boundary and allocates a new `Array`, and call count (not per-call
 //! cost) dominates this crate's matmul-bound cost. Every function here mirrors one
-//! `indrajala_ml/model/array_layer.py` method's formula exactly - see that file for the
+//! `indrajala_ml/model/layers/numpy/array_layer.py` method's formula exactly - see that file for the
 //! reference this crate is checked against.
 
 use pyo3::exceptions::PyValueError;

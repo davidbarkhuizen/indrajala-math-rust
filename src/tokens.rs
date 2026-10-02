@@ -1,6 +1,6 @@
 //! A patch model's parameter-free token layers (indrajala-ml's layer-norm and attention workplan;
 //! its README, Layer norm and attention): one Rust function per method of `PatchesArrayLayer` and
-//! `TokenMeanArrayLayer` in `indrajala_ml/model/token_array_layer.py`, as `fused.rs` is for
+//! `TokenMeanArrayLayer` in `indrajala_ml/model/layers/numpy/token_array_layer.py`, as `fused.rs` is for
 //! `array_layer.py`. A token sequence of `T` tokens of `d` features is flat and token-major,
 //! index `t * d + j`. Each function takes one example (1D) or a batch (2D, one example per row)
 //! and returns the same rank. `Position` needs none: it is `Array`'s `+` and `sum_axis0`.

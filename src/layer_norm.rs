@@ -1,5 +1,5 @@
 //! Layer norm (indrajala-ml's layer-norm and attention workplan, D5): one Rust function per method
-//! of `LayerNormArrayLayer` in `indrajala_ml/model/layer_norm_array_layer.py`, as `batch_norm.rs`
+//! of `LayerNormArrayLayer` in `indrajala_ml/model/layers/numpy/layer_norm_array_layer.py`, as `batch_norm.rs`
 //! is for batch norm. Each token's `d` features (a flat layer's whole vector being one token) are
 //! normalized by their own mean and biased variance, then `gamma * xhat + beta`, `gamma` and
 //! `beta` of length `d` shared over the tokens. A token-major batch of `T` tokens per example is
