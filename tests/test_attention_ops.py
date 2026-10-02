@@ -220,3 +220,25 @@ def test_the_attention_ops_refuse_shapes_that_dont_fit():
     q, k, v = (_array(f[name]) for name in ("q", "k", "v"))
     with pytest.raises(ValueError, match="attention_downstream_batch requires p of shape"):
         attention_downstream_batch(_array(c["delta"]), wq, wk, wv, wo, q, k, v, q)
+
+
+@pytest.mark.parametrize("tokens,features", [(1, 3), (5, 6), (16, 32)])
+def test_one_examples_backward_is_a_batch_of_ones(tokens: int, features: int):
+    c = _case(1, tokens, features)
+    x, delta = c["x"][0], c["delta"][0]
+    _, q, k, v, p, h = attention_forward(_array(x), *_parameters(c))
+    weights = [_array(c[name]) for name in ("wq", "wk", "wv", "wo")]
+    single = attention_downstream_batch(_array(delta), weights[0], weights[1], weights[2], weights[3], q, k, v, p)
+    f = _forward(c)
+    batch = _backward(c, f)
+    assert single[0].shape == (tokens * features,)
+    assert _bits(_numpy(single[0])) == _bits(batch["dx"])
+    for array, name in zip(single[1:], ["dq", "dk", "dv"]):
+        assert _bits(_numpy(array)) == _bits(batch[name]), name
+    grads = [_array(c["grad_" + name]) for name in NAMES]
+    one = attention_accumulate_gradient_batch(_array(delta), _array(x), h, single[1], single[2], single[3], *grads)
+    many = attention_accumulate_gradient_batch(
+        _array(c["delta"]), _array(c["x"]), _array(f["h"]), *(_array(batch[n]) for n in ("dq", "dk", "dv")), *grads
+    )
+    for i, name in enumerate(NAMES):
+        assert _bits(_numpy(one[i])) == _bits(_numpy(many[i])), name

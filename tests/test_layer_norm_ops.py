@@ -147,3 +147,20 @@ def test_the_layer_norm_ops_refuse_shapes_that_dont_fit():
         layer_norm_downstream_batch(delta, gamma, delta, Array([1.0]))
     with pytest.raises(ValueError, match="layer_norm_accumulate_gradient_batch requires xhat of shape"):
         layer_norm_accumulate_gradient_batch(delta, Array([[0.0] * 3]), gamma, beta)
+
+
+@pytest.mark.parametrize("tokens,features", [(1, 7), (4, 5), (16, 32)])
+def test_one_examples_backward_is_a_batch_of_ones(tokens: int, features: int):
+    c = _case(1, tokens, features)
+    gamma, beta = Array(c["gamma"].tolist()), Array(c["beta"].tolist())
+    _, xhat, std = layer_norm_forward(Array(c["x"][0].tolist()), gamma, beta, EPSILON)
+    _, xhat_batch, std_batch = layer_norm_forward_batch(Array(c["x"].tolist()), gamma, beta, EPSILON)
+    single = layer_norm_downstream_batch(Array(c["delta"][0].tolist()), gamma, xhat, std)
+    batch = layer_norm_downstream_batch(Array(c["delta"].tolist()), gamma, xhat_batch, std_batch)
+    assert single.shape == (tokens * features,)
+    assert _bits(_numpy(single)) == _bits(_numpy(batch))
+    grads = Array(c["grad_gamma"].tolist()), Array(c["grad_beta"].tolist())
+    one = layer_norm_accumulate_gradient_batch(Array(c["delta"][0].tolist()), xhat, *grads)
+    many = layer_norm_accumulate_gradient_batch(Array(c["delta"].tolist()), xhat_batch, *grads)
+    for u, w in zip(one, many):
+        assert _bits(_numpy(u)) == _bits(_numpy(w))

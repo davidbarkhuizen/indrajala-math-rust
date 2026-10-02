@@ -125,7 +125,8 @@ pub fn layer_norm_forward_batch(
 
 /// `LayerNormArrayLayer.downstream_batch`: `dl/dx` from `delta_batch` (`dl/dy`), per row,
 /// `dxhat = delta * gamma`, `m1 = sum(dxhat) / d`, `m2 = sum(dxhat * xhat) / d`, `dx = ((dxhat -
-/// m1) - xhat * m2) / std`. `xhat` and `std` are `layer_norm_forward_batch`'s.
+/// m1) - xhat * m2) / std`. `xhat` and `std` are `layer_norm_forward_batch`'s, or, with a 1D
+/// `delta_batch` for one example, `layer_norm_forward`'s.
 #[pyfunction]
 pub fn layer_norm_downstream_batch(
     delta_batch: &RustArray,
@@ -158,7 +159,7 @@ pub fn layer_norm_downstream_batch(
 
 /// `LayerNormArrayLayer.accumulate_gradient_batch`: `grad_gamma += sum(delta * xhat)` and
 /// `grad_beta += sum(delta)`, each feature's sum over the rows (examples, then tokens). Returns the
-/// updated `(grad_gamma, grad_beta)`.
+/// updated `(grad_gamma, grad_beta)`. A 1D `delta_batch` and `xhat` are one example.
 #[pyfunction]
 pub fn layer_norm_accumulate_gradient_batch(
     delta_batch: &RustArray,

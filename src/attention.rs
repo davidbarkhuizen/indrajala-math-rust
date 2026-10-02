@@ -206,9 +206,10 @@ pub fn attention_forward_batch(
     forward(x, &projections, context)
 }
 
-/// `AttentionArrayLayer._backward`: from `delta_batch` (`dl/dout`, 2D `batch, T * d`) and the
-/// forward pass's `q`, `k`, `v` and `p`, returns `(dx, dq, dk, dv)`: `dx`, the downstream, in
-/// `delta_batch`'s shape, and `dq`, `dk`, `dv` as `(N * T, d)` rows, which the gradients read.
+/// `AttentionArrayLayer._backward`: from `delta_batch` (`dl/dout`, 2D `batch, T * d`, or 1D for
+/// one example, whose caches are `attention_forward`'s) and the forward pass's `q`, `k`, `v` and
+/// `p`, returns `(dx, dq, dk, dv)`: `dx`, the downstream, in `delta_batch`'s shape, and `dq`, `dk`,
+/// `dv` as `(N * T, d)` rows, which the gradients read.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
 pub fn attention_downstream_batch(
@@ -223,12 +224,6 @@ pub fn attention_downstream_batch(
     p: &RustArray,
 ) -> PyResult<(RustArray, RustArray, RustArray, RustArray)> {
     let context = "attention_downstream_batch";
-    if !matches!(delta_batch.shape, Shape::Matrix(_, _)) {
-        return Err(PyValueError::new_err(format!(
-            "{context} requires a 2D delta_batch, got shape {:?}",
-            delta_batch.shape
-        )));
-    }
     let d = match wq.shape {
         Shape::Matrix(d, _) => d,
         Shape::Vector(d) => d,
@@ -287,7 +282,8 @@ pub fn attention_downstream_batch(
 /// `AttentionArrayLayer.accumulate_gradient_batch`: each projection's `(grad_W, grad_b)` as a
 /// dense layer's, `grad_W += delta^T X` and `grad_b += sum(delta)` over the `(N * T)` rows, with
 /// `dq`, `dk`, `dv` (`attention_downstream_batch`'s) against `x`, and `delta_batch` against `h`
-/// (the forward pass's). Returns the eight updated gradients in the parameters' order.
+/// (the forward pass's), `delta_batch` and `x` 2D or, for one example, 1D. Returns the eight
+/// updated gradients in the parameters' order.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 #[pyfunction]
 pub fn attention_accumulate_gradient_batch(
