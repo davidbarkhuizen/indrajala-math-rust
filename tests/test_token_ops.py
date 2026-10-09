@@ -3,6 +3,8 @@ A patch model's parameter-free token ops (indrajala-ml's layer-norm and attentio
 D8): `patches_*`, a fixed permutation, against numpy's reshape and transpose (indrajala-ml's
 `PatchesArrayLayer`), and `token_mean_*` against its left fold over the tokens (`np.cumsum`), by
 bits. `Position` has no op: it is `Array`'s `+` and `sum_axis0`, checked here as it uses them.
+`embedding_*` (indrajala-ml's sequence task workplan, D5) are checked against numpy's own
+`EmbeddingArrayLayer` expressions, a gather `E[ids]` and the scatter-add `np.add.at`, by bits.
 """
 
 import numpy as np
@@ -10,6 +12,8 @@ import pytest
 
 from indrajala_math_rust import (
     Array,
+    embedding_accumulate_gradient,
+    embedding_forward,
     patches_downstream,
     patches_forward,
     sum_axis0,
@@ -22,6 +26,8 @@ GRIDS = [(1, 1, 1, 1), (4, 6, 1, 2), (28, 28, 1, 7), (6, 4, 3, 2), (9, 9, 2, 3),
 ROWS = [None, 1, 3]  # None: a single example
 # (tokens, features)
 TOKENS = [(1, 1), (1, 7), (16, 32), (5, 3), (9, 33)]
+# (tokens, vocabulary, size)
+EMBEDDINGS = [(1, 1, 1), (1, 5, 3), (8, 3, 4), (64, 65, 32), (7, 76, 33)]
 
 
 def _numpy(array: Array) -> np.ndarray:
@@ -107,6 +113,40 @@ def test_a_position_table_is_added_with_plus_and_its_gradient_summed_with_sum_ax
     assert _bits(_numpy(sum_axis0(Array(delta.tolist())))) == _bits(np.cumsum(delta, axis=0)[-1])
 
 
+@pytest.mark.parametrize("tokens,vocabulary,size", EMBEDDINGS)
+@pytest.mark.parametrize("rows", ROWS)
+def test_an_embedding_reads_each_ids_row_and_scatter_adds_its_gradient_in_row_order(
+    tokens: int, vocabulary: int, size: int, rows: int | None
+):
+    # more ids than the vocabulary has rows, so ids repeat and their rows' gradients add up
+    rng = np.random.default_rng([tokens, vocabulary, size])
+    n = rows or 1
+    ids = rng.integers(0, vocabulary, (n, tokens)).astype(np.float64)
+    table = rng.uniform(-1.0, 1.0, (vocabulary, size))
+    out = _numpy(embedding_forward(Array(_batch(ids, rows).tolist()), Array(table.tolist())))
+    reference = table[ids.astype(np.intp)].reshape(n, tokens * size)
+    assert out.shape == _batch(reference, rows).shape
+    assert _bits(out) == _bits(reference)
+
+    delta = rng.uniform(-1.0, 1.0, (n, tokens * size))
+    grad = rng.uniform(-1.0, 1.0, (vocabulary, size))
+    updated = embedding_accumulate_gradient(
+        Array(_batch(delta, rows).tolist()), Array(_batch(ids, rows).tolist()), Array(grad.tolist())
+    )
+    expected = grad.copy()
+    np.add.at(expected, ids.astype(np.intp).reshape(-1), delta.reshape(-1, size))
+    assert updated.shape == (vocabulary, size)
+    assert _bits(_numpy(updated)) == _bits(expected)
+
+
+def test_an_embeddings_gradient_adds_a_repeated_ids_rows_in_their_order():
+    # 1e16 + 1.0 + 1.0 loses both ones, (1.0 + 1.0) + 1e16 keeps them: the order shows
+    delta = Array([[1e16, 1.0, 1.0], [1.0, 1.0, 1e16]])
+    out = _numpy(embedding_accumulate_gradient(delta, Array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]), Array([[0.0], [0.0]])))
+    assert out.tolist() == [[(1e16 + 1.0) + 1.0], [(1.0 + 1.0) + 1e16]]
+    assert out[0, 0] != out[1, 0]
+
+
 def test_the_token_ops_refuse_shapes_that_dont_fit():
     with pytest.raises(ValueError, match="patches_forward requires a patch_size of 1 or more dividing"):
         patches_forward(Array([0.0] * 36), 6, 6, 1, 4)
@@ -118,3 +158,17 @@ def test_the_token_ops_refuse_shapes_that_dont_fit():
         token_mean_forward(Array([0.0] * 10), 3)
     with pytest.raises(ValueError, match="token_mean_downstream requires 1 or more tokens"):
         token_mean_downstream(Array([0.0] * 3), 0)
+    table = Array([[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]])
+    for bad in (3.0, -1.0, 0.5, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match=r"embedding_forward reads token ids, whole numbers in \[0, 3\)"):
+            embedding_forward(Array([0.0, bad]), table)
+        with pytest.raises(
+            ValueError, match=r"embedding_accumulate_gradient reads token ids, whole numbers in \[0, 3\)"
+        ):
+            embedding_accumulate_gradient(Array([0.0] * 4), Array([0.0, bad]), table)
+    with pytest.raises(ValueError, match=r"embedding_forward requires table of shape \(vocabulary, size\)"):
+        embedding_forward(Array([0.0]), Array([0.0, 1.0]))
+    with pytest.raises(ValueError, match="embedding_accumulate_gradient requires delta of 2 values per token id in x"):
+        embedding_accumulate_gradient(Array([0.0] * 3), Array([0.0, 1.0]), table)
+    with pytest.raises(ValueError, match="embedding_accumulate_gradient requires delta of 2 values per token id in x"):
+        embedding_accumulate_gradient(Array([[0.0] * 4]), Array([0.0, 1.0]), table)

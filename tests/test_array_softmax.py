@@ -10,7 +10,7 @@ import math
 import numpy as np
 import pytest
 
-from indrajala_math_rust import Array, array_softmax
+from indrajala_math_rust import Array, array_softmax, exp
 
 
 def _numpy_softmax_1d(z: np.ndarray) -> np.ndarray:
@@ -83,3 +83,17 @@ def test_array_softmax_matches_numpy_row_wise_for_large_magnitude_values_without
     for row in range(2):
         actual_row = [actual[row, col] for col in range(3)]
         assert actual_row == pytest.approx(expected[row].tolist(), rel=1e-9, abs=1e-12)
+
+
+@pytest.mark.parametrize("shape", [(3,), (300,), (4, 9), (4, 257)])
+def test_array_softmax_sums_each_row_by_a_left_fold_by_bits(shape: tuple[int, ...]):
+    # the sum is np.cumsum's left fold (indrajala-ml's attention and token-wise output), never
+    # numpy's pairwise e.sum(), which differs from it on rows past 8 values; the crate's own exp,
+    # as numpy's isn't the same function, and the division numpy's, exact
+    rng = np.random.default_rng(len(shape) * 1000 + shape[-1])
+    for _ in range(20):
+        z = rng.uniform(-10.0, 10.0, shape)
+        e = np.array(exp(Array((z - z.max(axis=-1, keepdims=True)).tolist())).tolist())
+        expected = e / np.cumsum(e, axis=-1)[..., -1:]
+        actual = np.array(array_softmax(Array(z.tolist())).tolist())
+        assert [v.tobytes() for v in actual.ravel()] == [v.tobytes() for v in expected.ravel()]
