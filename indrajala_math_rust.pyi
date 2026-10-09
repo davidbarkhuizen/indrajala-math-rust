@@ -273,13 +273,22 @@ def layer_norm_accumulate_gradient_batch(
     delta_batch: Array, xhat: Array, grad_gamma: Array, grad_beta: Array
 ) -> tuple[Array, Array]: ...
 def attention_forward(
-    x: Array, wq: Array, bq: Array, wk: Array, bk: Array, wv: Array, bv: Array, wo: Array, bo: Array
+    x: Array, wq: Array, bq: Array, wk: Array, bk: Array, wv: Array, bv: Array, wo: Array, bo: Array, heads: int
 ) -> tuple[Array, Array, Array, Array, Array, Array]: ...
 def attention_forward_batch(
-    x: Array, wq: Array, bq: Array, wk: Array, bk: Array, wv: Array, bv: Array, wo: Array, bo: Array
+    x: Array, wq: Array, bq: Array, wk: Array, bk: Array, wv: Array, bv: Array, wo: Array, bo: Array, heads: int
 ) -> tuple[Array, Array, Array, Array, Array, Array]: ...
 def attention_downstream_batch(
-    delta_batch: Array, wq: Array, wk: Array, wv: Array, wo: Array, q: Array, k: Array, v: Array, p: Array
+    delta_batch: Array,
+    wq: Array,
+    wk: Array,
+    wv: Array,
+    wo: Array,
+    q: Array,
+    k: Array,
+    v: Array,
+    p: Array,
+    heads: int,
 ) -> tuple[Array, Array, Array, Array]: ...
 def attention_accumulate_gradient_batch(
     delta_batch: Array,

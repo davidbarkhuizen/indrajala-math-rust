@@ -70,7 +70,7 @@ also be tested there: in an indrajala-ml checkout, point `rust/` at the new comm
 | `src/batch_norm.rs` | `linear_*`, `batch_norm_*`: one call per `LinearArrayLayer`/`BatchNormArrayLayer` method (batch normalization, dense or per conv channel with `positions`: forward in training and inference, downstream, gradient accumulate) |
 | `src/tokens.rs` | `patches_*`, `token_mean_*`: one call per `PatchesArrayLayer`/`TokenMeanArrayLayer` method (forward, downstream), one example or a batch; `Position` is `+` and `sum_axis0` |
 | `src/layer_norm.rs` | `layer_norm_*`: one call per `LayerNormArrayLayer` method (forward, single and batch; downstream, gradient accumulate) |
-| `src/attention.rs` | `attention_*`: one call per pass of `AttentionArrayLayer` (forward, single and batch; downstream, which also returns `dQ, dK, dV`; gradient accumulate), composed of the crate's dense ops, `@` and `array_softmax` |
+| `src/attention.rs` | `attention_*`: one call per pass of `AttentionArrayLayer` (forward, single and batch; downstream, which also returns `dQ, dK, dV`; gradient accumulate), multi-head (`heads`), each a thin wrapper over the crate-internal blocks project, attend and combine, composed of the crate's dense ops, `@` and `array_softmax` |
 
 Each `layer_*` function in `src/fused.rs` mirrors a method of indrajala-ml's
 `indrajala_ml/model/layers/numpy/array_layer.py` or one of its ReLU/softmax/dropout/Adam/L2/momentum variants,
