@@ -7,7 +7,8 @@
 //!
 //! ```text
 //! project   Q = X Wq^T + bq;  K = X Wk^T + bk;  V = X Wv^T + bv           (T, h·d_k) each
-//! attend    S[i] = (Q[i] K[i]^T) / s;  P[i] = softmax_rows(S[i]);  H[i] = P[i] V[i]
+//! attend    S[i] = (Q[i] K[i]^T) / s;  S[i]_tj = -inf for j > t if causal
+//!           P[i] = softmax_rows(S[i]);  H[i] = P[i] V[i]
 //! combine   H = [H[0] ... H[h-1]];  out = H Wo^T + bo
 //! backward  dH = delta Wo
 //!           dP[i] = dH[i] V[i]^T;  dV[i] = P[i]^T dH[i];  dS[i] = P[i] * (dP[i] - rowsum(dP[i] * P[i]))
@@ -23,6 +24,12 @@
 //! Python's `a @ b.T` copies it; the row softmax is `array_softmax`; `rowsum` is a left fold from
 //! `0.0` over each row. At one head with `d_k = d` every expression is the single head's.
 //!
+//! A causal mask (indrajala-ml's sequence task workplan, D7) sets each score `S_tj` with `j > t`
+//! to `-inf` after the scale and before the row max, as numpy's `AttentionArrayLayer` does: the row
+//! max comes from the unmasked scores (the diagonal never is), `exp(-inf)` is exactly 0, so a
+//! masked `P_tj` is exactly 0 and so is its `dS_tj`. The backward pass reads `P` and needs no mask,
+//! so only the forward ops take `causal`. An unmasked pass computes what it did before the mask.
+//!
 //! The caches are packed: `Q`, `K`, `V`, `H` and their gradients `(N * T, h·d_k)`, head `i` in
 //! columns `i·d_k..`, and `P` `(N * T, h·T)`, head `i` in columns `i·T..`.
 
@@ -34,17 +41,19 @@ use crate::fused::{affine_forward_batch, layer_accumulate_gradient_batch, layer_
 use crate::linalg::matmul;
 use crate::ufuncs::array_softmax;
 
-/// What attend reads besides `Q`, `K` and `V`: the head count and each head's width. Masks and
-/// dropout on `P` are fields to come (the workplan's Extension points).
+/// What attend reads besides `Q`, `K` and `V`: the head count, each head's width and whether the
+/// scores are masked causally. Dropout on `P` is a field to come (the multi-head attention
+/// workplan's Extension points).
 #[derive(Clone, Copy)]
 struct AttentionOptions {
     heads: usize,
     key_size: usize,
+    causal: bool,
 }
 
 impl AttentionOptions {
     /// `heads` heads across the projections' `width = h·d_k` columns.
-    fn new(heads: usize, width: usize, context: &str) -> PyResult<Self> {
+    fn new(heads: usize, width: usize, causal: bool, context: &str) -> PyResult<Self> {
         if heads == 0 || width == 0 || !width.is_multiple_of(heads) {
             return Err(PyValueError::new_err(format!(
                 "{context} requires heads >= 1 dividing the projections' width {width}, got heads={heads}"
@@ -53,6 +62,7 @@ impl AttentionOptions {
         Ok(AttentionOptions {
             heads,
             key_size: width / heads,
+            causal,
         })
     }
 
@@ -100,12 +110,12 @@ fn require_weights(weights: [&RustArray; 4], d: usize, width: usize, context: &s
 
 /// `(d, options)`, `d` the token width (`bo`'s length) and the projections' width `bq`'s: every
 /// projection's weight and bias shaped to them.
-fn shapes(projections: &Projections, heads: usize, context: &str) -> PyResult<(usize, AttentionOptions)> {
+fn shapes(projections: &Projections, heads: usize, causal: bool, context: &str) -> PyResult<(usize, AttentionOptions)> {
     let (d, width) = (projections.bo.data.len(), projections.bq.data.len());
     if d == 0 {
         return Err(PyValueError::new_err(format!("{context} requires a non-empty bo")));
     }
-    let options = AttentionOptions::new(heads, width, context)?;
+    let options = AttentionOptions::new(heads, width, causal, context)?;
     let weights = [projections.wq, projections.wk, projections.wv, projections.wo];
     require_weights(weights, d, width, context)?;
     for (b, name) in [(projections.bq, "bq"), (projections.bk, "bk"), (projections.bv, "bv")] {
@@ -174,6 +184,14 @@ fn extend_side_by_side(out: &mut Vec<f64>, blocks: &[RustArray]) {
     }
 }
 
+/// A `(T, T)` score matrix with each `S_tj`, `j > t`, set to `-inf`.
+fn masked_causally(mut scores: RustArray, tokens: usize) -> RustArray {
+    for (t, row) in scores.data.chunks_exact_mut(tokens).enumerate() {
+        row[t + 1..].fill(f64::NEG_INFINITY);
+    }
+    scores
+}
+
 /// Each value divided by `s`.
 fn divided(m: RustArray, s: f64) -> RustArray {
     RustArray {
@@ -213,7 +231,10 @@ fn attend_forward(
                 head(k, n, i, tokens, d_k),
                 head(v, n, i, tokens, d_k),
             );
-            let scores = divided(matmul(&q_ni, &k_ni.transpose())?, s);
+            let mut scores = divided(matmul(&q_ni, &k_ni.transpose())?, s);
+            if options.causal {
+                scores = masked_causally(scores, tokens);
+            }
             let p_ni = array_softmax(&scores);
             h_n.push(matmul(&p_ni, &v_ni)?);
             p_n.push(p_ni);
@@ -310,8 +331,14 @@ fn project_backward(gradients: [&RustArray; 3], weights: [&RustArray; 3]) -> PyR
 /// rows and `p` as `(N * T, h·T)`.
 type ForwardResult = (RustArray, RustArray, RustArray, RustArray, RustArray, RustArray);
 
-fn forward(x: &RustArray, projections: &Projections, heads: usize, context: &str) -> PyResult<ForwardResult> {
-    let (d, options) = shapes(projections, heads, context)?;
+fn forward(
+    x: &RustArray,
+    projections: &Projections,
+    heads: usize,
+    causal: bool,
+    context: &str,
+) -> PyResult<ForwardResult> {
+    let (d, options) = shapes(projections, heads, causal, context)?;
     let (_, tokens) = examples_and_tokens(x, d, "x", context)?;
     let (q, k, v) = project(&token_rows(x, d), projections)?;
     let (p, h) = attend_forward(&q, &k, &v, tokens, &options)?;
@@ -324,10 +351,11 @@ fn forward(x: &RustArray, projections: &Projections, heads: usize, context: &str
 }
 
 /// `AttentionArrayLayer.forward`: one example, `x` 1D of `T * d` values, `d` `bo`'s length, in
-/// `heads` heads across `bq`'s length. Returns `(a, q, k, v, p, h)`: `a` 1D, and what the backward
-/// pass reads, `q`, `k`, `v` and `h` `(T, h·d_k)`, `p` `(T, h·T)`.
+/// `heads` heads across `bq`'s length, masked if `causal`. Returns `(a, q, k, v, p, h)`: `a` 1D,
+/// and what the backward pass reads, `q`, `k`, `v` and `h` `(T, h·d_k)`, `p` `(T, h·T)`.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
+#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, heads, *, causal = false))]
 pub fn attention_forward(
     x: &RustArray,
     wq: &RustArray,
@@ -339,6 +367,7 @@ pub fn attention_forward(
     wo: &RustArray,
     bo: &RustArray,
     heads: usize,
+    causal: bool,
 ) -> PyResult<ForwardResult> {
     let context = "attention_forward";
     if !matches!(x.shape, Shape::Vector(_)) {
@@ -357,14 +386,15 @@ pub fn attention_forward(
         wo,
         bo,
     };
-    forward(x, &projections, heads, context)
+    forward(x, &projections, heads, causal, context)
 }
 
 /// `AttentionArrayLayer.forward_batch`: `x` 2D (`batch, T * d`), each example
-/// `attention_forward`'s bits. Returns `(a, q, k, v, p, h)`, the caches over the batch's `(N * T)`
-/// rows, examples then tokens.
+/// `attention_forward`'s bits, masked if `causal`. Returns `(a, q, k, v, p, h)`, the caches over
+/// the batch's `(N * T)` rows, examples then tokens.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
+#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, heads, *, causal = false))]
 pub fn attention_forward_batch(
     x: &RustArray,
     wq: &RustArray,
@@ -376,6 +406,7 @@ pub fn attention_forward_batch(
     wo: &RustArray,
     bo: &RustArray,
     heads: usize,
+    causal: bool,
 ) -> PyResult<ForwardResult> {
     let context = "attention_forward_batch";
     if !matches!(x.shape, Shape::Matrix(_, _)) {
@@ -394,7 +425,7 @@ pub fn attention_forward_batch(
         wo,
         bo,
     };
-    forward(x, &projections, heads, context)
+    forward(x, &projections, heads, causal, context)
 }
 
 /// `AttentionArrayLayer._backward`: from `delta_batch` (`dl/dout`, 2D `batch, T * d`, or 1D for
@@ -420,7 +451,8 @@ pub fn attention_downstream_batch(
         Shape::Matrix(width, d) => (width, d),
         Shape::Vector(d) => (d, 1),
     };
-    let options = AttentionOptions::new(heads, width, context)?;
+    // causal or not, the same: the mask is in `p`
+    let options = AttentionOptions::new(heads, width, false, context)?;
     require_weights([wq, wk, wv, wo], d, width, context)?;
     let (examples, tokens) = examples_and_tokens(delta_batch, d, "delta_batch", context)?;
     let rows = examples * tokens;

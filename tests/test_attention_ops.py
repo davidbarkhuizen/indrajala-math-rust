@@ -11,7 +11,8 @@ them, and the heads' packing side by side, are numpy's, exact. numpy's own produ
 the crate's, so numpy is the reference only where no product is involved, and in the exact tests.
 
 At one head the ops are also pinned to the single-head ops' outputs, recorded before the multi-head
-change.
+change, which the unmasked ops still compute after the causal mask (indrajala-ml's sequence task
+workplan, D7). The composition masks its scores with numpy, exact, before `array_softmax`.
 """
 
 import hashlib
@@ -114,7 +115,13 @@ def _side_by_side(blocks: list[list[np.ndarray]]) -> np.ndarray:
     return np.concatenate([np.concatenate(heads, axis=1) for heads in blocks])
 
 
-def _composed_forward(c: dict[str, np.ndarray], tokens: int, heads: int) -> dict[str, np.ndarray]:
+def _masked(scores: Array, tokens: int) -> Array:
+    # each S_tj with j > t set to -inf
+    future = np.triu(np.ones((tokens, tokens), dtype=np.bool_), k=1)
+    return _array(np.where(future, -np.inf, _numpy(scores)))
+
+
+def _composed_forward(c: dict[str, np.ndarray], tokens: int, heads: int, causal: bool = False) -> dict[str, np.ndarray]:
     d, width = c["bo"].shape[0], c["bq"].shape[0]
     d_k = width // heads
     rows = _array(c["x"].reshape(-1, d))
@@ -126,7 +133,8 @@ def _composed_forward(c: dict[str, np.ndarray], tokens: int, heads: int) -> dict
         h.append([])
         for i in range(heads):
             q_ni, k_ni, v_ni = (_array(_head(m, n, i, tokens, d_k)) for m in (q, k, v))
-            p_ni = array_softmax((q_ni @ k_ni.T) / math.sqrt(d_k))
+            scores = (q_ni @ k_ni.T) / math.sqrt(d_k)
+            p_ni = array_softmax(_masked(scores, tokens) if causal else scores)
             p[n].append(_numpy(p_ni))
             h[n].append(_numpy(p_ni @ v_ni))
     h_rows = _side_by_side(h)
@@ -134,8 +142,8 @@ def _composed_forward(c: dict[str, np.ndarray], tokens: int, heads: int) -> dict
     return {"a": a.reshape(c["x"].shape), "q": q, "k": k, "v": v, "p": _side_by_side(p), "h": h_rows}
 
 
-def _forward(c: dict[str, np.ndarray], heads: int) -> dict[str, np.ndarray]:
-    result = attention_forward_batch(_array(c["x"]), *_parameters(c), heads=heads)
+def _forward(c: dict[str, np.ndarray], heads: int, causal: bool = False) -> dict[str, np.ndarray]:
+    result = attention_forward_batch(_array(c["x"]), *_parameters(c), heads=heads, causal=causal)
     return {name: _numpy(array) for name, array in zip(["a", "q", "k", "v", "p", "h"], result)}
 
 
@@ -190,26 +198,28 @@ def _gradients(c: dict[str, np.ndarray], f: dict[str, np.ndarray], b: dict[str, 
     return [_numpy(g) for g in grads]
 
 
+@pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("examples,tokens,features,heads,key_size", SHAPES, ids=map(_id, SHAPES))
 def test_the_forward_pass_is_the_crates_composition(
-    examples: int, tokens: int, features: int, heads: int, key_size: int
+    examples: int, tokens: int, features: int, heads: int, key_size: int, causal: bool
 ):
     # project (q, k, v), attend (p, h) and combine (a), each block's outputs
     c = _case(examples, tokens, features, heads, key_size)
-    out, composed = _forward(c, heads), _composed_forward(c, tokens, heads)
+    out, composed = _forward(c, heads, causal), _composed_forward(c, tokens, heads, causal)
     for name in ["a", "q", "k", "v", "p", "h"]:
         assert out[name].shape == composed[name].shape, name
         assert _bits(out[name]) == _bits(composed[name]), name
 
 
+@pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("examples,tokens,features,heads,key_size", SHAPES, ids=map(_id, SHAPES))
 def test_one_examples_forward_pass_is_its_batch_rows(
-    examples: int, tokens: int, features: int, heads: int, key_size: int
+    examples: int, tokens: int, features: int, heads: int, key_size: int, causal: bool
 ):
     c = _case(examples, tokens, features, heads, key_size)
-    batch = _forward(c, heads)
+    batch = _forward(c, heads, causal)
     for i in range(examples):
-        result = attention_forward(_array(c["x"][i]), *_parameters(c), heads=heads)
+        result = attention_forward(_array(c["x"][i]), *_parameters(c), heads=heads, causal=causal)
         single = {name: _numpy(array) for name, array in zip(["a", "q", "k", "v", "p", "h"], result)}
         assert _bits(single["a"]) == _bits(batch["a"][i])
         for name in ["q", "k", "v", "p", "h"]:
@@ -217,11 +227,14 @@ def test_one_examples_forward_pass_is_its_batch_rows(
             assert _bits(single[name]) == _bits(batch[name][i * tokens : (i + 1) * tokens]), name
 
 
+@pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("examples,tokens,features,heads,key_size", SHAPES, ids=map(_id, SHAPES))
-def test_the_downstream_is_the_crates_composition(examples: int, tokens: int, features: int, heads: int, key_size: int):
+def test_the_downstream_is_the_crates_composition(
+    examples: int, tokens: int, features: int, heads: int, key_size: int, causal: bool
+):
     # combine's and attend's backward (dq, dk, dv), then project's (dx)
     c = _case(examples, tokens, features, heads, key_size)
-    f = _forward(c, heads)
+    f = _forward(c, heads, causal)
     out, composed = _backward(c, f, heads), _composed_backward(c, f, tokens, heads)
     for name in ["dx", "dq", "dk", "dv"]:
         assert out[name].shape == composed[name].shape, name
@@ -344,6 +357,49 @@ def test_a_silent_heads_gradients_are_zero(examples: int, tokens: int, features:
     grads = dict(zip(NAMES, _gradients(c, f, b)))
     for name in ("wq", "bq", "wk", "bk", "wv", "bv"):
         assert _bits(grads[name][silent]) == _bits(np.zeros_like(grads[name][silent])), name
+
+
+@pytest.mark.parametrize("examples,tokens,features,heads,key_size", SHAPES, ids=map(_id, SHAPES))
+def test_a_causal_pass_weights_no_later_token_and_no_later_token_moves_an_earlier_output(
+    examples: int, tokens: int, features: int, heads: int, key_size: int
+):
+    # every masked weight P_tj, j > t, exactly 0; and token t's outputs, its rows of a and h,
+    # read only tokens 0..t, so new values for the later tokens leave them unchanged by bits
+    c = _case(examples, tokens, features, heads, key_size)
+    out = _forward(c, heads, causal=True)
+    future = np.triu(np.ones((tokens, tokens), dtype=np.bool_), k=1)
+    for n in range(examples):
+        for i in range(heads):
+            p = _head(out["p"], n, i, tokens, tokens)
+            assert _bits(p[future]) == _bits(np.zeros(int(future.sum())))
+            assert np.all(p[~future] > 0.0)
+    for t in range(tokens - 1):
+        later = dict(c)
+        later["x"] = c["x"].copy()
+        later["x"][:, (t + 1) * features :] = np.random.default_rng(t).uniform(
+            -2.0, 2.0, (examples, (tokens - t - 1) * features)
+        )
+        moved = _forward(later, heads, causal=True)
+        a, a_moved = out["a"].reshape(examples, tokens, features), moved["a"].reshape(examples, tokens, features)
+        assert _bits(a[:, : t + 1]) == _bits(a_moved[:, : t + 1]), t
+        h, h_moved = out["h"].reshape(examples, tokens, -1), moved["h"].reshape(examples, tokens, -1)
+        assert _bits(h[:, : t + 1]) == _bits(h_moved[:, : t + 1]), t
+
+
+@pytest.mark.parametrize("examples,tokens,features,heads,key_size", SHAPES, ids=map(_id, SHAPES))
+def test_unmasked_is_the_default_and_the_first_tokens_row_is_its_value_projection_masked(
+    examples: int, tokens: int, features: int, heads: int, key_size: int
+):
+    c = _case(examples, tokens, features, heads, key_size)
+    default, unmasked, masked = _forward(c, heads), _forward(c, heads, causal=False), _forward(c, heads, causal=True)
+    for name in ["a", "q", "k", "v", "p", "h"]:
+        assert _bits(default[name]) == _bits(unmasked[name]), name
+    # token 0 weights only itself, P_00 = 1, so its row of H is its row of V exactly
+    for n in range(examples):
+        assert _bits(masked["h"][n * tokens]) == _bits(masked["v"][n * tokens])
+    if tokens == 1:
+        for name in ["a", "q", "k", "v", "p", "h"]:
+            assert _bits(masked[name]) == _bits(unmasked[name]), name
 
 
 def test_the_attention_ops_refuse_shapes_that_dont_fit():

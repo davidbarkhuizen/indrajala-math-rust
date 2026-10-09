@@ -1,9 +1,11 @@
-//! A patch model's parameter-free token layers (indrajala-ml's layer-norm and attention workplan;
-//! its README, Layer norm and attention): one Rust function per method of `PatchesArrayLayer` and
-//! `TokenMeanArrayLayer` in `indrajala_ml/model/layers/numpy/token_array_layer.py`, as `fused.rs` is for
-//! `array_layer.py`. A token sequence of `T` tokens of `d` features is flat and token-major,
-//! index `t * d + j`. Each function takes one example (1D) or a batch (2D, one example per row)
-//! and returns the same rank. `Position` needs none: it is `Array`'s `+` and `sum_axis0`.
+//! The token layers that aren't attention: a patch model's parameter-free ones (indrajala-ml's
+//! layer-norm and attention workplan; its README, Layer norm and attention) and a sequence model's
+//! `Embedding` (its sequence task workplan, D5). One Rust function per method of
+//! `PatchesArrayLayer`, `TokenMeanArrayLayer` and `EmbeddingArrayLayer` in
+//! `indrajala_ml/model/layers/numpy/token_array_layer.py`, as `fused.rs` is for `array_layer.py`.
+//! A token sequence of `T` tokens of `d` features is flat and token-major, index `t * d + j`. Each
+//! function takes one example (1D) or a batch (2D, one example per row) and returns the same rank.
+//! `Position` needs none: it is `Array`'s `+` and `sum_axis0`.
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -184,4 +186,79 @@ pub fn token_mean_downstream(delta: &RustArray, tokens: usize) -> PyResult<RustA
         }
     }
     Ok(same_rank(data, delta, rows, tokens * features))
+}
+
+/// `(vocabulary, size)` of an embedding table, checked to be a non-empty matrix.
+fn table_shape(table: &RustArray, name: &str, context: &str) -> PyResult<(usize, usize)> {
+    match table.shape {
+        Shape::Matrix(vocabulary, size) if vocabulary > 0 && size > 0 => Ok((vocabulary, size)),
+        shape => Err(PyValueError::new_err(format!(
+            "{context} requires {name} of shape (vocabulary, size), both 1 or more, got {shape:?}"
+        ))),
+    }
+}
+
+/// `x`'s token ids, each refused unless a whole number in `[0, vocabulary)`, as
+/// `EmbeddingArrayLayer._ids` refuses them.
+fn token_ids(x: &RustArray, vocabulary: usize, context: &str) -> PyResult<Vec<usize>> {
+    x.data
+        .iter()
+        .map(|&v| {
+            if v >= 0.0 && v < vocabulary as f64 && v.fract() == 0.0 {
+                Ok(v as usize)
+            } else {
+                Err(PyValueError::new_err(format!(
+                    "{context} reads token ids, whole numbers in [0, {vocabulary}), got {v}"
+                )))
+            }
+        })
+        .collect()
+}
+
+/// `EmbeddingArrayLayer.forward_batch` (and `forward`): each of `x`'s `T` token ids per example as
+/// its row of the `(vocabulary, size)` `table`, `T * size` values per example, copied.
+#[pyfunction]
+pub fn embedding_forward(x: &RustArray, table: &RustArray) -> PyResult<RustArray> {
+    let context = "embedding_forward";
+    let (vocabulary, size) = table_shape(table, "table", context)?;
+    let (rows, tokens) = rows_and_width(x);
+    let mut data = Vec::with_capacity(x.data.len() * size);
+    for id in token_ids(x, vocabulary, context)? {
+        data.extend_from_slice(&table.data[id * size..(id + 1) * size]);
+    }
+    Ok(same_rank(data, x, rows, tokens * size))
+}
+
+/// `EmbeddingArrayLayer.accumulate_gradient_batch`: `grad_table` with each of `delta`'s rows of
+/// `size` added to the row its token id in `x` read, in row order (example by example, token by
+/// token), as `np.add.at` adds them: per row of the table, a left fold onto its gradient. `delta`
+/// is `T * size` values per example of `x`, in `x`'s rank. Returns the updated gradient.
+#[pyfunction]
+pub fn embedding_accumulate_gradient(delta: &RustArray, x: &RustArray, grad_table: &RustArray) -> PyResult<RustArray> {
+    let context = "embedding_accumulate_gradient";
+    let (vocabulary, size) = table_shape(grad_table, "grad_table", context)?;
+    let (rows, tokens) = rows_and_width(x);
+    let expected = match x.shape {
+        Shape::Vector(_) => Shape::Vector(tokens * size),
+        Shape::Matrix(_, _) => Shape::Matrix(rows, tokens * size),
+    };
+    if delta.shape != expected {
+        return Err(PyValueError::new_err(format!(
+            "{context} requires delta of {size} values per token id in x, x of shape {:?}, got {:?}",
+            x.shape, delta.shape
+        )));
+    }
+    let mut data = grad_table.data.clone();
+    for (id, row) in token_ids(x, vocabulary, context)?
+        .into_iter()
+        .zip(delta.data.chunks_exact(size))
+    {
+        for (acc, &v) in data[id * size..(id + 1) * size].iter_mut().zip(row) {
+            *acc += v;
+        }
+    }
+    Ok(RustArray {
+        data,
+        shape: grad_table.shape,
+    })
 }

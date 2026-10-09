@@ -121,13 +121,15 @@ pub fn array_dropout_mask(
 /// are validated for ReLU. A 1D vector is normalized as one whole distribution (`forward`'s
 /// shape); a 2D matrix is normalized row-wise, one independent distribution per row
 /// (`forward_batch`'s shape) - general axis-parameterized reduction stays out of scope; this is
-/// the one fixed case, matching `sum_axis0`'s own precedent.
+/// the one fixed case, matching `sum_axis0`'s own precedent. Each row's sum is a left fold from
+/// `0.0` in column order, numpy's `np.cumsum(e, axis=-1)[..., -1:]` (attention's and the token-wise
+/// output's sum in indrajala-ml), not `e.sum()`'s pairwise sum.
 #[pyfunction]
 pub fn array_softmax(arr: &RustArray) -> RustArray {
     fn normalize_row(row: &[f64]) -> Vec<f64> {
         let max_value = row.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let exp_values: Vec<f64> = row.iter().map(|&v| (v - max_value).exp()).collect();
-        let total: f64 = exp_values.iter().sum();
+        let total = exp_values.iter().fold(0.0, |acc, &e| acc + e);
         exp_values.iter().map(|&e| e / total).collect()
     }
 

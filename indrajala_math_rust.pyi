@@ -266,6 +266,8 @@ def patches_forward(x: Array, height: int, width: int, channels: int, patch_size
 def patches_downstream(delta: Array, height: int, width: int, channels: int, patch_size: int) -> Array: ...
 def token_mean_forward(x: Array, tokens: int) -> Array: ...
 def token_mean_downstream(delta: Array, tokens: int) -> Array: ...
+def embedding_forward(x: Array, table: Array) -> Array: ...
+def embedding_accumulate_gradient(delta: Array, x: Array, grad_table: Array) -> Array: ...
 def layer_norm_forward(x: Array, gamma: Array, beta: Array, epsilon: float) -> tuple[Array, Array, Array]: ...
 def layer_norm_forward_batch(x: Array, gamma: Array, beta: Array, epsilon: float) -> tuple[Array, Array, Array]: ...
 def layer_norm_downstream_batch(delta_batch: Array, gamma: Array, xhat: Array, std: Array) -> Array: ...
@@ -273,10 +275,32 @@ def layer_norm_accumulate_gradient_batch(
     delta_batch: Array, xhat: Array, grad_gamma: Array, grad_beta: Array
 ) -> tuple[Array, Array]: ...
 def attention_forward(
-    x: Array, wq: Array, bq: Array, wk: Array, bk: Array, wv: Array, bv: Array, wo: Array, bo: Array, heads: int
+    x: Array,
+    wq: Array,
+    bq: Array,
+    wk: Array,
+    bk: Array,
+    wv: Array,
+    bv: Array,
+    wo: Array,
+    bo: Array,
+    heads: int,
+    *,
+    causal: bool = False,
 ) -> tuple[Array, Array, Array, Array, Array, Array]: ...
 def attention_forward_batch(
-    x: Array, wq: Array, bq: Array, wk: Array, bk: Array, wv: Array, bv: Array, wo: Array, bo: Array, heads: int
+    x: Array,
+    wq: Array,
+    bq: Array,
+    wk: Array,
+    bk: Array,
+    wv: Array,
+    bv: Array,
+    wo: Array,
+    bo: Array,
+    heads: int,
+    *,
+    causal: bool = False,
 ) -> tuple[Array, Array, Array, Array, Array, Array]: ...
 def attention_downstream_batch(
     delta_batch: Array,
