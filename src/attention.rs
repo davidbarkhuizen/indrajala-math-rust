@@ -143,23 +143,34 @@ fn columns(m: &RustArray) -> usize {
 }
 
 /// Example `n`'s head `i`: the `(T, width)` block of an `(N * T, h * width)` matrix at rows
-/// `n·T..` and columns `i·width..`, copied.
+/// `n·T..` and columns `i·width..`, copied; in one piece when the block spans whole rows.
 fn head(m: &RustArray, n: usize, i: usize, tokens: usize, width: usize) -> RustArray {
     let stride = columns(m);
-    let mut block = Vec::with_capacity(tokens * width);
-    for row in m.data[n * tokens * stride..(n + 1) * tokens * stride].chunks_exact(stride) {
-        block.extend_from_slice(&row[i * width..(i + 1) * width]);
-    }
+    let rows = &m.data[n * tokens * stride..(n + 1) * tokens * stride];
+    let block = if width == stride {
+        rows.to_vec()
+    } else {
+        let mut block = Vec::with_capacity(tokens * width);
+        for row in rows.chunks_exact(stride) {
+            block.extend_from_slice(&row[i * width..(i + 1) * width]);
+        }
+        block
+    };
     RustArray::from_matrix(block, tokens, width)
 }
 
-/// `head`'s inverse: `block` written into example `n`'s head `i` of `m`'s values, `stride` wide.
-fn set_head(m: &mut [f64], stride: usize, n: usize, i: usize, block: &RustArray) {
-    let width = columns(block);
-    let tokens = block.data.len() / width;
-    let rows = m[n * tokens * stride..(n + 1) * tokens * stride].chunks_exact_mut(stride);
-    for (row, values) in rows.zip(block.data.chunks_exact(width)) {
-        row[i * width..(i + 1) * width].copy_from_slice(values);
+/// `head`'s inverse for one example: its heads' `(T, width)` blocks side by side, appended to
+/// `out` row by row; in one piece when there is one block.
+fn extend_side_by_side(out: &mut Vec<f64>, blocks: &[RustArray]) {
+    if let [block] = blocks {
+        out.extend_from_slice(&block.data);
+        return;
+    }
+    let width = columns(&blocks[0]);
+    for t in 0..blocks[0].data.len() / width {
+        for block in blocks {
+            out.extend_from_slice(&block.data[t * width..(t + 1) * width]);
+        }
     }
 }
 
@@ -192,9 +203,10 @@ fn attend_forward(
 ) -> PyResult<(RustArray, RustArray)> {
     let (heads, d_k, width, s) = (options.heads, options.key_size, options.width(), options.scale());
     let rows = q.data.len() / width;
-    let mut p = vec![0.0; rows * heads * tokens];
-    let mut h = vec![0.0; rows * width];
+    let mut p = Vec::with_capacity(rows * heads * tokens);
+    let mut h = Vec::with_capacity(rows * width);
     for n in 0..rows / tokens {
+        let (mut p_n, mut h_n) = (Vec::with_capacity(heads), Vec::with_capacity(heads));
         for i in 0..heads {
             let (q_ni, k_ni, v_ni) = (
                 head(q, n, i, tokens, d_k),
@@ -203,9 +215,11 @@ fn attend_forward(
             );
             let scores = divided(matmul(&q_ni, &k_ni.transpose())?, s);
             let p_ni = array_softmax(&scores);
-            set_head(&mut h, width, n, i, &matmul(&p_ni, &v_ni)?);
-            set_head(&mut p, heads * tokens, n, i, &p_ni);
+            h_n.push(matmul(&p_ni, &v_ni)?);
+            p_n.push(p_ni);
         }
+        extend_side_by_side(&mut p, &p_n);
+        extend_side_by_side(&mut h, &h_n);
     }
     Ok((
         RustArray::from_matrix(p, rows, heads * tokens),
@@ -236,10 +250,13 @@ fn attend_backward(
     let [q, k, v, p] = caches;
     let (heads, d_k, width, s) = (options.heads, options.key_size, options.width(), options.scale());
     let rows = dh.data.len() / width;
-    let mut dq = vec![0.0; rows * width];
-    let mut dk = vec![0.0; rows * width];
-    let mut dv = vec![0.0; rows * width];
+    let mut dq = Vec::with_capacity(rows * width);
+    let mut dk = Vec::with_capacity(rows * width);
+    let mut dv = Vec::with_capacity(rows * width);
     for n in 0..rows / tokens {
+        let mut dq_n = Vec::with_capacity(heads);
+        let mut dk_n = Vec::with_capacity(heads);
+        let mut dv_n = Vec::with_capacity(heads);
         for i in 0..heads {
             let (q_ni, k_ni, v_ni) = (
                 head(q, n, i, tokens, d_k),
@@ -248,16 +265,19 @@ fn attend_backward(
             );
             let (p_ni, dh_ni) = (head(p, n, i, tokens, tokens), head(dh, n, i, tokens, d_k));
             let dp = matmul(&dh_ni, &v_ni.transpose())?;
-            set_head(&mut dv, width, n, i, &matmul(&p_ni.transpose(), &dh_ni)?);
+            dv_n.push(matmul(&p_ni.transpose(), &dh_ni)?);
             let mut ds = Vec::with_capacity(tokens * tokens);
             for (dp_row, p_row) in dp.data.chunks_exact(tokens).zip(p_ni.data.chunks_exact(tokens)) {
                 let r = dp_row.iter().zip(p_row).fold(0.0, |acc, (&dpv, &pv)| acc + dpv * pv);
                 ds.extend(dp_row.iter().zip(p_row).map(|(&dpv, &pv)| pv * (dpv - r)));
             }
             let ds = RustArray::from_matrix(ds, tokens, tokens);
-            set_head(&mut dq, width, n, i, &divided(matmul(&ds, &k_ni)?, s));
-            set_head(&mut dk, width, n, i, &divided(matmul(&ds.transpose(), &q_ni)?, s));
+            dq_n.push(divided(matmul(&ds, &k_ni)?, s));
+            dk_n.push(divided(matmul(&ds.transpose(), &q_ni)?, s));
         }
+        extend_side_by_side(&mut dq, &dq_n);
+        extend_side_by_side(&mut dk, &dk_n);
+        extend_side_by_side(&mut dv, &dv_n);
     }
     Ok((
         RustArray::from_matrix(dq, rows, width),
