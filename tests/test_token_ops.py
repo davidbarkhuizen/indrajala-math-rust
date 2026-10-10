@@ -5,6 +5,8 @@ D8): `patches_*`, a fixed permutation, against numpy's reshape and transpose (in
 bits. `Position` has no op: it is `Array`'s `+` and `sum_axis0`, checked here as it uses them.
 `embedding_*` (indrajala-ml's sequence task workplan, D5) are checked against numpy's own
 `EmbeddingArrayLayer` expressions, a gather `E[ids]` and the scatter-add `np.add.at`, by bits.
+`token_dropout_*` (indrajala-ml's attention-dropout workplan, D2) against `TokenDropoutArrayLayer`'s:
+numpy's mask from one seed, `X * M / keep` and `delta * M / keep`, by bits.
 """
 
 import numpy as np
@@ -12,11 +14,14 @@ import pytest
 
 from indrajala_math_rust import (
     Array,
+    Generator,
     embedding_accumulate_gradient,
     embedding_forward,
     patches_downstream,
     patches_forward,
     sum_axis0,
+    token_dropout_downstream,
+    token_dropout_forward,
     token_mean_downstream,
     token_mean_forward,
 )
@@ -172,3 +177,34 @@ def test_the_token_ops_refuse_shapes_that_dont_fit():
         embedding_accumulate_gradient(Array([0.0] * 3), Array([0.0, 1.0]), table)
     with pytest.raises(ValueError, match="embedding_accumulate_gradient requires delta of 2 values per token id in x"):
         embedding_accumulate_gradient(Array([[0.0] * 4]), Array([0.0, 1.0]), table)
+
+
+@pytest.mark.parametrize("drop_probability", [0.0, 0.1, 0.5])
+@pytest.mark.parametrize("tokens,features", TOKENS)
+@pytest.mark.parametrize("rows", ROWS)
+def test_the_token_dropout_is_numpys_mask_and_scaling(
+    rows: int | None, tokens: int, features: int, drop_probability: float
+):
+    values = np.random.default_rng([tokens, features]).uniform(-1.0, 1.0, (rows or 1, tokens * features))
+    x, delta = _batch(values, rows), _batch(values[::-1] * 0.5, rows)
+    rng = Generator(9)
+    a, mask = token_dropout_forward(Array(x.tolist()), drop_probability, rng)
+    reference = np.random.default_rng(9)
+    expected = (reference.random(x.shape) >= drop_probability).astype(np.float64)
+    keep = 1.0 - drop_probability
+    assert _bits(_numpy(mask)) == _bits(expected) and _numpy(mask).shape == x.shape
+    assert _bits(_numpy(a)) == _bits(x * expected / keep)
+    assert rng.state == reference.bit_generator.state
+    downstream = token_dropout_downstream(Array(delta.tolist()), mask, drop_probability)
+    assert _bits(_numpy(downstream)) == _bits(delta * expected / keep)
+
+
+def test_the_token_dropout_ops_refuse_a_probability_outside_0_to_1_and_misshapen_masks():
+    x = Array([[1.0, 2.0], [3.0, 4.0]])
+    for p in (-0.1, 1.0, float("nan")):
+        with pytest.raises(ValueError, match=r"token_dropout_forward requires a drop_probability in \[0, 1\)"):
+            token_dropout_forward(x, p, Generator(1))
+        with pytest.raises(ValueError, match=r"token_dropout_downstream requires a drop_probability in \[0, 1\)"):
+            token_dropout_downstream(x, x, p)
+    with pytest.raises(ValueError, match="token_dropout_downstream requires delta and mask of one shape"):
+        token_dropout_downstream(x, Array([1.0, 0.0, 1.0, 1.0]), 0.5)
