@@ -30,6 +30,21 @@
 //! masked `P_tj` is exactly 0 and so is its `dS_tj`. The backward pass reads `P` and needs no mask,
 //! so only the forward ops take `causal`. An unmasked pass computes what it did before the mask.
 //!
+//! Dropout on `P` (indrajala-ml's attention-dropout workplan, D3-D5): a training pass with
+//! `dropout > 0` draws a 0/1 mask `M[i]` per example and head from the network's `Generator`, `T²`
+//! values each in (example, head, query, key) order, numpy's row-major `(N, h, T, T)` draw, every
+//! entry drawn, the causally masked ones included; `M_tj = u_tj >= dropout`. Then
+//!
+//! ```text
+//! attend    P~[i] = P[i] * M[i] / keep;  H[i] = P~[i] V[i]
+//! backward  dP[i] = (dH[i] V[i]^T) * M[i] / keep;  dV[i] = P~[i]^T dH[i]
+//! ```
+//!
+//! with `keep = 1 - dropout`, the softmax's backward reading the undropped `P`. The forward ops
+//! return `M`, packed as `P`, which the backward op takes; `P~` is recomputed from `P` and `M`, the
+//! same elementwise expression and so the same bits. Without `training`, and at `dropout = 0`,
+//! nothing is drawn, the mask is `None` and every op computes what it did before dropout.
+//!
 //! The caches are packed: `Q`, `K`, `V`, `H` and their gradients `(N * T, h·d_k)`, head `i` in
 //! columns `i·d_k..`, and `P` `(N * T, h·T)`, head `i` in columns `i·T..`.
 
@@ -38,32 +53,44 @@ use pyo3::prelude::*;
 
 use crate::array::{RustArray, Shape};
 use crate::fused::{affine_forward_batch, layer_accumulate_gradient_batch, layer_downstream_batch};
+use crate::generator::Generator;
 use crate::linalg::matmul;
 use crate::ufuncs::array_softmax;
 
-/// What attend reads besides `Q`, `K` and `V`: the head count, each head's width and whether the
-/// scores are masked causally. Dropout on `P` is a field to come (the multi-head attention
-/// workplan's Extension points).
+/// What attend reads besides `Q`, `K` and `V`: the head count, each head's width, whether the
+/// scores are masked causally and the drop probability of each weight in training.
 #[derive(Clone, Copy)]
 struct AttentionOptions {
     heads: usize,
     key_size: usize,
     causal: bool,
+    dropout: f64,
 }
 
 impl AttentionOptions {
-    /// `heads` heads across the projections' `width = h·d_k` columns.
-    fn new(heads: usize, width: usize, causal: bool, context: &str) -> PyResult<Self> {
+    /// `heads` heads across the projections' `width = h·d_k` columns, `dropout` in `[0, 1)`.
+    fn new(heads: usize, width: usize, causal: bool, dropout: f64, context: &str) -> PyResult<Self> {
         if heads == 0 || width == 0 || !width.is_multiple_of(heads) {
             return Err(PyValueError::new_err(format!(
                 "{context} requires heads >= 1 dividing the projections' width {width}, got heads={heads}"
+            )));
+        }
+        if !(0.0..1.0).contains(&dropout) {
+            return Err(PyValueError::new_err(format!(
+                "{context} requires a dropout in [0, 1), got {dropout}"
             )));
         }
         Ok(AttentionOptions {
             heads,
             key_size: width / heads,
             causal,
+            dropout,
         })
+    }
+
+    /// `1 - dropout`, each kept weight's divisor.
+    fn keep(&self) -> f64 {
+        1.0 - self.dropout
     }
 
     /// `h·d_k`, the projections' width.
@@ -110,12 +137,18 @@ fn require_weights(weights: [&RustArray; 4], d: usize, width: usize, context: &s
 
 /// `(d, options)`, `d` the token width (`bo`'s length) and the projections' width `bq`'s: every
 /// projection's weight and bias shaped to them.
-fn shapes(projections: &Projections, heads: usize, causal: bool, context: &str) -> PyResult<(usize, AttentionOptions)> {
+fn shapes(
+    projections: &Projections,
+    heads: usize,
+    causal: bool,
+    dropout: f64,
+    context: &str,
+) -> PyResult<(usize, AttentionOptions)> {
     let (d, width) = (projections.bo.data.len(), projections.bq.data.len());
     if d == 0 {
         return Err(PyValueError::new_err(format!("{context} requires a non-empty bo")));
     }
-    let options = AttentionOptions::new(heads, width, causal, context)?;
+    let options = AttentionOptions::new(heads, width, causal, dropout, context)?;
     let weights = [projections.wq, projections.wk, projections.wv, projections.wo];
     require_weights(weights, d, width, context)?;
     for (b, name) in [(projections.bq, "bq"), (projections.bk, "bk"), (projections.bv, "bv")] {
@@ -192,6 +225,14 @@ fn masked_causally(mut scores: RustArray, tokens: usize) -> RustArray {
     scores
 }
 
+/// `P~ = P * M / keep`, elementwise, in that grouping: numpy's `P * M / keep`.
+fn dropped(p: &RustArray, mask: &RustArray, keep: f64) -> RustArray {
+    RustArray {
+        data: p.data.iter().zip(&mask.data).map(|(&pv, &mv)| pv * mv / keep).collect(),
+        shape: p.shape,
+    }
+}
+
 /// Each value divided by `s`.
 fn divided(m: RustArray, s: f64) -> RustArray {
     RustArray {
@@ -210,21 +251,25 @@ fn project(rows: &RustArray, projections: &Projections) -> PyResult<(RustArray, 
     Ok((q, k, v))
 }
 
-/// Per example and head, the weights and the weighted sum: `(p, h)`, `p` `(N * T, h·T)` and `h`
-/// `(N * T, h·d_k)`, from the packed `(N * T, h·d_k)` `q`, `k`, `v`.
+/// Per example and head, the weights and the weighted sum: `(p, h, mask)`, `p` `(N * T, h·T)` and
+/// `h` `(N * T, h·d_k)`, from the packed `(N * T, h·d_k)` `q`, `k`, `v`. With `rng`, each head's
+/// weights are dropped by a mask drawn from it, returned packed as `p`; without, `mask` is `None`.
 fn attend_forward(
     q: &RustArray,
     k: &RustArray,
     v: &RustArray,
     tokens: usize,
     options: &AttentionOptions,
-) -> PyResult<(RustArray, RustArray)> {
+    mut rng: Option<&mut Generator>,
+) -> PyResult<(RustArray, RustArray, Option<RustArray>)> {
     let (heads, d_k, width, s) = (options.heads, options.key_size, options.width(), options.scale());
     let rows = q.data.len() / width;
     let mut p = Vec::with_capacity(rows * heads * tokens);
     let mut h = Vec::with_capacity(rows * width);
+    let mut mask = rng.as_ref().map(|_| Vec::with_capacity(rows * heads * tokens));
     for n in 0..rows / tokens {
         let (mut p_n, mut h_n) = (Vec::with_capacity(heads), Vec::with_capacity(heads));
+        let mut mask_n = Vec::with_capacity(if mask.is_some() { heads } else { 0 });
         for i in 0..heads {
             let (q_ni, k_ni, v_ni) = (
                 head(q, n, i, tokens, d_k),
@@ -236,15 +281,30 @@ fn attend_forward(
                 scores = masked_causally(scores, tokens);
             }
             let p_ni = array_softmax(&scores);
-            h_n.push(matmul(&p_ni, &v_ni)?);
+            match rng.as_deref_mut() {
+                Some(rng) => {
+                    let m_ni = RustArray::from_matrix(
+                        rng.draw_bernoulli_mask(options.dropout, tokens * tokens),
+                        tokens,
+                        tokens,
+                    );
+                    h_n.push(matmul(&dropped(&p_ni, &m_ni, options.keep()), &v_ni)?);
+                    mask_n.push(m_ni);
+                }
+                None => h_n.push(matmul(&p_ni, &v_ni)?),
+            }
             p_n.push(p_ni);
         }
         extend_side_by_side(&mut p, &p_n);
         extend_side_by_side(&mut h, &h_n);
+        if let Some(mask) = mask.as_mut() {
+            extend_side_by_side(mask, &mask_n);
+        }
     }
     Ok((
         RustArray::from_matrix(p, rows, heads * tokens),
         RustArray::from_matrix(h, rows, width),
+        mask.map(|mask| RustArray::from_matrix(mask, rows, heads * tokens)),
     ))
 }
 
@@ -261,9 +321,10 @@ fn combine_backward(delta: &RustArray, wo: &RustArray) -> PyResult<RustArray> {
 }
 
 /// Per example and head, the softmax's and the products' gradients: `(dq, dk, dv)`, each
-/// `(N * T, h·d_k)`, from the forward pass's packed caches and `dh`.
+/// `(N * T, h·d_k)`, from the forward pass's packed caches and `dh`, and its mask if it drew one.
 fn attend_backward(
     caches: [&RustArray; 4],
+    mask: Option<&RustArray>,
     dh: &RustArray,
     tokens: usize,
     options: &AttentionOptions,
@@ -285,8 +346,15 @@ fn attend_backward(
                 head(v, n, i, tokens, d_k),
             );
             let (p_ni, dh_ni) = (head(p, n, i, tokens, tokens), head(dh, n, i, tokens, d_k));
-            let dp = matmul(&dh_ni, &v_ni.transpose())?;
-            dv_n.push(matmul(&p_ni.transpose(), &dh_ni)?);
+            let mut dp = matmul(&dh_ni, &v_ni.transpose())?;
+            match mask {
+                Some(mask) => {
+                    let (m_ni, keep) = (head(mask, n, i, tokens, tokens), options.keep());
+                    dv_n.push(matmul(&dropped(&p_ni, &m_ni, keep).transpose(), &dh_ni)?);
+                    dp = dropped(&dp, &m_ni, keep);
+                }
+                None => dv_n.push(matmul(&p_ni.transpose(), &dh_ni)?),
+            }
             let mut ds = Vec::with_capacity(tokens * tokens);
             for (dp_row, p_row) in dp.data.chunks_exact(tokens).zip(p_ni.data.chunks_exact(tokens)) {
                 let r = dp_row.iter().zip(p_row).fold(0.0, |acc, (&dpv, &pv)| acc + dpv * pv);
@@ -327,36 +395,71 @@ fn project_backward(gradients: [&RustArray; 3], weights: [&RustArray; 3]) -> PyR
     })
 }
 
-/// The forward pass: `(a, q, k, v, p, h)`, `a` in `x`'s shape, the caches as `(N * T, h·d_k)`
-/// rows and `p` as `(N * T, h·T)`.
-type ForwardResult = (RustArray, RustArray, RustArray, RustArray, RustArray, RustArray);
+/// The forward pass: `(a, q, k, v, p, h, mask)`, `a` in `x`'s shape, the caches as `(N * T, h·d_k)`
+/// rows, `p` as `(N * T, h·T)` and `mask`, when the pass dropped, as `p`.
+type ForwardResult = (
+    RustArray,
+    RustArray,
+    RustArray,
+    RustArray,
+    RustArray,
+    RustArray,
+    Option<RustArray>,
+);
+
+/// How a forward pass drops its weights: `dropout`, and in `training` the generator it draws from.
+struct Dropping<'a, 'py> {
+    dropout: f64,
+    training: bool,
+    rng: Option<PyRefMut<'py, Generator>>,
+    context: &'a str,
+}
+
+impl Dropping<'_, '_> {
+    /// The generator to draw from: `rng` in a training pass with `dropout > 0`, which needs one;
+    /// else `None`, and nothing is drawn.
+    fn generator(&mut self) -> PyResult<Option<&mut Generator>> {
+        if !(self.training && self.dropout > 0.0) {
+            return Ok(None);
+        }
+        match self.rng.as_deref_mut() {
+            Some(rng) => Ok(Some(rng)),
+            None => Err(PyValueError::new_err(format!(
+                "{} requires an rng to drop out in training, got dropout={} and none",
+                self.context, self.dropout
+            ))),
+        }
+    }
+}
 
 fn forward(
     x: &RustArray,
     projections: &Projections,
     heads: usize,
     causal: bool,
-    context: &str,
+    mut dropping: Dropping,
 ) -> PyResult<ForwardResult> {
-    let (d, options) = shapes(projections, heads, causal, context)?;
+    let context = dropping.context;
+    let (d, options) = shapes(projections, heads, causal, dropping.dropout, context)?;
     let (_, tokens) = examples_and_tokens(x, d, "x", context)?;
     let (q, k, v) = project(&token_rows(x, d), projections)?;
-    let (p, h) = attend_forward(&q, &k, &v, tokens, &options)?;
+    let (p, h, mask) = attend_forward(&q, &k, &v, tokens, &options, dropping.generator()?)?;
     let out = combine(&h, projections)?;
     let a = RustArray {
         data: out.data,
         shape: x.shape,
     };
-    Ok((a, q, k, v, p, h))
+    Ok((a, q, k, v, p, h, mask))
 }
 
 /// `AttentionArrayLayer.forward`: one example, `x` 1D of `T * d` values, `d` `bo`'s length, in
-/// `heads` heads across `bq`'s length, masked if `causal`. Returns `(a, q, k, v, p, h)`: `a` 1D,
-/// and what the backward pass reads, `q`, `k`, `v` and `h` `(T, h·d_k)`, `p` `(T, h·T)`.
+/// `heads` heads across `bq`'s length, masked if `causal`, its weights dropped from `rng` in
+/// `training` at `dropout > 0`. Returns `(a, q, k, v, p, h, mask)`: `a` 1D, and what the backward
+/// pass reads, `q`, `k`, `v` and `h` `(T, h·d_k)`, `p` `(T, h·T)` and `mask` as `p`, or `None`.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, heads, *, causal = false))]
-pub fn attention_forward(
+#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, heads, *, causal = false, dropout = 0.0, training = false, rng = None))]
+pub fn attention_forward<'py>(
     x: &RustArray,
     wq: &RustArray,
     bq: &RustArray,
@@ -368,6 +471,9 @@ pub fn attention_forward(
     bo: &RustArray,
     heads: usize,
     causal: bool,
+    dropout: f64,
+    training: bool,
+    rng: Option<PyRefMut<'py, Generator>>,
 ) -> PyResult<ForwardResult> {
     let context = "attention_forward";
     if !matches!(x.shape, Shape::Vector(_)) {
@@ -386,16 +492,23 @@ pub fn attention_forward(
         wo,
         bo,
     };
-    forward(x, &projections, heads, causal, context)
+    let dropping = Dropping {
+        dropout,
+        training,
+        rng,
+        context,
+    };
+    forward(x, &projections, heads, causal, dropping)
 }
 
 /// `AttentionArrayLayer.forward_batch`: `x` 2D (`batch, T * d`), each example
-/// `attention_forward`'s bits, masked if `causal`. Returns `(a, q, k, v, p, h)`, the caches over
-/// the batch's `(N * T)` rows, examples then tokens.
+/// `attention_forward`'s bits, masked if `causal`, dropped as it. Returns `(a, q, k, v, p, h,
+/// mask)`, the caches over the batch's `(N * T)` rows, examples then tokens; the mask's draws are
+/// the examples' in turn, so one example's are its batch of one's.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, heads, *, causal = false))]
-pub fn attention_forward_batch(
+#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, heads, *, causal = false, dropout = 0.0, training = false, rng = None))]
+pub fn attention_forward_batch<'py>(
     x: &RustArray,
     wq: &RustArray,
     bq: &RustArray,
@@ -407,6 +520,9 @@ pub fn attention_forward_batch(
     bo: &RustArray,
     heads: usize,
     causal: bool,
+    dropout: f64,
+    training: bool,
+    rng: Option<PyRefMut<'py, Generator>>,
 ) -> PyResult<ForwardResult> {
     let context = "attention_forward_batch";
     if !matches!(x.shape, Shape::Matrix(_, _)) {
@@ -425,15 +541,23 @@ pub fn attention_forward_batch(
         wo,
         bo,
     };
-    forward(x, &projections, heads, causal, context)
+    let dropping = Dropping {
+        dropout,
+        training,
+        rng,
+        context,
+    };
+    forward(x, &projections, heads, causal, dropping)
 }
 
 /// `AttentionArrayLayer._backward`: from `delta_batch` (`dl/dout`, 2D `batch, T * d`, or 1D for
 /// one example, whose caches are `attention_forward`'s) and the forward pass's `q`, `k`, `v` and
 /// `p`, in `heads` heads across `wq`'s rows, returns `(dx, dq, dk, dv)`: `dx`, the downstream, in
 /// `delta_batch`'s shape, and `dq`, `dk`, `dv` as `(N * T, h·d_k)` rows, which the gradients read.
+/// A pass that dropped takes its `mask` (the forward op's, shaped as `p`) and its `dropout`.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
+#[pyo3(signature = (delta_batch, wq, wk, wv, wo, q, k, v, p, heads, *, mask = None, dropout = 0.0))]
 pub fn attention_downstream_batch(
     delta_batch: &RustArray,
     wq: &RustArray,
@@ -445,6 +569,8 @@ pub fn attention_downstream_batch(
     v: &RustArray,
     p: &RustArray,
     heads: usize,
+    mask: Option<&RustArray>,
+    dropout: f64,
 ) -> PyResult<(RustArray, RustArray, RustArray, RustArray)> {
     let context = "attention_downstream_batch";
     let (width, d) = match wq.shape {
@@ -452,7 +578,7 @@ pub fn attention_downstream_batch(
         Shape::Vector(d) => (d, 1),
     };
     // causal or not, the same: the mask is in `p`
-    let options = AttentionOptions::new(heads, width, false, context)?;
+    let options = AttentionOptions::new(heads, width, false, dropout, context)?;
     require_weights([wq, wk, wv, wo], d, width, context)?;
     let (examples, tokens) = examples_and_tokens(delta_batch, d, "delta_batch", context)?;
     let rows = examples * tokens;
@@ -460,9 +586,12 @@ pub fn attention_downstream_batch(
         require_shape(cache, Shape::Matrix(rows, width), name, context)?;
     }
     require_shape(p, Shape::Matrix(rows, heads * tokens), "p", context)?;
+    if let Some(mask) = mask {
+        require_shape(mask, p.shape, "mask", context)?;
+    }
 
     let dh = combine_backward(&token_rows(delta_batch, d), wo)?;
-    let (dq, dk, dv) = attend_backward([q, k, v, p], &dh, tokens, &options)?;
+    let (dq, dk, dv) = attend_backward([q, k, v, p], mask, &dh, tokens, &options)?;
     let dx = project_backward([&dq, &dk, &dv], [wq, wk, wv])?;
     let dx = RustArray {
         data: dx.data,

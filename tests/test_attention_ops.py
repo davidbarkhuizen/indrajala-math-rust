@@ -13,16 +13,23 @@ the crate's, so numpy is the reference only where no product is involved, and in
 At one head the ops are also pinned to the single-head ops' outputs, recorded before the multi-head
 change, which the unmasked ops still compute after the causal mask (indrajala-ml's sequence task
 workplan, D7). The composition masks its scores with numpy, exact, before `array_softmax`.
+
+Dropout on the weights (indrajala-ml's attention-dropout workplan, D3-D5): the mask is numpy's
+`default_rng(seed).random((N, h, T, T)) >= dropout`, packed as `p`, and the passes are the
+composition with `P~ = P * M / keep` (numpy, exact) in place of `P` in `H` and `dV`, and `dP`
+times `M / keep`. Without training, and at dropout 0, nothing is drawn and the bits are as before.
 """
 
 import hashlib
 import math
+from typing import Any
 
 import numpy as np
 import pytest
 
 from indrajala_math_rust import (
     Array,
+    Generator,
     affine_forward_batch,
     array_softmax,
     attention_accumulate_gradient_batch,
@@ -144,7 +151,7 @@ def _composed_forward(c: dict[str, np.ndarray], tokens: int, heads: int, causal:
 
 def _forward(c: dict[str, np.ndarray], heads: int, causal: bool = False) -> dict[str, np.ndarray]:
     result = attention_forward_batch(_array(c["x"]), *_parameters(c), heads=heads, causal=causal)
-    return {name: _numpy(array) for name, array in zip(["a", "q", "k", "v", "p", "h"], result)}
+    return {name: _numpy(array) for name, array in zip(["a", "q", "k", "v", "p", "h"], result[:6])}
 
 
 def _composed_backward(
@@ -220,7 +227,7 @@ def test_one_examples_forward_pass_is_its_batch_rows(
     batch = _forward(c, heads, causal)
     for i in range(examples):
         result = attention_forward(_array(c["x"][i]), *_parameters(c), heads=heads, causal=causal)
-        single = {name: _numpy(array) for name, array in zip(["a", "q", "k", "v", "p", "h"], result)}
+        single = {name: _numpy(array) for name, array in zip(["a", "q", "k", "v", "p", "h"], result[:6])}
         assert _bits(single["a"]) == _bits(batch["a"][i])
         for name in ["q", "k", "v", "p", "h"]:
             assert single[name].shape == (tokens, batch[name].shape[1]), name
@@ -270,7 +277,7 @@ def _digest(arrays: list[np.ndarray]) -> str:
 
 def _digests(c: dict[str, np.ndarray], x: np.ndarray, delta: np.ndarray, one: bool) -> list[str]:
     forward = attention_forward if one else attention_forward_batch
-    f = dict(zip(["a", "q", "k", "v", "p", "h"], (_numpy(a) for a in forward(_array(x), *_parameters(c), heads=1))))
+    f = dict(zip(["a", "q", "k", "v", "p", "h"], (_numpy(a) for a in forward(_array(x), *_parameters(c), heads=1)[:6])))
     b = _backward({**c, "delta": delta}, f, 1)
     grads = _gradients({**c, "x": x, "delta": delta}, f, b)
     return [_digest(list(f.values())), _digest(list(b.values())), _digest(grads)]
@@ -433,7 +440,7 @@ def test_the_attention_ops_refuse_shapes_that_dont_fit():
 def test_one_examples_backward_is_a_batch_of_ones(tokens: int, features: int, heads: int, key_size: int):
     c = _case(1, tokens, features, heads, key_size)
     x, delta = c["x"][0], c["delta"][0]
-    _, q, k, v, p, h = attention_forward(_array(x), *_parameters(c), heads=heads)
+    _, q, k, v, p, h, _ = attention_forward(_array(x), *_parameters(c), heads=heads)
     weights = [_array(c[name]) for name in ("wq", "wk", "wv", "wo")]
     single = attention_downstream_batch(
         _array(delta), weights[0], weights[1], weights[2], weights[3], q, k, v, p, heads
@@ -449,3 +456,169 @@ def test_one_examples_backward_is_a_batch_of_ones(tokens: int, features: int, he
     many = _gradients(c, f, batch)
     for i, name in enumerate(NAMES):
         assert _bits(_numpy(one[i])) == _bits(many[i]), name
+
+
+# dropout on the weights (the attention-dropout workplan, stage 4)
+
+DROPOUT = 0.3
+FORWARD = ["a", "q", "k", "v", "p", "h", "mask"]
+
+
+def _dropping_forward(
+    c: dict[str, np.ndarray], heads: int, causal: bool, seed: int, one: bool = False
+) -> dict[str, Any]:
+    forward = attention_forward if one else attention_forward_batch
+    x = c["x"][0] if one else c["x"]
+    rng = Generator(seed)
+    result = forward(_array(x), *_parameters(c), heads=heads, causal=causal, dropout=DROPOUT, training=True, rng=rng)
+    out: dict[str, Any] = {name: None if array is None else _numpy(array) for name, array in zip(FORWARD, result)}
+    out["rng"] = rng.state
+    return out
+
+
+def _packed_mask(examples: int, tokens: int, heads: int, seed: int) -> np.ndarray:
+    # numpy's (N, h, T, T) draw, packed as p: (N * T, h * T), head i in columns i * T..
+    mask = (np.random.default_rng(seed).random((examples, heads, tokens, tokens)) >= DROPOUT).astype(np.float64)
+    return mask.transpose(0, 2, 1, 3).reshape(examples * tokens, heads * tokens)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("examples,tokens,features,heads,key_size", SHAPES, ids=map(_id, SHAPES))
+def test_without_training_or_at_dropout_0_nothing_is_drawn_and_the_bits_are_as_before(
+    examples: int, tokens: int, features: int, heads: int, key_size: int, causal: bool
+):
+    c = _case(examples, tokens, features, heads, key_size)
+    before = _forward(c, heads, causal)
+    for dropout, training in [(DROPOUT, False), (0.0, True)]:
+        rng = Generator(4)
+        state = rng.state
+        result = attention_forward_batch(
+            _array(c["x"]), *_parameters(c), heads=heads, causal=causal, dropout=dropout, training=training, rng=rng
+        )
+        assert result[6] is None and rng.state == state
+        for name, array in zip(FORWARD, result[:6]):
+            assert _bits(_numpy(array)) == _bits(before[name]), name
+        b = attention_downstream_batch(
+            _array(c["delta"]),
+            *(_array(c[name]) for name in ("wq", "wk", "wv", "wo")),
+            *(_array(before[name]) for name in ("q", "k", "v", "p")),
+            heads=heads,
+            mask=None,
+            dropout=dropout,
+        )
+        for name, array in zip(["dx", "dq", "dk", "dv"], b):
+            assert _bits(_numpy(array)) == _bits(_backward(c, before, heads)[name]), name
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("examples,tokens,features,heads,key_size", SHAPES, ids=map(_id, SHAPES))
+def test_the_mask_is_numpys_row_major_draw_every_entry_drawn_packed_as_p(
+    examples: int, tokens: int, features: int, heads: int, key_size: int, causal: bool
+):
+    c = _case(examples, tokens, features, heads, key_size)
+    out = _dropping_forward(c, heads, causal, seed=7)
+    assert _bits(out["mask"]) == _bits(_packed_mask(examples, tokens, heads, 7))
+    # exactly N * h * T * T draws: the generator is where numpy's one draw leaves it
+    after = np.random.default_rng(7)
+    after.random(examples * heads * tokens * tokens)
+    assert out["rng"] == after.bit_generator.state
+
+
+def _dropped_composition(
+    c: dict[str, np.ndarray], f: dict[str, np.ndarray], tokens: int, heads: int
+) -> dict[str, np.ndarray]:
+    # the forward pass's h and a, and the backward pass, with P~ = P * M / keep (numpy, exact)
+    d, width = c["bo"].shape[0], c["bq"].shape[0]
+    d_k, s, keep = width // heads, math.sqrt(width // heads), 1.0 - DROPOUT
+    dh = _numpy(layer_downstream_batch(_array(c["wo"]), _array(c["delta"].reshape(-1, d))))
+    h: list[list[np.ndarray]] = []
+    dq: list[list[np.ndarray]] = []
+    dk: list[list[np.ndarray]] = []
+    dv: list[list[np.ndarray]] = []
+    for n in range(c["x"].shape[0]):
+        for blocks in (h, dq, dk, dv):
+            blocks.append([])
+        for i in range(heads):
+            q_ni, k_ni, v_ni, dh_ni = (_array(_head(m, n, i, tokens, d_k)) for m in (f["q"], f["k"], f["v"], dh))
+            p, m = _head(f["p"], n, i, tokens, tokens), _head(f["mask"], n, i, tokens, tokens)
+            dropped = _array(p * m / keep)
+            h[n].append(_numpy(dropped @ v_ni))
+            dp = _numpy(dh_ni @ v_ni.T) * m / keep
+            dv[n].append(_numpy(dropped.T @ dh_ni))
+            r = _numpy(sum_axis0(_array((dp * p).T)))
+            ds = _array(p * (dp - r[:, np.newaxis]))
+            dq[n].append(_numpy((ds @ k_ni) / s))
+            dk[n].append(_numpy((ds.T @ q_ni) / s))
+    h_rows = _side_by_side(h)
+    a = _numpy(affine_forward_batch(_array(c["wo"]), _array(h_rows), _array(c["bo"])))
+    dq_rows, dk_rows, dv_rows = _side_by_side(dq), _side_by_side(dk), _side_by_side(dv)
+    dx = (
+        layer_downstream_batch(_array(c["wq"]), _array(dq_rows))
+        + layer_downstream_batch(_array(c["wk"]), _array(dk_rows))
+    ) + layer_downstream_batch(_array(c["wv"]), _array(dv_rows))
+    return {
+        "a": a.reshape(c["x"].shape),
+        "h": h_rows,
+        "dx": _numpy(dx).reshape(c["x"].shape),
+        "dq": dq_rows,
+        "dk": dk_rows,
+        "dv": dv_rows,
+    }
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("examples,tokens,features,heads,key_size", SHAPES, ids=map(_id, SHAPES))
+def test_a_dropping_pass_is_the_composition_with_p_tilde(
+    examples: int, tokens: int, features: int, heads: int, key_size: int, causal: bool
+):
+    c = _case(examples, tokens, features, heads, key_size)
+    out = _dropping_forward(c, heads, causal, seed=7)
+    plain = _forward(c, heads, causal)
+    # project and the softmax as without dropout; attend's H and combine's a from P~
+    for name in ["q", "k", "v", "p"]:
+        assert _bits(out[name]) == _bits(plain[name]), name
+    composed = _dropped_composition(c, out, tokens, heads)
+    for name in ["a", "h"]:
+        assert _bits(out[name]) == _bits(composed[name]), name
+    b = attention_downstream_batch(
+        _array(c["delta"]),
+        *(_array(c[name]) for name in ("wq", "wk", "wv", "wo")),
+        *(_array(out[name]) for name in ("q", "k", "v", "p")),
+        heads=heads,
+        mask=_array(out["mask"]),
+        dropout=DROPOUT,
+    )
+    for name, array in zip(["dx", "dq", "dk", "dv"], b):
+        assert _bits(_numpy(array)) == _bits(composed[name]), name
+
+
+@pytest.mark.parametrize("examples,tokens,features,heads,key_size", SHAPES, ids=map(_id, SHAPES))
+def test_one_examples_dropping_pass_is_its_batch_of_ones(
+    examples: int, tokens: int, features: int, heads: int, key_size: int
+):
+    c = _case(1, tokens, features, heads, key_size)
+    one, batch = _dropping_forward(c, heads, True, seed=3, one=True), _dropping_forward(c, heads, True, seed=3)
+    assert _bits(one["a"]) == _bits(batch["a"][0])
+    for name in ["p", "h", "mask"]:
+        assert _bits(one[name]) == _bits(batch[name]), name
+    assert one["rng"] == batch["rng"]
+
+
+def test_the_dropping_ops_refuse_a_dropout_outside_0_to_1_a_missing_rng_and_a_misshapen_mask():
+    c = _case(2, 3, 4, 2, 2)
+    x = _array(c["x"])
+    for dropout in (-0.1, 1.0, math.nan):
+        with pytest.raises(ValueError, match=r"attention_forward_batch requires a dropout in \[0, 1\)"):
+            attention_forward_batch(x, *_parameters(c), heads=2, dropout=dropout)
+    with pytest.raises(ValueError, match="attention_forward requires an rng to drop out in training"):
+        attention_forward(_array(c["x"][0]), *_parameters(c), heads=2, dropout=0.1, training=True)
+    f = _dropping_forward(c, 2, False, seed=1)
+    args = (
+        _array(c["delta"]),
+        *(_array(c[name]) for name in ("wq", "wk", "wv", "wo")),
+        *(_array(f[name]) for name in ("q", "k", "v", "p")),
+    )
+    with pytest.raises(ValueError, match=r"attention_downstream_batch requires mask of shape Matrix\(6, 6\)"):
+        attention_downstream_batch(*args, heads=2, mask=_array(f["mask"][:, :3]), dropout=DROPOUT)
+    with pytest.raises(ValueError, match=r"attention_downstream_batch requires a dropout in \[0, 1\)"):
+        attention_downstream_batch(*args, heads=2, mask=_array(f["mask"]), dropout=1.0)

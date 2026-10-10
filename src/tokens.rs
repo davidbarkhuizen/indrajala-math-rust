@@ -1,7 +1,8 @@
 //! The token layers that aren't attention: a patch model's parameter-free ones (indrajala-ml's
 //! layer-norm and attention workplan; its README, Layer norm and attention) and a sequence model's
-//! `Embedding` (its sequence task workplan, D5). One Rust function per method of
-//! `PatchesArrayLayer`, `TokenMeanArrayLayer` and `EmbeddingArrayLayer` in
+//! `Embedding` (its sequence task workplan, D5), and the token-wise dropout (its attention-dropout
+//! workplan, D2). One Rust function per method of `PatchesArrayLayer`, `TokenMeanArrayLayer`,
+//! `EmbeddingArrayLayer` and `TokenDropoutArrayLayer` in
 //! `indrajala_ml/model/layers/numpy/token_array_layer.py`, as `fused.rs` is for `array_layer.py`.
 //! A token sequence of `T` tokens of `d` features is flat and token-major, index `t * d + j`. Each
 //! function takes one example (1D) or a batch (2D, one example per row) and returns the same rank.
@@ -11,6 +12,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::array::{RustArray, Shape};
+use crate::generator::Generator;
 
 /// `(rows, width)` of one example (1 row) or a batch.
 fn rows_and_width(x: &RustArray) -> (usize, usize) {
@@ -261,4 +263,55 @@ pub fn embedding_accumulate_gradient(delta: &RustArray, x: &RustArray, grad_tabl
         data,
         shape: grad_table.shape,
     })
+}
+
+/// `drop_probability` checked to be in `[0, 1)`; returns `1 - drop_probability`, the keep divisor.
+fn keep_probability(drop_probability: f64, context: &str) -> PyResult<f64> {
+    if !(0.0..1.0).contains(&drop_probability) {
+        return Err(PyValueError::new_err(format!(
+            "{context} requires a drop_probability in [0, 1), got {drop_probability}"
+        )));
+    }
+    Ok(1.0 - drop_probability)
+}
+
+/// `x * mask / keep`, elementwise, in that grouping: numpy's `X * M / keep`.
+fn masked(x: &RustArray, mask: &RustArray, keep: f64) -> RustArray {
+    RustArray {
+        data: x.data.iter().zip(&mask.data).map(|(&xv, &mv)| xv * mv / keep).collect(),
+        shape: x.shape,
+    }
+}
+
+/// `TokenDropoutArrayLayer.forward_batch` in training: a mask of `x`'s shape drawn from `rng` in
+/// C order (example, token, feature), `u >= drop_probability`, then `x * mask / keep`. One
+/// example (1D) or a batch (2D); an example's draws are its batch of one's. Returns `(a, mask)`.
+/// In inference the layer passes its input on and calls nothing.
+#[pyfunction]
+pub fn token_dropout_forward(
+    x: &RustArray,
+    drop_probability: f64,
+    mut rng: PyRefMut<'_, Generator>,
+) -> PyResult<(RustArray, RustArray)> {
+    let keep = keep_probability(drop_probability, "token_dropout_forward")?;
+    let mask = RustArray {
+        data: rng.draw_bernoulli_mask(drop_probability, x.data.len()),
+        shape: x.shape,
+    };
+    Ok((masked(x, &mask, keep), mask))
+}
+
+/// `TokenDropoutArrayLayer`'s backward pass after a training forward: `delta * mask / keep`, the
+/// downstream, `mask` `token_dropout_forward`'s.
+#[pyfunction]
+pub fn token_dropout_downstream(delta: &RustArray, mask: &RustArray, drop_probability: f64) -> PyResult<RustArray> {
+    let context = "token_dropout_downstream";
+    let keep = keep_probability(drop_probability, context)?;
+    if delta.shape != mask.shape {
+        return Err(PyValueError::new_err(format!(
+            "{context} requires delta and mask of one shape, got {:?} and {:?}",
+            delta.shape, mask.shape
+        )));
+    }
+    Ok(masked(delta, mask, keep))
 }

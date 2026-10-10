@@ -45,8 +45,8 @@ use linalg::{matmul_threads_for, outer, set_kernel_overrides, set_matmul_threadi
 use mnist::decode_mnist_pixels;
 use random::{bernoulli_mask, seed, seed_at_import, uniform};
 use tokens::{
-    embedding_accumulate_gradient, embedding_forward, patches_downstream, patches_forward, token_mean_downstream,
-    token_mean_forward,
+    embedding_accumulate_gradient, embedding_forward, patches_downstream, patches_forward, token_dropout_downstream,
+    token_dropout_forward, token_mean_downstream, token_mean_forward,
 };
 use ufuncs::{
     argmax, array_dropout_mask, array_relu, array_relu_mask, array_sigmoid_mask, array_softmax, exp, sum_axis0,
@@ -136,6 +136,8 @@ fn indrajala_math_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(token_mean_downstream, m)?)?;
     m.add_function(wrap_pyfunction!(embedding_forward, m)?)?;
     m.add_function(wrap_pyfunction!(embedding_accumulate_gradient, m)?)?;
+    m.add_function(wrap_pyfunction!(token_dropout_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(token_dropout_downstream, m)?)?;
     m.add_function(wrap_pyfunction!(layer_norm_forward, m)?)?;
     m.add_function(wrap_pyfunction!(layer_norm_forward_batch, m)?)?;
     m.add_function(wrap_pyfunction!(layer_norm_downstream_batch, m)?)?;
