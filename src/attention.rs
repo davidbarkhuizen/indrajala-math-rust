@@ -45,6 +45,21 @@
 //! same elementwise expression and so the same bits. Without `training`, and at `dropout = 0`,
 //! nothing is drawn, the mask is `None` and every op computes what it did before dropout.
 //!
+//! Rotary positions (indrajala-ml's rotary-positions workplan, D3-D5): a pass given `cos` and
+//! `sin`, `(T, d_k / 2)` each, row `t` token `t`'s angles, ends project by rotating each head's
+//! `Q` and `K`, after the biases, feature `j < d_k / 2` paired with `j + d_k / 2`:
+//!
+//! ```text
+//! project   q'_j = q_j c - q_{j+d_k/2} s;  q'_{j+d_k/2} = q_j s + q_{j+d_k/2} c    (k likewise)
+//! backward  dq_j = dq'_j c + dq'_{j+d_k/2} s;  dq_{j+d_k/2} = dq'_{j+d_k/2} c - dq'_j s
+//! ```
+//!
+//! each entry two products and a sum, numpy's elementwise expressions, so the same bits. The
+//! caches `q` and `k` are the rotated ones, which attend reads; the downstream op rotates `dQ` and
+//! `dK` back before project's products and returns them so, the gradients of the unrotated `Q` and
+//! `K`, which the gradient op takes as before, so it needs no table. `V` isn't rotated. Without a
+//! table every op computes what it did before rotation.
+//!
 //! The caches are packed: `Q`, `K`, `V`, `H` and their gradients `(N * T, h·d_k)`, head `i` in
 //! columns `i·d_k..`, and `P` `(N * T, h·T)`, head `i` in columns `i·T..`.
 
@@ -114,6 +129,78 @@ struct Projections<'a> {
     bv: &'a RustArray,
     wo: &'a RustArray,
     bo: &'a RustArray,
+}
+
+/// A rotary pass's table (indrajala-ml's rotary-positions workplan, D4, D5): `cos` and `sin`,
+/// `(T, d_k / 2)` each, row `t` token `t`'s angles, computed by the caller.
+#[derive(Clone, Copy)]
+struct Rotation<'a> {
+    cos: &'a RustArray,
+    sin: &'a RustArray,
+}
+
+impl<'a> Rotation<'a> {
+    /// The table from the ops' `cos` and `sin` keywords: both or neither, each `(T, d_k / 2)` with
+    /// `d_k` even.
+    fn new(
+        cos: Option<&'a RustArray>,
+        sin: Option<&'a RustArray>,
+        tokens: usize,
+        options: &AttentionOptions,
+        context: &str,
+    ) -> PyResult<Option<Self>> {
+        let (cos, sin) = match (cos, sin) {
+            (None, None) => return Ok(None),
+            (Some(cos), Some(sin)) => (cos, sin),
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "{context} requires both cos and sin to rotate, or neither"
+                )));
+            }
+        };
+        if !options.key_size.is_multiple_of(2) {
+            return Err(PyValueError::new_err(format!(
+                "{context} requires an even head size to rotate, got d_k={}",
+                options.key_size
+            )));
+        }
+        let shape = Shape::Matrix(tokens, options.key_size / 2);
+        require_shape(cos, shape, "cos", context)?;
+        require_shape(sin, shape, "sin", context)?;
+        Ok(Some(Rotation { cos, sin }))
+    }
+
+    /// The packed `(N * T, h·d_k)` rows `m`, each head's features `j` and `j + d_k / 2` rotated by
+    /// the row's token's angles: `(a c - b s, a s + b c)`; or back, `inverse`, by the transpose:
+    /// `(a c + b s, b c - a s)`. Each entry two products and a sum, as numpy's elementwise
+    /// expressions, so the same bits.
+    fn rotated(&self, m: &RustArray, tokens: usize, options: &AttentionOptions, inverse: bool) -> RustArray {
+        let (d_k, width) = (options.key_size, options.width());
+        let half = d_k / 2;
+        let mut data = m.data.clone();
+        for (r, (row, out)) in m.data.chunks_exact(width).zip(data.chunks_exact_mut(width)).enumerate() {
+            let t = r % tokens;
+            let (cos, sin) = (
+                &self.cos.data[t * half..(t + 1) * half],
+                &self.sin.data[t * half..(t + 1) * half],
+            );
+            for i in 0..options.heads {
+                let (first, second) = out[i * d_k..(i + 1) * d_k].split_at_mut(half);
+                let (a_row, b_row) = row[i * d_k..(i + 1) * d_k].split_at(half);
+                for j in 0..half {
+                    let (a, b, c, s) = (a_row[j], b_row[j], cos[j], sin[j]);
+                    if inverse {
+                        first[j] = a * c + b * s;
+                        second[j] = b * c - a * s;
+                    } else {
+                        first[j] = a * c - b * s;
+                        second[j] = a * s + b * c;
+                    }
+                }
+            }
+        }
+        RustArray { data, shape: m.shape }
+    }
 }
 
 fn require_shape(array: &RustArray, shape: Shape, name: &str, context: &str) -> PyResult<()> {
@@ -243,12 +330,26 @@ fn divided(m: RustArray, s: f64) -> RustArray {
 
 // project, attend, combine: the forward pass's blocks
 
-/// `Q`, `K`, `V` from the `(N * T, d)` input rows: each the product, then the bias, over all heads.
-fn project(rows: &RustArray, projections: &Projections) -> PyResult<(RustArray, RustArray, RustArray)> {
+/// `Q`, `K`, `V` from the `(N * T, d)` input rows: each the product, then the bias, over all heads;
+/// with a `rotation`, `Q` and `K` then rotated.
+fn project(
+    rows: &RustArray,
+    projections: &Projections,
+    rotation: Option<Rotation>,
+    tokens: usize,
+    options: &AttentionOptions,
+) -> PyResult<(RustArray, RustArray, RustArray)> {
     let q = affine_forward_batch(projections.wq, rows, projections.bq)?;
     let k = affine_forward_batch(projections.wk, rows, projections.bk)?;
     let v = affine_forward_batch(projections.wv, rows, projections.bv)?;
-    Ok((q, k, v))
+    Ok(match rotation {
+        Some(rotation) => (
+            rotation.rotated(&q, tokens, options, false),
+            rotation.rotated(&k, tokens, options, false),
+            v,
+        ),
+        None => (q, k, v),
+    })
 }
 
 /// Per example and head, the weights and the weighted sum: `(p, h, mask)`, `p` `(N * T, h·T)` and
@@ -438,11 +539,13 @@ fn forward(
     heads: usize,
     causal: bool,
     mut dropping: Dropping,
+    table: (Option<&RustArray>, Option<&RustArray>),
 ) -> PyResult<ForwardResult> {
     let context = dropping.context;
     let (d, options) = shapes(projections, heads, causal, dropping.dropout, context)?;
     let (_, tokens) = examples_and_tokens(x, d, "x", context)?;
-    let (q, k, v) = project(&token_rows(x, d), projections)?;
+    let rotation = Rotation::new(table.0, table.1, tokens, &options, context)?;
+    let (q, k, v) = project(&token_rows(x, d), projections, rotation, tokens, &options)?;
     let (p, h, mask) = attend_forward(&q, &k, &v, tokens, &options, dropping.generator()?)?;
     let out = combine(&h, projections)?;
     let a = RustArray {
@@ -454,11 +557,12 @@ fn forward(
 
 /// `AttentionArrayLayer.forward`: one example, `x` 1D of `T * d` values, `d` `bo`'s length, in
 /// `heads` heads across `bq`'s length, masked if `causal`, its weights dropped from `rng` in
-/// `training` at `dropout > 0`. Returns `(a, q, k, v, p, h, mask)`: `a` 1D, and what the backward
+/// `training` at `dropout > 0`, its queries and keys rotated by `cos` and `sin` when given.
+/// Returns `(a, q, k, v, p, h, mask)`: `a` 1D, and what the backward
 /// pass reads, `q`, `k`, `v` and `h` `(T, h·d_k)`, `p` `(T, h·T)` and `mask` as `p`, or `None`.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, heads, *, causal = false, dropout = 0.0, training = false, rng = None))]
+#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, heads, *, causal = false, dropout = 0.0, training = false, rng = None, cos = None, sin = None))]
 pub fn attention_forward<'py>(
     x: &RustArray,
     wq: &RustArray,
@@ -474,6 +578,8 @@ pub fn attention_forward<'py>(
     dropout: f64,
     training: bool,
     rng: Option<PyRefMut<'py, Generator>>,
+    cos: Option<&RustArray>,
+    sin: Option<&RustArray>,
 ) -> PyResult<ForwardResult> {
     let context = "attention_forward";
     if !matches!(x.shape, Shape::Vector(_)) {
@@ -498,16 +604,16 @@ pub fn attention_forward<'py>(
         rng,
         context,
     };
-    forward(x, &projections, heads, causal, dropping)
+    forward(x, &projections, heads, causal, dropping, (cos, sin))
 }
 
 /// `AttentionArrayLayer.forward_batch`: `x` 2D (`batch, T * d`), each example
-/// `attention_forward`'s bits, masked if `causal`, dropped as it. Returns `(a, q, k, v, p, h,
+/// `attention_forward`'s bits, masked if `causal`, dropped and rotated as it. Returns `(a, q, k, v, p, h,
 /// mask)`, the caches over the batch's `(N * T)` rows, examples then tokens; the mask's draws are
 /// the examples' in turn, so one example's are its batch of one's.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, heads, *, causal = false, dropout = 0.0, training = false, rng = None))]
+#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, heads, *, causal = false, dropout = 0.0, training = false, rng = None, cos = None, sin = None))]
 pub fn attention_forward_batch<'py>(
     x: &RustArray,
     wq: &RustArray,
@@ -523,6 +629,8 @@ pub fn attention_forward_batch<'py>(
     dropout: f64,
     training: bool,
     rng: Option<PyRefMut<'py, Generator>>,
+    cos: Option<&RustArray>,
+    sin: Option<&RustArray>,
 ) -> PyResult<ForwardResult> {
     let context = "attention_forward_batch";
     if !matches!(x.shape, Shape::Matrix(_, _)) {
@@ -547,17 +655,18 @@ pub fn attention_forward_batch<'py>(
         rng,
         context,
     };
-    forward(x, &projections, heads, causal, dropping)
+    forward(x, &projections, heads, causal, dropping, (cos, sin))
 }
 
 /// `AttentionArrayLayer._backward`: from `delta_batch` (`dl/dout`, 2D `batch, T * d`, or 1D for
 /// one example, whose caches are `attention_forward`'s) and the forward pass's `q`, `k`, `v` and
 /// `p`, in `heads` heads across `wq`'s rows, returns `(dx, dq, dk, dv)`: `dx`, the downstream, in
 /// `delta_batch`'s shape, and `dq`, `dk`, `dv` as `(N * T, h·d_k)` rows, which the gradients read.
-/// A pass that dropped takes its `mask` (the forward op's, shaped as `p`) and its `dropout`.
+/// A pass that dropped takes its `mask` (the forward op's, shaped as `p`) and its `dropout`; one
+/// that rotated takes its `cos` and `sin`, and returns `dq` and `dk` rotated back.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (delta_batch, wq, wk, wv, wo, q, k, v, p, heads, *, mask = None, dropout = 0.0))]
+#[pyo3(signature = (delta_batch, wq, wk, wv, wo, q, k, v, p, heads, *, mask = None, dropout = 0.0, cos = None, sin = None))]
 pub fn attention_downstream_batch(
     delta_batch: &RustArray,
     wq: &RustArray,
@@ -571,6 +680,8 @@ pub fn attention_downstream_batch(
     heads: usize,
     mask: Option<&RustArray>,
     dropout: f64,
+    cos: Option<&RustArray>,
+    sin: Option<&RustArray>,
 ) -> PyResult<(RustArray, RustArray, RustArray, RustArray)> {
     let context = "attention_downstream_batch";
     let (width, d) = match wq.shape {
@@ -589,9 +700,18 @@ pub fn attention_downstream_batch(
     if let Some(mask) = mask {
         require_shape(mask, p.shape, "mask", context)?;
     }
+    let rotation = Rotation::new(cos, sin, tokens, &options, context)?;
 
     let dh = combine_backward(&token_rows(delta_batch, d), wo)?;
     let (dq, dk, dv) = attend_backward([q, k, v, p], mask, &dh, tokens, &options)?;
+    // project's backward starts by rotating back: the gradients of the unrotated Q and K
+    let (dq, dk) = match rotation {
+        Some(rotation) => (
+            rotation.rotated(&dq, tokens, &options, true),
+            rotation.rotated(&dk, tokens, &options, true),
+        ),
+        None => (dq, dk),
+    };
     let dx = project_backward([&dq, &dk, &dv], [wq, wk, wv])?;
     let dx = RustArray {
         data: dx.data,
