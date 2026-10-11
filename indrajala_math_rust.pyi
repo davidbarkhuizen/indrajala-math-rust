@@ -292,6 +292,8 @@ def attention_forward(
     dropout: float = 0.0,
     training: bool = False,
     rng: Generator | None = None,
+    cos: Array | None = None,
+    sin: Array | None = None,
 ) -> tuple[Array, Array, Array, Array, Array, Array, Array | None]: ...
 def attention_forward_batch(
     x: Array,
@@ -309,6 +311,8 @@ def attention_forward_batch(
     dropout: float = 0.0,
     training: bool = False,
     rng: Generator | None = None,
+    cos: Array | None = None,
+    sin: Array | None = None,
 ) -> tuple[Array, Array, Array, Array, Array, Array, Array | None]: ...
 def attention_downstream_batch(
     delta_batch: Array,
@@ -324,6 +328,8 @@ def attention_downstream_batch(
     *,
     mask: Array | None = None,
     dropout: float = 0.0,
+    cos: Array | None = None,
+    sin: Array | None = None,
 ) -> tuple[Array, Array, Array, Array]: ...
 def attention_accumulate_gradient_batch(
     delta_batch: Array,

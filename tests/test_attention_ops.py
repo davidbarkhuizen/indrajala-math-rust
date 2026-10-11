@@ -622,3 +622,149 @@ def test_the_dropping_ops_refuse_a_dropout_outside_0_to_1_a_missing_rng_and_a_mi
         attention_downstream_batch(*args, heads=2, mask=_array(f["mask"][:, :3]), dropout=DROPOUT)
     with pytest.raises(ValueError, match=r"attention_downstream_batch requires a dropout in \[0, 1\)"):
         attention_downstream_batch(*args, heads=2, mask=_array(f["mask"]), dropout=1.0)
+
+
+# Rotary positions (indrajala-ml's rotary-positions workplan, D3-D5): the forward ops given `cos`
+# and `sin` are the composition with Q and K rotated by numpy, exact, after project; the downstream
+# is the composition from the rotated caches, its dq and dk rotated back before project's products.
+
+ROTARY = [shape for shape in SHAPES if shape[4] % 2 == 0]
+
+
+def _table(tokens: int, key_size: int, base: float = 100.0) -> tuple[np.ndarray, np.ndarray]:
+    # indrajala-ml's rotary_table: math's cos and sin of t * theta_j, (T, d_k / 2) each
+    angles = [[t * base ** (-2 * j / key_size) for j in range(key_size // 2)] for t in range(tokens)]
+    return (
+        np.array([[math.cos(a) for a in row] for row in angles]).reshape(tokens, key_size // 2),
+        np.array([[math.sin(a) for a in row] for row in angles]).reshape(tokens, key_size // 2),
+    )
+
+
+def _rotated(rows: np.ndarray, table: tuple[np.ndarray, np.ndarray], heads: int, inverse: bool = False) -> np.ndarray:
+    # (N * T, h * d_k) rows, each head's features j and j + d_k / 2 rotated by the row's token's angles
+    tokens, half = table[0].shape
+    x = rows.reshape(-1, tokens, heads, 2 * half)
+    a, b = x[..., :half], x[..., half:]
+    c, s = table[0][:, np.newaxis, :], table[1][:, np.newaxis, :]
+    pairs = (a * c + b * s, b * c - a * s) if inverse else (a * c - b * s, a * s + b * c)
+    return np.concatenate(pairs, axis=-1).reshape(rows.shape)
+
+
+def _rotary_forward(
+    c: dict[str, np.ndarray], tokens: int, heads: int, causal: bool, one: bool = False
+) -> dict[str, np.ndarray]:
+    cos, sin = _table(tokens, c["bq"].shape[0] // heads)
+    x, forward = (c["x"][0], attention_forward) if one else (c["x"], attention_forward_batch)
+    result = forward(_array(x), *_parameters(c), heads=heads, causal=causal, cos=_array(cos), sin=_array(sin))
+    return {name: _numpy(array) for name, array in zip(["a", "q", "k", "v", "p", "h"], result[:6])}
+
+
+def _composed_rotary_forward(c: dict[str, np.ndarray], tokens: int, heads: int, causal: bool) -> dict[str, np.ndarray]:
+    # project, then Q and K rotated, then attend and combine as _composed_forward's
+    d, width = c["bo"].shape[0], c["bq"].shape[0]
+    d_k = width // heads
+    table = _table(tokens, d_k)
+    rows = _array(c["x"].reshape(-1, d))
+    q, k, v = (_numpy(affine_forward_batch(_array(c["w" + n]), rows, _array(c["b" + n]))) for n in "qkv")
+    q, k = _rotated(q, table, heads), _rotated(k, table, heads)
+    p: list[list[np.ndarray]] = []
+    h: list[list[np.ndarray]] = []
+    for n in range(c["x"].shape[0]):
+        p.append([])
+        h.append([])
+        for i in range(heads):
+            q_ni, k_ni, v_ni = (_array(_head(m, n, i, tokens, d_k)) for m in (q, k, v))
+            scores = (q_ni @ k_ni.T) / math.sqrt(d_k)
+            p_ni = array_softmax(_masked(scores, tokens) if causal else scores)
+            p[n].append(_numpy(p_ni))
+            h[n].append(_numpy(p_ni @ v_ni))
+    h_rows = _side_by_side(h)
+    a = _numpy(affine_forward_batch(_array(c["wo"]), _array(h_rows), _array(c["bo"])))
+    return {"a": a.reshape(c["x"].shape), "q": q, "k": k, "v": v, "p": _side_by_side(p), "h": h_rows}
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("examples,tokens,features,heads,key_size", ROTARY, ids=map(_id, ROTARY))
+def test_a_rotary_forward_pass_is_the_composition_with_q_and_k_rotated_after_project(
+    examples: int, tokens: int, features: int, heads: int, key_size: int, causal: bool
+):
+    c = _case(examples, tokens, features, heads, key_size)
+    out, composed = _rotary_forward(c, tokens, heads, causal), _composed_rotary_forward(c, tokens, heads, causal)
+    for name in ["a", "q", "k", "v", "p", "h"]:
+        assert out[name].shape == composed[name].shape, name
+        assert _bits(out[name]) == _bits(composed[name]), name
+    if tokens > 1:
+        assert _bits(out["q"]) != _bits(_forward(c, heads, causal)["q"])
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("examples,tokens,features,heads,key_size", ROTARY, ids=map(_id, ROTARY))
+def test_a_rotary_downstream_rotates_dq_and_dk_back_before_projects_products(
+    examples: int, tokens: int, features: int, heads: int, key_size: int, causal: bool
+):
+    c = _case(examples, tokens, features, heads, key_size)
+    f = _rotary_forward(c, tokens, heads, causal)
+    table = _table(tokens, key_size)
+    result = attention_downstream_batch(
+        _array(c["delta"]),
+        *(_array(c[name]) for name in ("wq", "wk", "wv", "wo")),
+        *(_array(f[name]) for name in ("q", "k", "v", "p")),
+        heads=heads,
+        cos=_array(table[0]),
+        sin=_array(table[1]),
+    )
+    out = {name: _numpy(array) for name, array in zip(["dx", "dq", "dk", "dv"], result)}
+    # the unrotated op's attend gradients from the rotated caches, then rotated back, then dx
+    plain = _backward(c, f, heads)
+    dq, dk = _rotated(plain["dq"], table, heads, inverse=True), _rotated(plain["dk"], table, heads, inverse=True)
+    dx = (
+        layer_downstream_batch(_array(c["wq"]), _array(dq)) + layer_downstream_batch(_array(c["wk"]), _array(dk))
+    ) + layer_downstream_batch(_array(c["wv"]), _array(plain["dv"]))
+    assert _bits(out["dq"]) == _bits(dq)
+    assert _bits(out["dk"]) == _bits(dk)
+    assert _bits(out["dv"]) == _bits(plain["dv"])
+    assert _bits(out["dx"]) == _bits(_numpy(dx).reshape(c["x"].shape))
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("examples,tokens,features,heads,key_size", ROTARY, ids=map(_id, ROTARY))
+def test_one_examples_rotary_pass_is_its_batch_rows(
+    examples: int, tokens: int, features: int, heads: int, key_size: int, causal: bool
+):
+    c = _case(examples, tokens, features, heads, key_size)
+    one, batch = _rotary_forward(c, tokens, heads, causal, one=True), _rotary_forward(c, tokens, heads, causal)
+    assert _bits(one["a"]) == _bits(batch["a"][0])
+    for name in ["q", "k", "v", "p", "h"]:
+        assert _bits(one[name]) == _bits(batch[name][:tokens]), name
+
+
+def test_position_0_is_unrotated_so_one_token_is_the_unrotated_pass_by_bits():
+    c = _case(2, 1, 6, 3, 2)
+    f, plain = _rotary_forward(c, 1, 3, False), _forward(c, 3)
+    for name in ["a", "q", "k", "v", "p", "h"]:
+        assert _bits(f[name]) == _bits(plain[name]), name
+
+
+def test_the_rotary_ops_refuse_half_a_table_an_odd_head_and_a_misshapen_table():
+    c = _case(2, 3, 6, 3, 2)
+    x, parameters = _array(c["x"]), _parameters(c)
+    cos, sin = (_array(t) for t in _table(3, 2))
+    with pytest.raises(ValueError, match="attention_forward_batch requires both cos and sin to rotate, or neither"):
+        attention_forward_batch(x, *parameters, heads=3, cos=cos)
+    with pytest.raises(ValueError, match=r"attention_forward_batch requires cos of shape Matrix\(3, 1\)"):
+        attention_forward_batch(x, *parameters, heads=3, cos=Array([[1.0, 1.0]] * 3), sin=sin)
+    with pytest.raises(ValueError, match=r"attention_forward_batch requires sin of shape Matrix\(3, 1\)"):
+        attention_forward_batch(x, *parameters, heads=3, cos=cos, sin=Array([[0.0]] * 2))
+    odd = _case(2, 3, 6, 2, 3)
+    with pytest.raises(ValueError, match="attention_forward_batch requires an even head size to rotate, got d_k=3"):
+        attention_forward_batch(_array(odd["x"]), *_parameters(odd), heads=2, cos=cos, sin=sin)
+    f = _forward(c, 3)
+    args = (
+        _array(c["delta"]),
+        *(_array(c[name]) for name in ("wq", "wk", "wv", "wo")),
+        *(_array(f[name]) for name in ("q", "k", "v", "p")),
+    )
+    with pytest.raises(ValueError, match="attention_downstream_batch requires both cos and sin to rotate, or neither"):
+        attention_downstream_batch(*args, heads=3, sin=sin)
+    with pytest.raises(ValueError, match=r"attention_downstream_batch requires cos of shape Matrix\(3, 1\)"):
+        attention_downstream_batch(*args, heads=3, cos=Array([[1.0]] * 2), sin=sin)
