@@ -11,6 +11,7 @@ mod linalg;
 mod mnist;
 mod ops;
 mod random;
+mod recurrent;
 mod tokens;
 mod ufuncs;
 
@@ -44,6 +45,10 @@ use layer_norm::{
 use linalg::{matmul_threads_for, outer, set_kernel_overrides, set_matmul_threading};
 use mnist::decode_mnist_pixels;
 use random::{bernoulli_mask, seed, seed_at_import, uniform};
+use recurrent::{
+    attention_pooling_backward, attention_pooling_forward, codes_backward, codes_forward, concatenate_columns,
+    gru_backward, gru_forward, state_input_backward, state_input_forward,
+};
 use tokens::{
     embedding_accumulate_gradient, embedding_forward, patches_downstream, patches_forward, token_dropout_downstream,
     token_dropout_forward, token_mean_downstream, token_mean_forward,
@@ -146,6 +151,15 @@ fn indrajala_math_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(attention_forward_batch, m)?)?;
     m.add_function(wrap_pyfunction!(attention_downstream_batch, m)?)?;
     m.add_function(wrap_pyfunction!(attention_accumulate_gradient_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(state_input_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(state_input_backward, m)?)?;
+    m.add_function(wrap_pyfunction!(attention_pooling_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(attention_pooling_backward, m)?)?;
+    m.add_function(wrap_pyfunction!(gru_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(gru_backward, m)?)?;
+    m.add_function(wrap_pyfunction!(codes_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(codes_backward, m)?)?;
+    m.add_function(wrap_pyfunction!(concatenate_columns, m)?)?;
     m.add_class::<RustArray>()?;
     m.add_class::<ConvGeometry>()?;
     m.add_class::<SeedSequence>()?;
