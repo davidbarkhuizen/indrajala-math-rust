@@ -1,0 +1,501 @@
+//! A factored window-recurrent state (indrajala-ml's factored-state workplan, stage 2): G factors,
+//! each its own pooling, GRU cell and codes, the state `(N, S)` their states side by side, factor
+//! `g` the `s_g` columns after the factors before it (`S = s_1 + ... + s_G`).
+//!
+//! ```text
+//! pooling g     u_g = pool(x; q_g)                       (attention_pooling_forward)
+//! cell g        h_g = GRU_g(c_g, i_g),  i_g = u_g, or [u_g, c_(-g)] with the cross-term on
+//! codes g       q_g = e_(g, k), k = argmin ||h_g - e_g,k||^2   (codes_forward); q_g = h_g if continuous
+//! next state    [q_1, ..., q_G]
+//! ```
+//!
+//! `c_(-g)` is the other factors' states in factor order, the state's columns without factor
+//! `g`'s; factor `g`'s `w` is then `(3 s_g, d + S - s_g)`, its input `d` first. Each step is the
+//! single-factor op it names in `recurrent.rs`, called factor by factor in factor order, so with
+//! G = 1 the forward and backward passes are today's by bits (the workplan's D6), and every
+//! factor's are those ops' at any G. The sums the factors share are left folds in factor order,
+//! each starting from factor 1's term (not from `0.0`, which would turn a `-0.0` into `0.0`):
+//! the tokens' gradient `dx = dx_1 + ... + dx_G` (every factor's pooling reads the same tokens),
+//! and, with the cross-term, factor `g`'s state gradient its own cell's, then each other factor's
+//! input gradient through its `c_(-h)` columns, in factor order.
+//!
+//! `recurrence_step_forward` runs a window's every factor in one call and gives a
+//! `RecurrenceStep`, which holds what `recurrence_step_backward` reads; `factored_codes_*` snap a
+//! state over the factors' codes alone (the learned initial state, W8).
+
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+
+use crate::array::{RustArray, Shape};
+use crate::ops::same_shape_elementwise;
+use crate::recurrent::{
+    attention_pooling_backward, attention_pooling_forward, codes_backward, codes_forward, columns, features_per_token,
+    gru_backward, gru_forward, matrix_shape, require_shape,
+};
+
+/// Each factor's first column, from the factors' sizes, every one 1 or more; and their total.
+fn factor_starts(sizes: &[usize], context: &str) -> PyResult<(Vec<usize>, usize)> {
+    if sizes.is_empty() || sizes.contains(&0) {
+        return Err(PyValueError::new_err(format!(
+            "{context} requires 1 or more factors, each of size 1 or more, got sizes {sizes:?}"
+        )));
+    }
+    let mut starts = Vec::with_capacity(sizes.len());
+    let mut total = 0;
+    for &size in sizes {
+        starts.push(total);
+        total += size;
+    }
+    Ok((starts, total))
+}
+
+/// The factors' blocks of `x`, `(rows, total)`: each its own columns, a copy.
+fn split(x: &RustArray, total: usize, starts: &[usize], sizes: &[usize]) -> Vec<RustArray> {
+    starts
+        .iter()
+        .zip(sizes)
+        .map(|(&start, &size)| columns(x, total, start, start + size))
+        .collect()
+}
+
+/// The factors' blocks side by side, `(rows, total)`: `split`'s inverse.
+fn join(blocks: &[RustArray], rows: usize, total: usize) -> RustArray {
+    let mut data = Vec::with_capacity(rows * total);
+    for row in 0..rows {
+        for block in blocks {
+            let width = block.data.len() / rows.max(1);
+            data.extend_from_slice(&block.data[row * width..(row + 1) * width]);
+        }
+    }
+    RustArray::from_matrix(data, rows, total)
+}
+
+/// The list arguments' common length, the factor count G, refused unless they agree.
+fn factor_count(lengths: &[(usize, &str)], context: &str) -> PyResult<usize> {
+    let (count, _) = lengths[0];
+    if let Some((length, name)) = lengths.iter().find(|(length, _)| *length != count) {
+        return Err(PyValueError::new_err(format!(
+            "{context} requires one entry per factor in every list, {count} factors, got {length} in {name}"
+        )));
+    }
+    Ok(count)
+}
+
+/// Factor `g`'s state `c_g` snapped to its nearest code, or itself for a continuous factor: `(q,
+/// indices)`.
+fn snap(h: &RustArray, codes: Option<&RustArray>) -> PyResult<(RustArray, Option<Vec<usize>>)> {
+    match codes {
+        Some(e) => {
+            let (q, indices) = codes_forward(h, e)?;
+            Ok((q, Some(indices)))
+        }
+        None => Ok((h.clone(), None)),
+    }
+}
+
+/// `snap`'s backward pass: `codes_backward`, or `dq` itself for a continuous factor. Returns
+/// `(dh, grad_e)`.
+#[allow(clippy::too_many_arguments)]
+fn snap_backward(
+    dq: RustArray,
+    h: &RustArray,
+    q: &RustArray,
+    indices: &Option<Vec<usize>>,
+    grad_e: Option<&RustArray>,
+    weight: f64,
+    commitment: f64,
+    context: &str,
+) -> PyResult<(RustArray, Option<RustArray>)> {
+    match (indices, grad_e) {
+        (Some(indices), Some(grad_e)) => {
+            let (dh, grad_e) = codes_backward(&dq, h, q, indices.clone(), grad_e, weight, commitment)?;
+            Ok((dh, Some(grad_e)))
+        }
+        (None, None) => Ok((dq, None)),
+        (Some(_), None) => Err(PyValueError::new_err(format!(
+            "{context} requires a codes gradient for each snapped factor, got None"
+        ))),
+        (None, Some(_)) => Err(PyValueError::new_err(format!(
+            "{context} requires None as a continuous factor's codes gradient"
+        ))),
+    }
+}
+
+/// Each row of `h`, `(N, S)`, snapped factor by factor: factor `g`'s `sizes[g]` columns to the
+/// nearest of its codes `codes[g]` (`codes_forward`), or kept for a continuous factor (None).
+/// Returns `(q, indices)`, `q` `(N, S)` and each factor's indices, None for a continuous factor.
+#[pyfunction]
+pub fn factored_codes_forward(
+    h: &RustArray,
+    sizes: Vec<usize>,
+    codes: Vec<Option<PyRef<'_, RustArray>>>,
+) -> PyResult<(RustArray, Vec<Option<Vec<usize>>>)> {
+    let context = "factored_codes_forward";
+    factor_count(&[(sizes.len(), "sizes"), (codes.len(), "codes")], context)?;
+    let (starts, total) = factor_starts(&sizes, context)?;
+    let (rows, _) = matrix_shape(h, "h", context)?;
+    require_shape(h, Shape::Matrix(rows, total), "h", context)?;
+    let mut blocks = Vec::with_capacity(sizes.len());
+    let mut indices = Vec::with_capacity(sizes.len());
+    for (h_g, e) in split(h, total, &starts, &sizes).iter().zip(&codes) {
+        let (q, i) = snap(h_g, e.as_deref())?;
+        blocks.push(q);
+        indices.push(i);
+    }
+    Ok((join(&blocks, rows, total), indices))
+}
+
+/// `factored_codes_forward`'s backward pass: factor by factor, `codes_backward` of its columns of
+/// `dq`, `h` and `q` with its own commitment, or `dq`'s columns straight through for a continuous
+/// factor (its `grad_codes` None). Returns `(dh, grad_codes)`.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+pub fn factored_codes_backward(
+    dq: &RustArray,
+    h: &RustArray,
+    q: &RustArray,
+    sizes: Vec<usize>,
+    indices: Vec<Option<Vec<usize>>>,
+    grad_codes: Vec<Option<PyRef<'_, RustArray>>>,
+    weight: f64,
+    commitments: Vec<f64>,
+) -> PyResult<(RustArray, Vec<Option<RustArray>>)> {
+    let context = "factored_codes_backward";
+    factor_count(
+        &[
+            (sizes.len(), "sizes"),
+            (indices.len(), "indices"),
+            (grad_codes.len(), "grad_codes"),
+            (commitments.len(), "commitments"),
+        ],
+        context,
+    )?;
+    let (starts, total) = factor_starts(&sizes, context)?;
+    let (rows, _) = matrix_shape(h, "h", context)?;
+    for (x, name) in [(dq, "dq"), (h, "h"), (q, "q")] {
+        require_shape(x, Shape::Matrix(rows, total), name, context)?;
+    }
+    let mut dh = Vec::with_capacity(sizes.len());
+    let mut new_grad_codes = Vec::with_capacity(sizes.len());
+    let blocks = split(dq, total, &starts, &sizes)
+        .into_iter()
+        .zip(split(h, total, &starts, &sizes))
+        .zip(split(q, total, &starts, &sizes));
+    for (g, ((dq_g, h_g), q_g)) in blocks.enumerate() {
+        let (dh_g, grad_e) = snap_backward(
+            dq_g,
+            &h_g,
+            &q_g,
+            &indices[g],
+            grad_codes[g].as_deref(),
+            weight,
+            commitments[g],
+            context,
+        )?;
+        dh.push(dh_g);
+        new_grad_codes.push(grad_e);
+    }
+    Ok((join(&dh, rows, total), new_grad_codes))
+}
+
+/// One factor's forward pass, what its backward pass reads.
+struct FactorTape {
+    /// the pooling's weights, `(N, T)`
+    p: RustArray,
+    /// the cell's input `i_g`, `(N, d)` or `(N, d + S - s_g)`
+    input: RustArray,
+    /// the factor's state `c_g`, `(N, s_g)`
+    c: RustArray,
+    r: RustArray,
+    z: RustArray,
+    h_tilde: RustArray,
+    rc: RustArray,
+    /// the cell's output before it is snapped, `(N, s_g)`
+    h: RustArray,
+    /// the next state's block, `(N, s_g)`
+    q: RustArray,
+    indices: Option<Vec<usize>>,
+}
+
+/// A window's factored recurrence step, from `recurrence_step_forward`: the next state, the cells'
+/// outputs before they are snapped, and each factor's code indices, with what
+/// `recurrence_step_backward` reads.
+#[pyclass(module = "indrajala_math_rust", frozen, skip_from_py_object)]
+pub struct RecurrenceStep {
+    x: Py<RustArray>,
+    tokens: usize,
+    features: usize,
+    cross: bool,
+    rows: usize,
+    sizes: Vec<usize>,
+    starts: Vec<usize>,
+    factors: Vec<FactorTape>,
+    state: Py<RustArray>,
+    h: Py<RustArray>,
+}
+
+#[pymethods]
+impl RecurrenceStep {
+    /// The next state, `(N, S)`: each factor's code, or its cell's output if continuous.
+    #[getter]
+    fn state(&self, py: Python<'_>) -> Py<RustArray> {
+        self.state.clone_ref(py)
+    }
+
+    /// The cells' outputs before they are snapped, `(N, S)`.
+    #[getter]
+    fn h(&self, py: Python<'_>) -> Py<RustArray> {
+        self.h.clone_ref(py)
+    }
+
+    /// Each factor's code indices, one per example; None for a continuous factor.
+    #[getter]
+    fn indices(&self) -> Vec<Option<Vec<usize>>> {
+        self.factors.iter().map(|f| f.indices.clone()).collect()
+    }
+
+    /// The factors' state sizes.
+    #[getter]
+    fn sizes(&self) -> Vec<usize> {
+        self.sizes.clone()
+    }
+}
+
+/// Factor `g`'s state size `s_g` from its `u_weights`, `(3 s_g, s_g)`.
+fn cell_size(u_weights: &RustArray, context: &str) -> PyResult<usize> {
+    let (rows, size) = matrix_shape(u_weights, "every u_weights", context)?;
+    if rows != 3 * size || size == 0 {
+        return Err(PyValueError::new_err(format!(
+            "{context} requires each u_weights of shape (3s, s), s >= 1, got {:?}",
+            u_weights.shape
+        )));
+    }
+    Ok(size)
+}
+
+/// The columns of `c` that aren't factor `g`'s, in factor order, `(N, S - s_g)`.
+fn others(c: &RustArray, total: usize, start: usize, size: usize) -> RustArray {
+    let rows = c.data.len() / total;
+    let mut data = Vec::with_capacity(rows * (total - size));
+    for row in c.data.chunks_exact(total) {
+        data.extend_from_slice(&row[..start]);
+        data.extend_from_slice(&row[start + size..]);
+    }
+    RustArray::from_matrix(data, rows, total - size)
+}
+
+/// A window's recurrence over G factors in one call: from the tokens the window's output layer
+/// reads, `x` `(N, T * d)`, and the state `c` `(N, S)`, each factor `g`'s pooling
+/// (`queries[g]`, `(d,)`), cell (`w[g]`, `u_weights[g]`, `b[g]`, as `gru_forward`'s, `w[g]` `(3
+/// s_g, d)`, or `(3 s_g, d + S - s_g)` with `cross`) and codes (`codes[g]`, `(m_g, s_g)`, or None
+/// for a continuous factor), in factor order. Returns the `RecurrenceStep`.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (x, c, queries, w, u_weights, b, codes, tokens, *, cross))]
+pub fn recurrence_step_forward(
+    py: Python<'_>,
+    x: Bound<'_, RustArray>,
+    c: &RustArray,
+    queries: Vec<PyRef<'_, RustArray>>,
+    w: Vec<PyRef<'_, RustArray>>,
+    u_weights: Vec<PyRef<'_, RustArray>>,
+    b: Vec<PyRef<'_, RustArray>>,
+    codes: Vec<Option<PyRef<'_, RustArray>>>,
+    tokens: usize,
+    cross: bool,
+) -> PyResult<RecurrenceStep> {
+    let context = "recurrence_step_forward";
+    factor_count(
+        &[
+            (queries.len(), "queries"),
+            (w.len(), "w"),
+            (u_weights.len(), "u_weights"),
+            (b.len(), "b"),
+            (codes.len(), "codes"),
+        ],
+        context,
+    )?;
+    let sizes = u_weights
+        .iter()
+        .map(|u| cell_size(u, context))
+        .collect::<PyResult<Vec<_>>>()?;
+    let (starts, total) = factor_starts(&sizes, context)?;
+    if cross && sizes.len() < 2 {
+        return Err(PyValueError::new_err(format!(
+            "{context} requires 2 or more factors for the cross-term, got {}",
+            sizes.len()
+        )));
+    }
+    let x_ref = x.borrow();
+    let (rows, width) = matrix_shape(&x_ref, "x", context)?;
+    require_shape(c, Shape::Matrix(rows, total), "c", context)?;
+    let features = features_per_token(tokens, width, context)?;
+
+    let mut factors = Vec::with_capacity(sizes.len());
+    for (g, c_g) in split(c, total, &starts, &sizes).into_iter().enumerate() {
+        let (u, p) = attention_pooling_forward(&x_ref, &queries[g], tokens)?;
+        let input_size = features + if cross { total - sizes[g] } else { 0 };
+        let input = if cross {
+            join(&[u, others(c, total, starts[g], sizes[g])], rows, input_size)
+        } else {
+            u
+        };
+        require_shape(&w[g], Shape::Matrix(3 * sizes[g], input_size), "each w", context)?;
+        let (h, r, z, h_tilde, rc) = gru_forward(&input, &c_g, &w[g], &u_weights[g], &b[g])?;
+        let (q, indices) = snap(&h, codes[g].as_deref())?;
+        factors.push(FactorTape {
+            p,
+            input,
+            c: c_g,
+            r,
+            z,
+            h_tilde,
+            rc,
+            h,
+            q,
+            indices,
+        });
+    }
+    let qs: Vec<RustArray> = factors.iter().map(|f| f.q.clone()).collect();
+    let hs: Vec<RustArray> = factors.iter().map(|f| f.h.clone()).collect();
+    drop(x_ref);
+    Ok(RecurrenceStep {
+        state: Py::new(py, join(&qs, rows, total))?,
+        h: Py::new(py, join(&hs, rows, total))?,
+        x: x.unbind(),
+        tokens,
+        features,
+        cross,
+        rows,
+        sizes,
+        starts,
+        factors,
+    })
+}
+
+/// `recurrence_step_forward`'s backward pass, from the next state's gradient `dq` `(N, S)`: factor
+/// by factor, its codes' (`codes_backward`, weight and its `commitments[g]`; straight through if
+/// continuous), its cell's (`gru_backward`) and its pooling's (`attention_pooling_backward`), each
+/// parameter's gradient accumulated onto the one given. Returns `(dx, dc, grad_queries, grad_w,
+/// grad_u, grad_b, grad_codes)`: the tokens' gradient, the state's, and each factor's parameters'.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+#[pyfunction]
+pub fn recurrence_step_backward(
+    py: Python<'_>,
+    step: PyRef<'_, RecurrenceStep>,
+    dq: &RustArray,
+    queries: Vec<PyRef<'_, RustArray>>,
+    w: Vec<PyRef<'_, RustArray>>,
+    u_weights: Vec<PyRef<'_, RustArray>>,
+    grad_queries: Vec<PyRef<'_, RustArray>>,
+    grad_w: Vec<PyRef<'_, RustArray>>,
+    grad_u: Vec<PyRef<'_, RustArray>>,
+    grad_b: Vec<PyRef<'_, RustArray>>,
+    grad_codes: Vec<Option<PyRef<'_, RustArray>>>,
+    weight: f64,
+    commitments: Vec<f64>,
+) -> PyResult<(
+    RustArray,
+    RustArray,
+    Vec<RustArray>,
+    Vec<RustArray>,
+    Vec<RustArray>,
+    Vec<RustArray>,
+    Vec<Option<RustArray>>,
+)> {
+    let context = "recurrence_step_backward";
+    let count = factor_count(
+        &[
+            (step.sizes.len(), "the step's factors"),
+            (queries.len(), "queries"),
+            (w.len(), "w"),
+            (u_weights.len(), "u_weights"),
+            (grad_queries.len(), "grad_queries"),
+            (grad_w.len(), "grad_w"),
+            (grad_u.len(), "grad_u"),
+            (grad_b.len(), "grad_b"),
+            (grad_codes.len(), "grad_codes"),
+            (commitments.len(), "commitments"),
+        ],
+        context,
+    )?;
+    let rows = step.rows;
+    let total = step.starts[count - 1] + step.sizes[count - 1];
+    require_shape(dq, Shape::Matrix(rows, total), "dq", context)?;
+    let x = step.x.bind(py).borrow();
+    let features = step.features;
+
+    let mut dx: Option<RustArray> = None;
+    let mut dc_own = Vec::with_capacity(count);
+    let mut dc_cross = Vec::with_capacity(count);
+    let mut new_grad_q = Vec::with_capacity(count);
+    let mut new_grad_w = Vec::with_capacity(count);
+    let mut new_grad_u = Vec::with_capacity(count);
+    let mut new_grad_b = Vec::with_capacity(count);
+    let mut new_grad_codes = Vec::with_capacity(count);
+    for (g, dq_g) in split(dq, total, &step.starts, &step.sizes).into_iter().enumerate() {
+        let f = &step.factors[g];
+        let (dh, grad_e) = snap_backward(
+            dq_g,
+            &f.h,
+            &f.q,
+            &f.indices,
+            grad_codes[g].as_deref(),
+            weight,
+            commitments[g],
+            context,
+        )?;
+        let (d_input, dc, gw, gu, gb) = gru_backward(
+            &dh,
+            &f.input,
+            &f.c,
+            &f.r,
+            &f.z,
+            &f.h_tilde,
+            &f.rc,
+            &w[g],
+            &u_weights[g],
+            &grad_w[g],
+            &grad_u[g],
+            &grad_b[g],
+        )?;
+        let input_size = features + if step.cross { total - step.sizes[g] } else { 0 };
+        let du = if step.cross {
+            dc_cross.push(columns(&d_input, input_size, features, input_size));
+            columns(&d_input, input_size, 0, features)
+        } else {
+            d_input
+        };
+        let (dx_g, gq) = attention_pooling_backward(&x, &f.p, &queries[g], &du, &grad_queries[g], step.tokens)?;
+        dx = Some(match dx {
+            None => dx_g,
+            Some(sum) => RustArray::from_matrix(
+                same_shape_elementwise(&sum.data, &dx_g.data, |a, v| a + v),
+                rows,
+                step.tokens * features,
+            ),
+        });
+        dc_own.push(dc);
+        new_grad_q.push(gq);
+        new_grad_w.push(gw);
+        new_grad_u.push(gu);
+        new_grad_b.push(gb);
+        new_grad_codes.push(grad_e);
+    }
+
+    let mut dc = join(&dc_own, rows, total);
+    // each factor h's gradient through the other factors' columns, c_(-h), in factor order
+    for (h, cross) in dc_cross.iter().enumerate() {
+        let (start, size) = (step.starts[h], step.sizes[h]);
+        let width = total - size;
+        for (row, values) in dc.data.chunks_exact_mut(total).zip(cross.data.chunks_exact(width)) {
+            let (before, rest) = row.split_at_mut(start);
+            let targets = before.iter_mut().chain(rest[size..].iter_mut());
+            for (acc, &v) in targets.zip(values) {
+                *acc += v;
+            }
+        }
+    }
+    let dx = dx.expect("a step has 1 or more factors");
+    Ok((dx, dc, new_grad_q, new_grad_w, new_grad_u, new_grad_b, new_grad_codes))
+}

@@ -375,3 +375,54 @@ def codes_backward(
     dq: Array, h: Array, q: Array, indices: list[int], grad_e: Array, weight: float, commitment: float
 ) -> tuple[Array, Array]: ...
 def concatenate_columns(arrays: list[Array]) -> Array: ...
+def factored_codes_forward(
+    h: Array, sizes: list[int], codes: list[Array | None]
+) -> tuple[Array, list[list[int] | None]]: ...
+def factored_codes_backward(
+    dq: Array,
+    h: Array,
+    q: Array,
+    sizes: list[int],
+    indices: list[list[int] | None],
+    grad_codes: list[Array | None],
+    weight: float,
+    commitments: list[float],
+) -> tuple[Array, list[Array | None]]: ...
+
+@final
+class RecurrenceStep:
+    @property
+    def state(self) -> Array: ...
+    @property
+    def h(self) -> Array: ...
+    @property
+    def indices(self) -> list[list[int] | None]: ...
+    @property
+    def sizes(self) -> list[int]: ...
+
+def recurrence_step_forward(
+    x: Array,
+    c: Array,
+    queries: list[Array],
+    w: list[Array],
+    u_weights: list[Array],
+    b: list[Array],
+    codes: list[Array | None],
+    tokens: int,
+    *,
+    cross: bool,
+) -> RecurrenceStep: ...
+def recurrence_step_backward(
+    step: RecurrenceStep,
+    dq: Array,
+    queries: list[Array],
+    w: list[Array],
+    u_weights: list[Array],
+    grad_queries: list[Array],
+    grad_w: list[Array],
+    grad_u: list[Array],
+    grad_b: list[Array],
+    grad_codes: list[Array | None],
+    weight: float,
+    commitments: list[float],
+) -> tuple[Array, Array, list[Array], list[Array], list[Array], list[Array], list[Array | None]]: ...

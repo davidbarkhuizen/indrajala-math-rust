@@ -40,7 +40,7 @@ use crate::ops::same_shape_elementwise;
 use crate::ufuncs::array_softmax;
 
 /// `(rows, cols)` of a matrix, refused for a vector.
-fn matrix_shape(x: &RustArray, name: &str, context: &str) -> PyResult<(usize, usize)> {
+pub(crate) fn matrix_shape(x: &RustArray, name: &str, context: &str) -> PyResult<(usize, usize)> {
     match x.shape {
         Shape::Matrix(rows, cols) => Ok((rows, cols)),
         shape => Err(PyValueError::new_err(format!(
@@ -50,7 +50,7 @@ fn matrix_shape(x: &RustArray, name: &str, context: &str) -> PyResult<(usize, us
 }
 
 /// `x` refused unless of shape `expected`.
-fn require_shape(x: &RustArray, expected: Shape, name: &str, context: &str) -> PyResult<()> {
+pub(crate) fn require_shape(x: &RustArray, expected: Shape, name: &str, context: &str) -> PyResult<()> {
     if x.shape != expected {
         return Err(PyValueError::new_err(format!(
             "{context} requires {name} of shape {expected:?}, got {:?}",
@@ -61,7 +61,7 @@ fn require_shape(x: &RustArray, expected: Shape, name: &str, context: &str) -> P
 }
 
 /// The features per token of `width` values in `tokens` tokens, refused unless it divides.
-fn features_per_token(tokens: usize, width: usize, context: &str) -> PyResult<usize> {
+pub(crate) fn features_per_token(tokens: usize, width: usize, context: &str) -> PyResult<usize> {
     if tokens == 0 || !width.is_multiple_of(tokens) {
         return Err(PyValueError::new_err(format!(
             "{context} requires tokens x features values per example, {tokens} tokens, got {width}"
@@ -81,7 +81,7 @@ fn tanh(x: f64) -> f64 {
 }
 
 /// Columns `start..end` of a `cols`-wide matrix, a copy.
-fn columns(x: &RustArray, cols: usize, start: usize, end: usize) -> RustArray {
+pub(crate) fn columns(x: &RustArray, cols: usize, start: usize, end: usize) -> RustArray {
     let rows = x.data.len() / cols.max(1);
     let mut data = Vec::with_capacity(rows * (end - start));
     for row in x.data.chunks_exact(cols.max(1)) {

@@ -4,6 +4,7 @@ mod array;
 mod attention;
 mod batch_norm;
 mod conv;
+mod factored;
 mod fused;
 mod generator;
 mod layer_norm;
@@ -26,6 +27,9 @@ use batch_norm::{
 use conv::{
     conv_accumulate_gradient_batch, conv_downstream_batch, conv_forward_batch, conv_linear_accumulate_gradient_batch,
     conv_linear_forward_batch, max_pool_downstream_batch, max_pool_forward_batch, ConvGeometry,
+};
+use factored::{
+    factored_codes_backward, factored_codes_forward, recurrence_step_backward, recurrence_step_forward, RecurrenceStep,
 };
 use fused::{
     affine_forward, affine_forward_batch, layer_accumulate_gradient, layer_accumulate_gradient_batch,
@@ -160,10 +164,15 @@ fn indrajala_math_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(codes_forward, m)?)?;
     m.add_function(wrap_pyfunction!(codes_backward, m)?)?;
     m.add_function(wrap_pyfunction!(concatenate_columns, m)?)?;
+    m.add_function(wrap_pyfunction!(factored_codes_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(factored_codes_backward, m)?)?;
+    m.add_function(wrap_pyfunction!(recurrence_step_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(recurrence_step_backward, m)?)?;
     m.add_class::<RustArray>()?;
     m.add_class::<ConvGeometry>()?;
     m.add_class::<SeedSequence>()?;
     m.add_class::<Generator>()?;
+    m.add_class::<RecurrenceStep>()?;
     seed_at_import();
     Ok(())
 }
