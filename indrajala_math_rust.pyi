@@ -426,3 +426,29 @@ def recurrence_step_backward(
     weight: float,
     commitments: list[float],
 ) -> tuple[Array, Array, list[Array], list[Array], list[Array], list[Array], list[Array | None]]: ...
+
+@final
+class WindowProgram:
+    def __new__(
+        cls,
+        ops: list[tuple[Any, ...]],
+        columns: int,
+        reads: int,
+        sizes: list[int],
+        snapped: list[bool],
+        *,
+        cross: bool,
+    ) -> WindowProgram: ...
+    @property
+    def parameter_count(self) -> int: ...
+
+def window_program_forward(
+    program: WindowProgram,
+    x: Array,
+    parameters: list[Array],
+    c0: Array,
+    *,
+    states: bool = False,
+    codes: bool = False,
+) -> tuple[Array, list[Array], list[Array], list[list[list[int] | None]]]: ...
+def argmax_token_rows(matrix: Array, classes: int) -> list[tuple[int, ...]]: ...

@@ -284,27 +284,46 @@ fn others(c: &RustArray, total: usize, start: usize, size: usize) -> RustArray {
     RustArray::from_matrix(data, rows, total - size)
 }
 
-/// A window's recurrence over G factors in one call: from the tokens the window's output layer
-/// reads, `x` `(N, T * d)`, and the state `c` `(N, S)`, each factor `g`'s pooling
-/// (`queries[g]`, `(d,)`), cell (`w[g]`, `u_weights[g]`, `b[g]`, as `gru_forward`'s, `w[g]` `(3
-/// s_g, d)`, or `(3 s_g, d + S - s_g)` with `cross`) and codes (`codes[g]`, `(m_g, s_g)`, or None
-/// for a continuous factor), in factor order. Returns the `RecurrenceStep`.
+/// A window's recurrence step, as `recurrence_step_forward` computes it, without Python's
+/// references: what `RecurrenceStep` holds, and the window program's step (program.rs).
+pub(crate) struct StepCore {
+    pub(crate) features: usize,
+    pub(crate) rows: usize,
+    pub(crate) sizes: Vec<usize>,
+    pub(crate) starts: Vec<usize>,
+    factors: Vec<FactorTape>,
+    /// the next state, `(N, S)`
+    pub(crate) state: RustArray,
+    /// the cells' outputs before they are snapped, `(N, S)`
+    pub(crate) h: RustArray,
+}
+
+impl StepCore {
+    /// Each factor's code indices, one per example; None for a continuous factor.
+    pub(crate) fn indices(&self) -> Vec<Option<Vec<usize>>> {
+        self.factors.iter().map(|f| f.indices.clone()).collect()
+    }
+}
+
+/// The arrays a list argument holds, as plain references.
+fn refs<'a>(arrays: &'a [PyRef<'_, RustArray>]) -> Vec<&'a RustArray> {
+    arrays.iter().map(|a| &**a).collect()
+}
+
+/// `recurrence_step_forward`'s computation over plain references, under `context`'s name.
 #[allow(clippy::too_many_arguments)]
-#[pyfunction]
-#[pyo3(signature = (x, c, queries, w, u_weights, b, codes, tokens, *, cross))]
-pub fn recurrence_step_forward(
-    py: Python<'_>,
-    x: Bound<'_, RustArray>,
+pub(crate) fn step_forward(
+    x: &RustArray,
     c: &RustArray,
-    queries: Vec<PyRef<'_, RustArray>>,
-    w: Vec<PyRef<'_, RustArray>>,
-    u_weights: Vec<PyRef<'_, RustArray>>,
-    b: Vec<PyRef<'_, RustArray>>,
-    codes: Vec<Option<PyRef<'_, RustArray>>>,
+    queries: &[&RustArray],
+    w: &[&RustArray],
+    u_weights: &[&RustArray],
+    b: &[&RustArray],
+    codes: &[Option<&RustArray>],
     tokens: usize,
     cross: bool,
-) -> PyResult<RecurrenceStep> {
-    let context = "recurrence_step_forward";
+    context: &str,
+) -> PyResult<StepCore> {
     factor_count(
         &[
             (queries.len(), "queries"),
@@ -326,23 +345,22 @@ pub fn recurrence_step_forward(
             sizes.len()
         )));
     }
-    let x_ref = x.borrow();
-    let (rows, width) = matrix_shape(&x_ref, "x", context)?;
+    let (rows, width) = matrix_shape(x, "x", context)?;
     require_shape(c, Shape::Matrix(rows, total), "c", context)?;
     let features = features_per_token(tokens, width, context)?;
 
     let mut factors = Vec::with_capacity(sizes.len());
     for (g, c_g) in split(c, total, &starts, &sizes).into_iter().enumerate() {
-        let (u, p) = attention_pooling_forward(&x_ref, &queries[g], tokens)?;
+        let (u, p) = attention_pooling_forward(x, queries[g], tokens)?;
         let input_size = features + if cross { total - sizes[g] } else { 0 };
         let input = if cross {
             join(&[u, others(c, total, starts[g], sizes[g])], rows, input_size)
         } else {
             u
         };
-        require_shape(&w[g], Shape::Matrix(3 * sizes[g], input_size), "each w", context)?;
-        let (h, r, z, h_tilde, rc) = gru_forward(&input, &c_g, &w[g], &u_weights[g], &b[g])?;
-        let (q, indices) = snap(&h, codes[g].as_deref())?;
+        require_shape(w[g], Shape::Matrix(3 * sizes[g], input_size), "each w", context)?;
+        let (h, r, z, h_tilde, rc) = gru_forward(&input, &c_g, w[g], u_weights[g], b[g])?;
+        let (q, indices) = snap(&h, codes[g])?;
         factors.push(FactorTape {
             p,
             input,
@@ -358,18 +376,63 @@ pub fn recurrence_step_forward(
     }
     let qs: Vec<RustArray> = factors.iter().map(|f| f.q.clone()).collect();
     let hs: Vec<RustArray> = factors.iter().map(|f| f.h.clone()).collect();
-    drop(x_ref);
-    Ok(RecurrenceStep {
-        state: Py::new(py, join(&qs, rows, total))?,
-        h: Py::new(py, join(&hs, rows, total))?,
-        x: x.unbind(),
-        tokens,
+    Ok(StepCore {
+        state: join(&qs, rows, total),
+        h: join(&hs, rows, total),
         features,
-        cross,
         rows,
         sizes,
         starts,
         factors,
+    })
+}
+
+/// A window's recurrence over G factors in one call: from the tokens the window's output layer
+/// reads, `x` `(N, T * d)`, and the state `c` `(N, S)`, each factor `g`'s pooling
+/// (`queries[g]`, `(d,)`), cell (`w[g]`, `u_weights[g]`, `b[g]`, as `gru_forward`'s, `w[g]` `(3
+/// s_g, d)`, or `(3 s_g, d + S - s_g)` with `cross`) and codes (`codes[g]`, `(m_g, s_g)`, or None
+/// for a continuous factor), in factor order. Returns the `RecurrenceStep`.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (x, c, queries, w, u_weights, b, codes, tokens, *, cross))]
+pub fn recurrence_step_forward(
+    py: Python<'_>,
+    x: Bound<'_, RustArray>,
+    c: &RustArray,
+    queries: Vec<PyRef<'_, RustArray>>,
+    w: Vec<PyRef<'_, RustArray>>,
+    u_weights: Vec<PyRef<'_, RustArray>>,
+    b: Vec<PyRef<'_, RustArray>>,
+    codes: Vec<Option<PyRef<'_, RustArray>>>,
+    tokens: usize,
+    cross: bool,
+) -> PyResult<RecurrenceStep> {
+    let codes: Vec<Option<&RustArray>> = codes.iter().map(|e| e.as_deref()).collect();
+    let x_ref = x.borrow();
+    let core = step_forward(
+        &x_ref,
+        c,
+        &refs(&queries),
+        &refs(&w),
+        &refs(&u_weights),
+        &refs(&b),
+        &codes,
+        tokens,
+        cross,
+        "recurrence_step_forward",
+    )?;
+    drop(x_ref);
+    Ok(RecurrenceStep {
+        state: Py::new(py, core.state)?,
+        h: Py::new(py, core.h)?,
+        x: x.unbind(),
+        tokens,
+        features: core.features,
+        cross,
+        rows: core.rows,
+        sizes: core.sizes,
+        starts: core.starts,
+        factors: core.factors,
     })
 }
 
