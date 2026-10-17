@@ -34,6 +34,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::array::{RustArray, Shape};
+use crate::cr_exp::exp;
 use crate::fused::{affine_forward_batch, layer_accumulate_gradient_batch};
 use crate::linalg::{matmul, matmul_add, matmul_nt};
 use crate::ops::same_shape_elementwise;
@@ -71,13 +72,13 @@ pub(crate) fn features_per_token(tokens: usize, width: usize, context: &str) -> 
 }
 
 fn sigmoid(x: f64) -> f64 {
-    1.0 / (1.0 + (-x).exp())
+    1.0 / (1.0 + exp(-x))
 }
 
 /// The workplan's W15: through `exp`, as `sigmoid`, so it agrees where `exp` does. A large `x`
 /// overflows `exp(2x)` to infinity and gives exactly 1; a large negative `x` exactly -1.
 fn tanh(x: f64) -> f64 {
-    1.0 - 2.0 / ((2.0 * x).exp() + 1.0)
+    1.0 - 2.0 / (exp(2.0 * x) + 1.0)
 }
 
 /// Columns `start..end` of a `cols`-wide matrix, a copy.

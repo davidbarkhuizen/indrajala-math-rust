@@ -4,6 +4,7 @@ use pyo3::prelude::*;
 use crate::array::{RustArray, Shape};
 use crate::fused::dropout_hidden_delta_from_downstream;
 use crate::ops::same_shape_elementwise;
+use crate::scalar::{max, relu};
 
 /// Elementwise `e^x` over a whole array - mirrors `array_layer.sigmoid`'s own reliance on
 /// `exp`'s overflow behavior (a large negative `z` drives `exp(-z)` to `f64::INFINITY`, and
@@ -14,7 +15,7 @@ use crate::ops::same_shape_elementwise;
 #[pyfunction]
 pub fn exp(arr: &RustArray) -> RustArray {
     RustArray {
-        data: arr.data.iter().map(|value| value.exp()).collect(),
+        data: crate::cr_exp::map(&arr.data, crate::cr_exp::exp_inline),
         shape: arr.shape,
     }
 }
@@ -46,7 +47,7 @@ pub fn sum_axis0(arr: &RustArray) -> PyResult<RustArray> {
 #[pyfunction]
 pub fn array_relu(arr: &RustArray) -> RustArray {
     RustArray {
-        data: arr.data.iter().map(|&v| v.max(0.0)).collect(),
+        data: arr.data.iter().map(|&v| relu(v)).collect(),
         shape: arr.shape,
     }
 }
@@ -127,8 +128,8 @@ pub fn array_dropout_mask(
 #[pyfunction]
 pub fn array_softmax(arr: &RustArray) -> RustArray {
     fn normalize_row(row: &[f64]) -> Vec<f64> {
-        let max_value = row.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let exp_values: Vec<f64> = row.iter().map(|&v| (v - max_value).exp()).collect();
+        let max_value = row.iter().fold(f64::NEG_INFINITY, |running, &v| max(running, v));
+        let exp_values = crate::cr_exp::map(row, |v| crate::cr_exp::exp_inline(v - max_value));
         let total = exp_values.iter().fold(0.0, |acc, &e| acc + e);
         exp_values.iter().map(|&e| e / total).collect()
     }

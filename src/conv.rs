@@ -23,6 +23,7 @@ use pyo3::prelude::*;
 
 use crate::array::{RustArray, Shape};
 use crate::linalg::{matmul_long_k, matmul_narrow, tiled_row_range, Panel, OVERWRITE};
+use crate::scalar::relu;
 
 /// The shape arithmetic for one conv or pool layer, built once by the Python layer and passed to
 /// every call. Pooling uses it with `kernel_size = pool_size`.
@@ -241,7 +242,7 @@ pub fn conv_forward_batch(
         );
         for channel in 0..o {
             let bias = b.data[channel];
-            a.extend((0..p).map(|position| (by_position[position * o + channel] + bias).max(0.0)));
+            a.extend((0..p).map(|position| relu(by_position[position * o + channel] + bias)));
         }
     }
     let cols = RustArray::from_matrix(cols, n * p, fan_in);

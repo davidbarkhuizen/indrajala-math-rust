@@ -72,6 +72,8 @@ also be tested there: in an indrajala-ml checkout, point `rust/` at the new comm
 | `src/layer_norm.rs` | `layer_norm_*`: one call per `LayerNormArrayLayer` method (forward, single and batch; downstream, gradient accumulate) |
 | `src/attention.rs` | `attention_*`: one call per pass of `AttentionArrayLayer` (forward, single and batch; downstream, which also returns `dQ, dK, dV`; gradient accumulate), multi-head (`heads`), causal (`causal`), dropping its weights in training (`dropout`, `training`, `rng`; the downstream takes the `mask`), rotary positions (`cos`, `sin`: the forward ops rotate `Q` and `K`, the downstream rotates `dQ` and `dK` back), each a thin wrapper over the crate-internal blocks project, attend and combine, composed of the crate's dense ops, `@` and `array_softmax` |
 | `src/recurrent.rs` | `state_input_*`, `attention_pooling_*`, `gru_*`, `codes_*`: one call per pass of a window-recurrent network's `StateInputArrayLayer`/`AttentionPoolingArrayLayer`/`GRUArrayLayer`/`CodesArrayLayer` (forward, backward), batch-only, composed of the crate's dense ops, `@` and `array_softmax`, with `tanh` through `exp`; `concatenate_columns`, which joins the windows' outputs |
+| `src/cr_exp.rs` | (crate-internal) `exp`, correctly rounded: a port of CORE-MATH's `cr_exp`; every `exp` in the crate (the `exp` ufunc, sigmoid, `tanh`, softmax) goes through it |
+| `src/scalar.rs` | (crate-internal) the scalar rules below: relu, the softmax row maximum, `powi` |
 
 Each `layer_*` function in `src/fused.rs` mirrors a method of indrajala-ml's
 `indrajala_ml/model/layers/numpy/array_layer.py` or one of its ReLU/softmax/dropout/Adam/L2/momentum variants,
@@ -79,6 +81,19 @@ and must stay numerically identical to it. Likewise each `conv_*`/`max_pool_*` f
 `src/conv.rs` mirrors a method of `indrajala_ml/model/layers/numpy/conv_array_layer.py`/`max_pool_array_layer.py`, each `conv_linear_*` function one of its `LinearConvArrayLayer`, each `linear_*`/`batch_norm_*` function in `src/batch_norm.rs` one of `linear_array_layer.py`/`batch_norm_array_layer.py`, and each function in `src/tokens.rs`, `src/layer_norm.rs`, `src/attention.rs` and `src/recurrent.rs` one of `token_array_layer.py`, `layer_norm_array_layer.py`, `attention_array_layer.py` or `recurrent_array_layer.py`. Conv tensors cross the boundary as matrices
 (`Array` stays 1D/2D); `src/conv.rs`'s module comment gives the layouts.
 
+## Same bits on every machine
+
+A network on this backend trains to the same bits on x86_64 and aarch64 (indrajala-ml's
+`docs/aarch64-workplan.md`). Products follow one order on every path: four `mul_add` lanes
+combined `(l0 + l1) + (l2 + l3)`, tails in order, reductions as left folds (`src/linalg.rs`);
+threading splits rows or column chunks, never one sum. `exp` is correctly rounded
+(`src/cr_exp.rs`), so it is mathematics' value, not a C library's. Where IEEE 754 or the compiler
+would leave a result to the machine, `src/scalar.rs` fixes it: relu gives `+0.0` for both zeros
+and propagates NaN; the softmax row maximum is a left fold with relu's comparison; Adam's `powi`
+is square-and-multiply from the exponent's low bit. Not claimed: the sign and payload of a NaN
+that an invalid operation (`inf - inf`, `0 * inf`) creates, which is the hardware's.
+
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE). `src/cr_exp.rs` is a port of CORE-MATH's `cr_exp` (MIT, Alexei
+Sibidanov), its copyright and permission notice kept in the file.
