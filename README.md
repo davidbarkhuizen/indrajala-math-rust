@@ -87,7 +87,9 @@ A network on this backend trains to the same bits on x86_64 and aarch64 (indraja
 `docs/aarch64-workplan.md`). Products follow one order on every path: four `mul_add` lanes
 combined `(l0 + l1) + (l2 + l3)`, tails in order, reductions as left folds (`src/linalg.rs`);
 threading splits rows or column chunks, never one sum. `exp` is correctly rounded
-(`src/cr_exp.rs`), so it is mathematics' value, not a C library's. Where IEEE 754 or the compiler
+(`src/cr_exp.rs`), so it is mathematics' value, not a C library's. A C library's `exp` need not
+be: glibc 2.43's rounds about 0.075% of inputs to the neighbouring double (worst 0.504 ULP,
+within its documented bound), and which inputs differs between libraries. Where IEEE 754 or the compiler
 would leave a result to the machine, `src/scalar.rs` fixes it: relu gives `+0.0` for both zeros
 and propagates NaN; the softmax row maximum is a left fold with relu's comparison; Adam's `powi`
 is square-and-multiply from the exponent's low bit. Not claimed: the sign and payload of a NaN
