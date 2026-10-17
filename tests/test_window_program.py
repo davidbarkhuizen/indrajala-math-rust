@@ -16,20 +16,35 @@ import pytest
 
 from indrajala_math_rust import (
     Array,
+    Generator,
     WindowProgram,
     affine_forward_batch,
     argmax_token_rows,
+    array_relu_mask,
+    attention_accumulate_gradient_batch,
+    attention_downstream_batch,
     attention_forward_batch,
     concatenate_columns,
     default_rng,
+    embedding_accumulate_gradient,
     embedding_forward,
+    layer_accumulate_gradient_batch,
+    layer_downstream_batch,
+    layer_norm_accumulate_gradient_batch,
+    layer_norm_downstream_batch,
     layer_norm_forward_batch,
     layer_relu_forward_batch,
     layer_softmax_forward_batch,
     matmul_threads_for,
+    recurrence_step_backward,
     recurrence_step_forward,
+    state_input_backward,
     state_input_forward,
+    sum_axis0,
+    token_dropout_downstream,
+    token_dropout_forward,
     window_program_forward,
+    window_program_learn,
 )
 
 # each factor's (state size, codes; None for a continuous factor)
@@ -362,3 +377,267 @@ def test_argmax_token_rows_is_pythons_index_of_max_ties_and_nans_included():
     assert argmax_token_rows(Array(values), 1) == _argmax_by_python(values, 1)
     with pytest.raises(ValueError, match="whole runs"):
         argmax_token_rows(Array(values), 5)
+
+
+# The training step (the workplan's stage 4): `window_program_learn` against indrajala-ml's
+# `_accumulate_gradients` composed of the crate's ops, its recomputed forward pass (W20) included:
+# every window forward in training with the generator's state kept, then from the last window each
+# window's forward pass again from its generator's state, and its backward pass, layer by layer.
+
+
+def _zeros(like: Array) -> Array:
+    return Array.zeros(like.shape[0] if len(like.shape) == 1 else (like.shape[0], like.shape[1]))
+
+
+def _forward_training(window: Window, read_at: int, a: Array, C: Array, rng: Generator):
+    # one window's per-layer forward pass in training: each layer's input and result and its cache
+    inputs, results, caches = [], [], []
+    forks: list[Array] = []
+    read = None
+    for i, (op, parameters) in enumerate(zip(window.ops, window.parameters, strict=True)):
+        if i == read_at:
+            read = a
+        inputs.append(a)
+        kind, cache = op[0], None
+        if kind == "embedding":
+            a = embedding_forward(a, parameters[0])
+        elif kind == "position":
+            (P,) = parameters
+            a = a + P.reshape(P.shape[0] * P.shape[1])
+        elif kind == "state_input":
+            a = state_input_forward(a, C, parameters[0], op[1])
+        elif kind == "fork":
+            forks.append(a)
+        elif kind == "add":
+            a = a + forks.pop()
+        elif kind == "layer_norm":
+            gamma, beta = parameters
+            a, xhat, std = layer_norm_forward_batch(a, gamma, beta, op[1])
+            cache = (xhat, std)
+        elif kind in ("token_dense", "token_output"):
+            W, b = parameters
+            forward = (
+                layer_softmax_forward_batch
+                if kind == "token_output"
+                else layer_relu_forward_batch
+                if op[2] == "relu"
+                else affine_forward_batch
+            )
+            n, tokens = a.shape[0], op[1]
+            a = forward(W, a.reshape((n * tokens, W.shape[1])), b).reshape((n, tokens * W.shape[0]))
+        elif kind == "attention":
+            _, heads, causal, dropout, cos, sin = op
+            table = {} if cos is None else {"cos": cos, "sin": sin}
+            a, q, k, v, p, h, mask = attention_forward_batch(
+                a, *parameters, heads=heads, causal=causal, dropout=dropout, training=True, rng=rng, **table
+            )
+            cache = (q, k, v, p, h, mask)
+        else:
+            a, cache = token_dropout_forward(a, op[1], rng)
+        results.append(a)
+        caches.append(cache)
+    assert read is not None
+    return inputs, results, caches, read
+
+
+def _learn_per_layer(window: Window, recurrence: Recurrence, read_at: int, X: Array, Y: Array, C0: Array, rng):
+    k, ops, L = window.tokens, window.ops, len(window.ops)
+    windows = X.shape[1] // k
+    weight = 1.0 / windows
+    width = Y.shape[1] // windows
+    grads = [[_zeros(p) for p in ps] for ps in window.parameters]
+    g_parts = {name: [_zeros(a) for a in getattr(recurrence, name)] for name in ("q", "W", "U", "b")}
+    g_codes = [None if e is None else _zeros(e) for e in recurrence.E]
+    commitments = [0.25 if e is not None else 0.0 for e in recurrence.E]
+    states, generators, C = [], [], C0
+    for w in range(windows):
+        states.append(C)
+        generators.append(rng.state)
+        _, _, _, read = _forward_training(window, read_at, X[:, w * k : (w + 1) * k], C, rng)
+        C = recurrence_step_forward(
+            read, C, recurrence.q, recurrence.W, recurrence.U, recurrence.b, recurrence.E, k, cross=recurrence.cross
+        ).state
+    after = rng.state
+    dC = Array.zeros((X.shape[0], sum(recurrence.sizes)))
+    adds = {}
+    open_forks = []
+    for i, op in enumerate(ops):
+        if op[0] == "fork":
+            open_forks.append(i)
+        elif op[0] == "add":
+            adds[open_forks.pop()] = i
+    for w in reversed(range(windows)):
+        rng.state = generators[w]
+        inputs, results, caches, read = _forward_training(window, read_at, X[:, w * k : (w + 1) * k], states[w], rng)
+        step = recurrence_step_forward(
+            read,
+            states[w],
+            recurrence.q,
+            recurrence.W,
+            recurrence.U,
+            recurrence.b,
+            recurrence.E,
+            k,
+            cross=recurrence.cross,
+        )
+        pooled, dC_w, gq, gW, gU, gb, gE = recurrence_step_backward(
+            step,
+            dC,
+            recurrence.q,
+            recurrence.W,
+            recurrence.U,
+            g_parts["q"],
+            g_parts["W"],
+            g_parts["U"],
+            g_parts["b"],
+            g_codes,
+            weight,
+            commitments,
+        )
+        g_parts.update(q=gq, W=gW, U=gU, b=gb)
+        g_codes = gE
+        deltas: list[Array | None] = [None] * L
+        attention_back: dict[int, tuple[Array, Array, Array, Array]] = {}
+        state_back: dict[int, tuple[Array, Array]] = {}
+        deltas[-1] = ((results[-1] - Y[:, w * width : (w + 1) * width]) / ops[-1][1]) * weight
+
+        def downstream(j: int, deltas=deltas, caches=caches, attention_back=attention_back) -> Array:
+            kind, ps, delta = ops[j][0], window.parameters[j], deltas[j]
+            if kind == "fork":
+                return downstream(j + 1, deltas, caches, attention_back) + deltas[adds[j]]
+            assert delta is not None
+            if kind in ("position", "add", "state_input"):
+                return delta
+            if kind == "layer_norm":
+                return layer_norm_downstream_batch(delta, ps[0], *caches[j])
+            if kind in ("token_dense", "token_output"):
+                W, n, tokens = ps[0], delta.shape[0], ops[j][1]
+                rows = layer_downstream_batch(W, delta.reshape((n * tokens, W.shape[0])))
+                return rows.reshape((n, tokens * W.shape[1]))
+            if kind == "attention":
+                return attention_back[j][0]
+            assert kind == "dropout"
+            return token_dropout_downstream(delta, caches[j], ops[j][1])
+
+        for i in reversed(range(L - 1)):
+            kind, ps = ops[i][0], window.parameters[i]
+            if kind == "fork":
+                continue
+            d = downstream(i + 1)
+            if i + 1 == read_at:
+                d = d + pooled
+            if kind == "token_dense" and ops[i][2] == "relu":
+                d = array_relu_mask(d, results[i])
+            elif kind == "attention":
+                _, heads, _, dropout, cos, sin = ops[i]
+                q, kk, v, p, _, mask = caches[i]
+                table = {} if cos is None else {"cos": cos, "sin": sin}
+                attention_back[i] = attention_downstream_batch(
+                    d, ps[0], ps[2], ps[4], ps[6], q, kk, v, p, heads, mask=mask, dropout=dropout, **table
+                )
+            elif kind == "state_input":
+                state_back[i] = state_input_backward(d, states[w], ps[0], grads[i][0], ops[i][1])
+            deltas[i] = d
+        for i, op in enumerate(ops):
+            kind, x, delta = op[0], inputs[i], deltas[i]
+            if delta is None:
+                continue  # a fork's, never read
+            if kind == "embedding":
+                grads[i][0] = embedding_accumulate_gradient(delta, x, grads[i][0])
+            elif kind == "position":
+                rows, cols = grads[i][0].shape[0], grads[i][0].shape[1]
+                grads[i][0] = grads[i][0] + sum_axis0(delta).reshape((rows, cols))
+            elif kind == "state_input":
+                grads[i][0] = state_back[i][1]
+            elif kind == "layer_norm":
+                grads[i] = list(layer_norm_accumulate_gradient_batch(delta, caches[i][0], *grads[i]))
+            elif kind in ("token_dense", "token_output"):
+                W, n, tokens = window.parameters[i][0], delta.shape[0], op[1]
+                grads[i] = list(
+                    layer_accumulate_gradient_batch(
+                        delta.reshape((n * tokens, W.shape[0])), x.reshape((n * tokens, W.shape[1])), *grads[i]
+                    )
+                )
+            elif kind == "attention":
+                _, dq, dk, dv = attention_back[i]
+                grads[i] = list(attention_accumulate_gradient_batch(delta, x, caches[i][4], dq, dk, dv, *grads[i]))
+        dC = dC_w
+        for i in sorted(state_back):
+            dC = dC + state_back[i][0]
+    rng.state = after
+    parts = [
+        array
+        for g in range(len(recurrence.sizes))
+        for array in (
+            g_parts["q"][g],
+            g_parts["W"][g],
+            g_parts["U"][g],
+            g_parts["b"][g],
+            g_codes[g],
+            _zeros(recurrence.c[g]),
+        )
+        if array is not None
+    ]
+    return [array for arrays in grads for array in arrays] + parts, dC
+
+
+def _check_learn(window: Window, recurrence: Recurrence, n: int, windows: int, seed: int = 0) -> None:
+    rng = np.random.default_rng(seed)
+    X = _ids(rng, n, windows * window.tokens, window.vocabulary)
+    classes = window.parameters[-1][0].shape[0]
+    labels = rng.integers(0, classes, (n, windows * window.tokens))
+    Y = Array(np.eye(classes)[labels].reshape(n, -1).tolist())
+    C0 = _random(rng, n, sum(recurrence.sizes))
+    program = WindowProgram(
+        window.ops, window.tokens, len(window.ops) - 1, recurrence.sizes, recurrence.snapped, cross=recurrence.cross
+    )
+    parameters = [*window.flat(), *recurrence.flat()]
+    gradients = [_zeros(p) for p in parameters]
+    commitments = [0.25 if e is not None else 0.0 for e in recurrence.E]
+    rng_program, rng_per_layer = default_rng(seed), default_rng(seed)
+    dC = window_program_learn(program, X, Y, parameters, gradients, C0, rng_program, 1.0 / windows, commitments)
+    expected, expected_dC = _learn_per_layer(window, recurrence, len(window.ops) - 1, X, Y, C0, rng_per_layer)
+    assert len(gradients) == len(expected)
+    for actual, wanted in zip(gradients, expected, strict=True):
+        _assert_bits(actual, wanted)
+    _assert_bits(dC, expected_dC)
+    assert rng_program.state == rng_per_layer.state
+
+
+@pytest.mark.parametrize("windows", [1, 2, 5])
+def test_the_linear_windows_training_step_is_the_per_layer_path(windows: int):
+    _check_learn(_linear(1, 16, seed=1), Recurrence(16, [(16, 16)], False, seed=2), 4, windows)
+
+
+def test_the_family_windows_training_step_with_rotary_attention_and_dropout_is_the_per_layer_path():
+    window = _family(3, 16, seed=3, rotary=True, dropout=0.25)
+    _check_learn(window, Recurrence(16, [(8, 6), (8, 6)], False, seed=4), 5, 4)
+
+
+@pytest.mark.parametrize(
+    "factors, cross", [([(4, None)], False), ([(3, 5), (5, 7)], True), ([(2, 3), (4, None), (2, 2)], True)]
+)
+def test_factored_continuous_and_crossed_training_steps_are_the_per_layer_path(factors: Factors, cross: bool):
+    size = sum(s for s, _ in factors)
+    _check_learn(_linear(2, size, seed=7), Recurrence(16, factors, cross, seed=8), 4, 3)
+
+
+def test_a_threaded_training_step_is_the_per_layer_path():
+    n, d, s = 2048, 64, 32
+    window = Window(1, 27, d, seed=11).position().state_input(2 * s)
+    window.fork().layer_norm().dense(d, "relu").join()
+    window.layer_norm().output(3)
+    _check_learn(window, Recurrence(d, [(s, 16), (s, 16)], False, seed=12), n, 2)
+
+
+def test_a_training_step_refuses_past_its_memory_budget_and_keeps_its_gradients():
+    window, recurrence = _linear(1, 4, seed=13), Recurrence(16, [(4, 4)], False, seed=14)
+    program = WindowProgram(window.ops, 1, len(window.ops) - 1, [4], [True], cross=False)
+    parameters = [*window.flat(), *recurrence.flat()]
+    gradients = [_zeros(p) for p in parameters]
+    X, Y = Array([[1.0, 2.0]]), Array([[1.0, 0.0, 0.0, 0.0, 1.0, 0.0]])
+    with pytest.raises(ValueError, match="memory_budget"):
+        window_program_learn(
+            program, X, Y, parameters, gradients, Array([[0.0] * 4]), default_rng(0), 0.5, [0.25], memory_budget=100
+        )
+    assert all(g.shape == p.shape for g, p in zip(gradients, parameters, strict=True))

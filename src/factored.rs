@@ -223,13 +223,8 @@ struct FactorTape {
 #[pyclass(module = "indrajala_math_rust", frozen, skip_from_py_object)]
 pub struct RecurrenceStep {
     x: Py<RustArray>,
-    tokens: usize,
-    features: usize,
-    cross: bool,
-    rows: usize,
-    sizes: Vec<usize>,
-    starts: Vec<usize>,
-    factors: Vec<FactorTape>,
+    /// the step, its state and cells' outputs moved to `state` and `h`
+    core: StepCore,
     state: Py<RustArray>,
     h: Py<RustArray>,
 }
@@ -251,13 +246,13 @@ impl RecurrenceStep {
     /// Each factor's code indices, one per example; None for a continuous factor.
     #[getter]
     fn indices(&self) -> Vec<Option<Vec<usize>>> {
-        self.factors.iter().map(|f| f.indices.clone()).collect()
+        self.core.indices()
     }
 
     /// The factors' state sizes.
     #[getter]
     fn sizes(&self) -> Vec<usize> {
-        self.sizes.clone()
+        self.core.sizes.clone()
     }
 }
 
@@ -287,6 +282,8 @@ fn others(c: &RustArray, total: usize, start: usize, size: usize) -> RustArray {
 /// A window's recurrence step, as `recurrence_step_forward` computes it, without Python's
 /// references: what `RecurrenceStep` holds, and the window program's step (program.rs).
 pub(crate) struct StepCore {
+    tokens: usize,
+    cross: bool,
     pub(crate) features: usize,
     pub(crate) rows: usize,
     pub(crate) sizes: Vec<usize>,
@@ -299,6 +296,36 @@ pub(crate) struct StepCore {
 }
 
 impl StepCore {
+    /// A step of no factors, a placeholder until `step_forward` gives one.
+    pub(crate) fn empty() -> StepCore {
+        StepCore {
+            tokens: 0,
+            cross: false,
+            features: 0,
+            rows: 0,
+            sizes: Vec::new(),
+            starts: Vec::new(),
+            factors: Vec::new(),
+            state: RustArray::from_vector(Vec::new()),
+            h: RustArray::from_vector(Vec::new()),
+        }
+    }
+
+    /// How many values the step keeps for its backward pass.
+    pub(crate) fn floats(&self) -> usize {
+        let tapes: usize = self
+            .factors
+            .iter()
+            .map(|f| {
+                [&f.p, &f.input, &f.c, &f.r, &f.z, &f.h_tilde, &f.rc, &f.h, &f.q]
+                    .iter()
+                    .map(|a| a.data.len())
+                    .sum::<usize>()
+            })
+            .sum();
+        tapes + self.state.data.len() + self.h.data.len()
+    }
+
     /// Each factor's code indices, one per example; None for a continuous factor.
     pub(crate) fn indices(&self) -> Vec<Option<Vec<usize>>> {
         self.factors.iter().map(|f| f.indices.clone()).collect()
@@ -379,6 +406,8 @@ pub(crate) fn step_forward(
     Ok(StepCore {
         state: join(&qs, rows, total),
         h: join(&hs, rows, total),
+        tokens,
+        cross,
         features,
         rows,
         sizes,
@@ -422,17 +451,14 @@ pub fn recurrence_step_forward(
         "recurrence_step_forward",
     )?;
     drop(x_ref);
+    let mut core = core;
+    let state = std::mem::replace(&mut core.state, RustArray::from_vector(Vec::new()));
+    let h = std::mem::replace(&mut core.h, RustArray::from_vector(Vec::new()));
     Ok(RecurrenceStep {
-        state: Py::new(py, core.state)?,
-        h: Py::new(py, core.h)?,
+        state: Py::new(py, state)?,
+        h: Py::new(py, h)?,
         x: x.unbind(),
-        tokens,
-        features: core.features,
-        cross,
-        rows: core.rows,
-        sizes: core.sizes,
-        starts: core.starts,
-        factors: core.factors,
+        core,
     })
 }
 
@@ -466,99 +492,155 @@ pub fn recurrence_step_backward(
     Vec<RustArray>,
     Vec<Option<RustArray>>,
 )> {
-    let context = "recurrence_step_backward";
-    let count = factor_count(
-        &[
-            (step.sizes.len(), "the step's factors"),
-            (queries.len(), "queries"),
-            (w.len(), "w"),
-            (u_weights.len(), "u_weights"),
-            (grad_queries.len(), "grad_queries"),
-            (grad_w.len(), "grad_w"),
-            (grad_u.len(), "grad_u"),
-            (grad_b.len(), "grad_b"),
-            (grad_codes.len(), "grad_codes"),
-            (commitments.len(), "commitments"),
-        ],
-        context,
-    )?;
-    let rows = step.rows;
-    let total = step.starts[count - 1] + step.sizes[count - 1];
-    require_shape(dq, Shape::Matrix(rows, total), "dq", context)?;
     let x = step.x.bind(py).borrow();
-    let features = step.features;
+    let codes: Vec<Option<&RustArray>> = grad_codes.iter().map(|e| e.as_deref()).collect();
+    step.core.backward(
+        &x,
+        dq,
+        &refs(&queries),
+        &refs(&w),
+        &refs(&u_weights),
+        &StepGradients {
+            queries: &refs(&grad_queries),
+            w: &refs(&grad_w),
+            u: &refs(&grad_u),
+            b: &refs(&grad_b),
+            codes: &codes,
+        },
+        weight,
+        &commitments,
+        "recurrence_step_backward",
+    )
+}
 
-    let mut dx: Option<RustArray> = None;
-    let mut dc_own = Vec::with_capacity(count);
-    let mut dc_cross = Vec::with_capacity(count);
-    let mut new_grad_q = Vec::with_capacity(count);
-    let mut new_grad_w = Vec::with_capacity(count);
-    let mut new_grad_u = Vec::with_capacity(count);
-    let mut new_grad_b = Vec::with_capacity(count);
-    let mut new_grad_codes = Vec::with_capacity(count);
-    for (g, dq_g) in split(dq, total, &step.starts, &step.sizes).into_iter().enumerate() {
-        let f = &step.factors[g];
-        let (dh, grad_e) = snap_backward(
-            dq_g,
-            &f.h,
-            &f.q,
-            &f.indices,
-            grad_codes[g].as_deref(),
-            weight,
-            commitments[g],
+/// The parameters' gradients a step's backward pass accumulates onto, each factor's.
+pub(crate) struct StepGradients<'a> {
+    pub(crate) queries: &'a [&'a RustArray],
+    pub(crate) w: &'a [&'a RustArray],
+    pub(crate) u: &'a [&'a RustArray],
+    pub(crate) b: &'a [&'a RustArray],
+    pub(crate) codes: &'a [Option<&'a RustArray>],
+}
+
+/// `recurrence_step_backward`'s result: `(dx, dc, grad_queries, grad_w, grad_u, grad_b, grad_codes)`.
+pub(crate) type StepBackward = (
+    RustArray,
+    RustArray,
+    Vec<RustArray>,
+    Vec<RustArray>,
+    Vec<RustArray>,
+    Vec<RustArray>,
+    Vec<Option<RustArray>>,
+);
+
+impl StepCore {
+    /// `recurrence_step_backward`'s computation, from the tokens `x` the step read, under
+    /// `context`'s name.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn backward(
+        &self,
+        x: &RustArray,
+        dq: &RustArray,
+        queries: &[&RustArray],
+        w: &[&RustArray],
+        u_weights: &[&RustArray],
+        grads: &StepGradients<'_>,
+        weight: f64,
+        commitments: &[f64],
+        context: &str,
+    ) -> PyResult<StepBackward> {
+        let count = factor_count(
+            &[
+                (self.sizes.len(), "the step's factors"),
+                (queries.len(), "queries"),
+                (w.len(), "w"),
+                (u_weights.len(), "u_weights"),
+                (grads.queries.len(), "grad_queries"),
+                (grads.w.len(), "grad_w"),
+                (grads.u.len(), "grad_u"),
+                (grads.b.len(), "grad_b"),
+                (grads.codes.len(), "grad_codes"),
+                (commitments.len(), "commitments"),
+            ],
             context,
         )?;
-        let (d_input, dc, gw, gu, gb) = gru_backward(
-            &dh,
-            &f.input,
-            &f.c,
-            &f.r,
-            &f.z,
-            &f.h_tilde,
-            &f.rc,
-            &w[g],
-            &u_weights[g],
-            &grad_w[g],
-            &grad_u[g],
-            &grad_b[g],
-        )?;
-        let input_size = features + if step.cross { total - step.sizes[g] } else { 0 };
-        let du = if step.cross {
-            dc_cross.push(columns(&d_input, input_size, features, input_size));
-            columns(&d_input, input_size, 0, features)
-        } else {
-            d_input
-        };
-        let (dx_g, gq) = attention_pooling_backward(&x, &f.p, &queries[g], &du, &grad_queries[g], step.tokens)?;
-        dx = Some(match dx {
-            None => dx_g,
-            Some(sum) => RustArray::from_matrix(
-                same_shape_elementwise(&sum.data, &dx_g.data, |a, v| a + v),
-                rows,
-                step.tokens * features,
-            ),
-        });
-        dc_own.push(dc);
-        new_grad_q.push(gq);
-        new_grad_w.push(gw);
-        new_grad_u.push(gu);
-        new_grad_b.push(gb);
-        new_grad_codes.push(grad_e);
-    }
+        let rows = self.rows;
+        let total = self.starts[count - 1] + self.sizes[count - 1];
+        require_shape(dq, Shape::Matrix(rows, total), "dq", context)?;
+        let features = self.features;
 
-    let mut dc = join(&dc_own, rows, total);
-    // each factor h's gradient through the other factors' columns, c_(-h), in factor order
-    for (h, cross) in dc_cross.iter().enumerate() {
-        let (start, size) = (step.starts[h], step.sizes[h]);
-        let width = total - size;
-        for (row, values) in dc.data.chunks_exact_mut(total).zip(cross.data.chunks_exact(width)) {
-            let (before, rest) = row.split_at_mut(start);
-            let targets = before.iter_mut().chain(rest[size..].iter_mut());
-            for (acc, &v) in targets.zip(values) {
-                *acc += v;
+        let mut dx: Option<RustArray> = None;
+        let mut dc_own = Vec::with_capacity(count);
+        let mut dc_cross = Vec::with_capacity(count);
+        let mut new_grad_q = Vec::with_capacity(count);
+        let mut new_grad_w = Vec::with_capacity(count);
+        let mut new_grad_u = Vec::with_capacity(count);
+        let mut new_grad_b = Vec::with_capacity(count);
+        let mut new_grad_codes = Vec::with_capacity(count);
+        for (g, dq_g) in split(dq, total, &self.starts, &self.sizes).into_iter().enumerate() {
+            let f = &self.factors[g];
+            let (dh, grad_e) = snap_backward(
+                dq_g,
+                &f.h,
+                &f.q,
+                &f.indices,
+                grads.codes[g],
+                weight,
+                commitments[g],
+                context,
+            )?;
+            let (d_input, dc, gw, gu, gb) = gru_backward(
+                &dh,
+                &f.input,
+                &f.c,
+                &f.r,
+                &f.z,
+                &f.h_tilde,
+                &f.rc,
+                w[g],
+                u_weights[g],
+                grads.w[g],
+                grads.u[g],
+                grads.b[g],
+            )?;
+            let input_size = features + if self.cross { total - self.sizes[g] } else { 0 };
+            let du = if self.cross {
+                dc_cross.push(columns(&d_input, input_size, features, input_size));
+                columns(&d_input, input_size, 0, features)
+            } else {
+                d_input
+            };
+            let (dx_g, gq) = attention_pooling_backward(x, &f.p, queries[g], &du, grads.queries[g], self.tokens)?;
+            dx = Some(match dx {
+                None => dx_g,
+                Some(sum) => RustArray::from_matrix(
+                    same_shape_elementwise(&sum.data, &dx_g.data, |a, v| a + v),
+                    rows,
+                    self.tokens * features,
+                ),
+            });
+            dc_own.push(dc);
+            new_grad_q.push(gq);
+            new_grad_w.push(gw);
+            new_grad_u.push(gu);
+            new_grad_b.push(gb);
+            new_grad_codes.push(grad_e);
+        }
+
+        let mut dc = join(&dc_own, rows, total);
+        // each factor h's gradient through the other factors' columns, c_(-h), in factor order
+        for (h, cross) in dc_cross.iter().enumerate() {
+            let (start, size) = (self.starts[h], self.sizes[h]);
+            let width = total - size;
+            for (row, values) in dc.data.chunks_exact_mut(total).zip(cross.data.chunks_exact(width)) {
+                let (before, rest) = row.split_at_mut(start);
+                let targets = before.iter_mut().chain(rest[size..].iter_mut());
+                for (acc, &v) in targets.zip(values) {
+                    *acc += v;
+                }
             }
         }
+        let dx = dx.expect("a step has 1 or more factors");
+        Ok((dx, dc, new_grad_q, new_grad_w, new_grad_u, new_grad_b, new_grad_codes))
     }
-    let dx = dx.expect("a step has 1 or more factors");
-    Ok((dx, dc, new_grad_q, new_grad_w, new_grad_u, new_grad_b, new_grad_codes))
 }
