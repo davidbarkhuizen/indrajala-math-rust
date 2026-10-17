@@ -49,7 +49,7 @@ def test_adam_bias_corrections_are_square_and_multiply_by_bits(t: int):
         Array(w), Array(b), Array(gw), Array(gb), Array(mw), Array(vw), Array(mb), Array(vb),
         t, 0.9, 0.999, 1e-8, 0.001, 2,
     )  # fmt: skip
-    flat = lambda rows: [x for row in rows for x in row]  # noqa: E731
+    flat = lambda rows: [x for row in rows for x in row]
     expected_w = _adam(flat(w), flat(gw), flat(mw), flat(vw), t, 0.9, 0.999, 1e-8, 0.001, 2.0)
     expected_b = _adam(b, gb, mb, vb, t, 0.9, 0.999, 1e-8, 0.001, 2.0)
     assert (flat(new_w.tolist()), flat(new_mw.tolist()), flat(new_vw.tolist())) == expected_w
