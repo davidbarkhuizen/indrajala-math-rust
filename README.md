@@ -46,7 +46,7 @@ tests catches wrong types.
 CI (`.github/workflows/ci.yml`) runs all of these, and the build and test steps, on every push and
 PR to `main`.
 
-`tests/` (~2,370 tests, about 15 s) checks each op against numpy and needs nothing from
+`tests/` (~2,790 tests, about 30 s) checks each op against numpy and needs nothing from
 indrajala-ml. The tests that check the fused layer ops against indrajala-ml's numpy reference
 classes live in indrajala-ml's own `tests/`, so a change to `src/fused.rs` or `src/conv.rs` should
 also be tested there: in an indrajala-ml checkout, point `rust/` at the new commit, then

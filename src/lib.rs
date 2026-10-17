@@ -11,6 +11,7 @@ mod layer_norm;
 mod linalg;
 mod mnist;
 mod ops;
+mod program;
 mod random;
 mod recurrent;
 mod tokens;
@@ -48,6 +49,7 @@ use layer_norm::{
 };
 use linalg::{matmul_threads_for, outer, set_kernel_overrides, set_matmul_threading};
 use mnist::decode_mnist_pixels;
+use program::{argmax_token_rows, window_program_forward, WindowProgram};
 use random::{bernoulli_mask, seed, seed_at_import, uniform};
 use recurrent::{
     attention_pooling_backward, attention_pooling_forward, codes_backward, codes_forward, concatenate_columns,
@@ -168,11 +170,14 @@ fn indrajala_math_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(factored_codes_backward, m)?)?;
     m.add_function(wrap_pyfunction!(recurrence_step_forward, m)?)?;
     m.add_function(wrap_pyfunction!(recurrence_step_backward, m)?)?;
+    m.add_function(wrap_pyfunction!(window_program_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(argmax_token_rows, m)?)?;
     m.add_class::<RustArray>()?;
     m.add_class::<ConvGeometry>()?;
     m.add_class::<SeedSequence>()?;
     m.add_class::<Generator>()?;
     m.add_class::<RecurrenceStep>()?;
+    m.add_class::<WindowProgram>()?;
     seed_at_import();
     Ok(())
 }

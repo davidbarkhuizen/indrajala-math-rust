@@ -482,7 +482,14 @@ pub fn codes_backward(
 /// `np.concatenate(arrays, axis=1)`: matrices of one row count side by side, a copy.
 #[pyfunction]
 pub fn concatenate_columns(arrays: Vec<PyRef<'_, RustArray>>) -> PyResult<RustArray> {
-    let context = "concatenate_columns";
+    join_columns(
+        &arrays.iter().map(|a| &**a).collect::<Vec<&RustArray>>(),
+        "concatenate_columns",
+    )
+}
+
+/// `concatenate_columns` over plain references, under `context`'s name.
+pub(crate) fn join_columns(arrays: &[&RustArray], context: &str) -> PyResult<RustArray> {
     let Some(first) = arrays.first() else {
         return Err(PyValueError::new_err(format!(
             "{context} requires 1 or more arrays, got none"
@@ -490,7 +497,7 @@ pub fn concatenate_columns(arrays: Vec<PyRef<'_, RustArray>>) -> PyResult<RustAr
     };
     let (rows, _) = matrix_shape(first, "every array", context)?;
     let mut widths = Vec::with_capacity(arrays.len());
-    for array in &arrays {
+    for array in arrays {
         let (array_rows, width) = matrix_shape(array, "every array", context)?;
         if array_rows != rows {
             return Err(PyValueError::new_err(format!(
