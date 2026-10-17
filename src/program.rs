@@ -280,44 +280,47 @@ impl WindowProgram {
     }
 
     /// One window's ops from its columns `x` and its state `c`: its output and the tokens the
-    /// poolings read.
+    /// poolings read. Each op's result is kept, as the per-layer path keeps its activations, and a
+    /// fork, a dropout in inference and the poolings refer to theirs rather than copy it.
     fn window(&self, x: RustArray, c: &RustArray, parameters: &[&RustArray]) -> PyResult<(RustArray, RustArray)> {
-        let mut a = x;
-        let mut forks: Vec<RustArray> = Vec::new();
-        let mut read = None;
+        let mut activations = vec![x];
+        let mut current = 0; // the activation the next op reads
+        let mut forks: Vec<usize> = Vec::new();
+        let mut read = 0;
         let mut at = 0;
         for (i, op) in self.ops.iter().enumerate() {
             if i == self.reads {
-                read = Some(a.clone());
+                read = current;
             }
             let p = &parameters[at..at + op.parameter_count()];
             at += op.parameter_count();
-            a = match op {
-                Op::Embedding => embedding_forward(&a, p[0])?,
+            let a = &activations[current];
+            let next = match op {
+                Op::Embedding => embedding_forward(a, p[0])?,
                 Op::Position => {
                     a.combine_with_array(&RustArray::from_vector(p[0].data.clone()), |x, y| x + y, "add")?
                 }
-                Op::StateInput { tokens } => state_input_forward(&a, c, p[0], *tokens)?,
+                Op::StateInput { tokens } => state_input_forward(a, c, p[0], *tokens)?,
                 Op::Fork => {
-                    forks.push(a.clone());
-                    a
+                    forks.push(current);
+                    continue;
                 }
                 Op::Add => {
                     let Some(skip) = forks.pop() else {
                         return Err(PyValueError::new_err("window_program_forward: an add without its fork"));
                     };
-                    a.combine_with_array(&skip, |x, y| x + y, "add")?
+                    a.combine_with_array(&activations[skip], |x, y| x + y, "add")?
                 }
-                Op::LayerNorm { epsilon } => layer_norm_forward_batch(&a, p[0], p[1], *epsilon)?.0,
+                Op::LayerNorm { epsilon } => layer_norm_forward_batch(a, p[0], p[1], *epsilon)?.0,
                 Op::TokenDense { tokens, relu } => {
                     let forward = if *relu {
                         layer_relu_forward_batch
                     } else {
                         affine_forward_batch
                     };
-                    token_rows(&a, *tokens, p[0], p[1], forward)?
+                    token_rows(a, *tokens, p[0], p[1], forward)?
                 }
-                Op::TokenOutput { tokens } => token_rows(&a, *tokens, p[0], p[1], layer_softmax_forward_batch)?,
+                Op::TokenOutput { tokens } => token_rows(a, *tokens, p[0], p[1], layer_softmax_forward_batch)?,
                 Op::Attention {
                     heads,
                     causal,
@@ -326,7 +329,7 @@ impl WindowProgram {
                     sin,
                 } => {
                     attention_forward_batch(
-                        &a,
+                        a,
                         p[0],
                         p[1],
                         p[2],
@@ -345,10 +348,17 @@ impl WindowProgram {
                     )?
                     .0
                 }
-                Op::Dropout => a,
+                Op::Dropout => continue,
             };
+            activations.push(next);
+            current = activations.len() - 1;
         }
-        Ok((a, read.expect("reads is among the ops")))
+        if read == current {
+            let output = activations.swap_remove(current);
+            return Ok((output.clone(), output));
+        }
+        let output = activations.swap_remove(current);
+        Ok((output, activations.swap_remove(read)))
     }
 }
 
@@ -371,15 +381,15 @@ fn token_rows(
             a.shape
         )));
     }
-    let out = forward(w, &reshaped(a, rows, input_size), b)?;
-    Ok(reshaped(&out, examples, tokens * size))
-}
-
-fn reshaped(a: &RustArray, rows: usize, cols: usize) -> RustArray {
-    RustArray {
+    let rows_of = RustArray {
         data: a.data.clone(),
-        shape: Shape::Matrix(rows, cols),
-    }
+        shape: Shape::Matrix(rows, input_size),
+    };
+    let out = forward(w, &rows_of, b)?;
+    Ok(RustArray {
+        data: out.data,
+        shape: Shape::Matrix(examples, tokens * size),
+    })
 }
 
 /// `window_program_forward`'s result: the outputs, and, as kept, each window's next state, its
