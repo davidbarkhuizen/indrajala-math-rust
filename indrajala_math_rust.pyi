@@ -452,3 +452,16 @@ def window_program_forward(
     codes: bool = False,
 ) -> tuple[Array, list[Array], list[Array], list[list[list[int] | None]]]: ...
 def argmax_token_rows(matrix: Array, classes: int) -> list[tuple[int, ...]]: ...
+def window_program_learn(
+    program: WindowProgram,
+    x: Array,
+    y: Array,
+    parameters: list[Array],
+    gradients: list[Array],
+    c0: Array,
+    rng: Generator,
+    weight: float,
+    commitments: list[float],
+    *,
+    memory_budget: int = ...,
+) -> Array: ...

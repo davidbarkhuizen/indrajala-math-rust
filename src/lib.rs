@@ -49,7 +49,7 @@ use layer_norm::{
 };
 use linalg::{matmul_threads_for, outer, set_kernel_overrides, set_matmul_threading};
 use mnist::decode_mnist_pixels;
-use program::{argmax_token_rows, window_program_forward, WindowProgram};
+use program::{argmax_token_rows, window_program_forward, window_program_learn, WindowProgram};
 use random::{bernoulli_mask, seed, seed_at_import, uniform};
 use recurrent::{
     attention_pooling_backward, attention_pooling_forward, codes_backward, codes_forward, concatenate_columns,
@@ -171,6 +171,7 @@ fn indrajala_math_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(recurrence_step_forward, m)?)?;
     m.add_function(wrap_pyfunction!(recurrence_step_backward, m)?)?;
     m.add_function(wrap_pyfunction!(window_program_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(window_program_learn, m)?)?;
     m.add_function(wrap_pyfunction!(argmax_token_rows, m)?)?;
     m.add_class::<RustArray>()?;
     m.add_class::<ConvGeometry>()?;

@@ -21,12 +21,19 @@ use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
 use crate::array::{RustArray, Shape};
-use crate::attention::attention_forward_batch;
-use crate::factored::step_forward;
-use crate::fused::{affine_forward_batch, layer_relu_forward_batch, layer_softmax_forward_batch};
-use crate::layer_norm::layer_norm_forward_batch;
-use crate::recurrent::{columns, join_columns, matrix_shape, state_input_forward};
-use crate::tokens::embedding_forward;
+use crate::attention::{attention_accumulate_gradient_batch, attention_downstream_batch, attention_forward_batch};
+use crate::factored::{step_forward, StepCore, StepGradients};
+use crate::fused::{
+    affine_forward_batch, layer_accumulate_gradient_batch, layer_downstream_batch, layer_relu_forward_batch,
+    layer_softmax_forward_batch,
+};
+use crate::generator::Generator;
+use crate::layer_norm::{layer_norm_accumulate_gradient_batch, layer_norm_downstream_batch, layer_norm_forward_batch};
+use crate::recurrent::{columns, join_columns, matrix_shape, state_input_backward, state_input_forward};
+use crate::tokens::{
+    embedding_accumulate_gradient, embedding_forward, token_dropout_downstream, token_dropout_forward,
+};
+use crate::ufuncs::{array_relu_mask, sum_axis0};
 
 /// One layer of a window, as the program runs it.
 #[derive(Clone)]
@@ -55,15 +62,15 @@ enum Op {
         cos: Option<RustArray>,
         sin: Option<RustArray>,
     },
-    /// token-wise dropout: nothing in inference
-    Dropout,
+    /// token-wise dropout, its drop probability: a mask drawn in training, nothing in inference
+    Dropout { p: f64 },
 }
 
 impl Op {
     fn parameter_count(&self) -> usize {
         match self {
             Op::Embedding | Op::Position | Op::StateInput { .. } => 1,
-            Op::Fork | Op::Add | Op::Dropout => 0,
+            Op::Fork | Op::Add | Op::Dropout { .. } => 0,
             Op::LayerNorm { .. } | Op::TokenDense { .. } | Op::TokenOutput { .. } => 2,
             Op::Attention { .. } => 8,
         }
@@ -158,8 +165,7 @@ impl Op {
             }
             "dropout" => {
                 expect(1)?;
-                let _: f64 = item(1)?.extract()?;
-                Op::Dropout
+                Op::Dropout { p: item(1)?.extract()? }
             }
             _ => {
                 return Err(PyValueError::new_err(format!(
@@ -189,6 +195,8 @@ pub struct WindowProgram {
     sizes: Vec<usize>,
     snapped: Vec<bool>,
     cross: bool,
+    /// each fork's add (the op that closes its block); 0 for any other op
+    adds: Vec<usize>,
 }
 
 #[pymethods]
@@ -217,6 +225,27 @@ impl WindowProgram {
                  got columns {columns}, sizes {sizes:?}, snapped {snapped:?}"
             )));
         }
+        let mut adds = vec![0; ops.len()];
+        let mut open = Vec::new();
+        for (i, op) in ops.iter().enumerate() {
+            match op {
+                Op::Fork => open.push(i),
+                Op::Add => {
+                    let Some(fork) = open.pop() else {
+                        return Err(PyValueError::new_err(format!(
+                            "{context}: an add at op {i} without its fork"
+                        )));
+                    };
+                    adds[fork] = i;
+                }
+                _ => {}
+            }
+        }
+        if !open.is_empty() || !matches!(ops.last(), Some(Op::TokenOutput { .. })) {
+            return Err(PyValueError::new_err(format!(
+                "{context} requires every fork closed by an add and a token_output op last"
+            )));
+        }
         Ok(WindowProgram {
             ops,
             columns,
@@ -224,6 +253,7 @@ impl WindowProgram {
             sizes,
             snapped,
             cross,
+            adds,
         })
     }
 
@@ -234,7 +264,8 @@ impl WindowProgram {
     }
 }
 
-/// One window's ops' parameters and the recurrence's, split from a call's list.
+/// A call's parameters (or the gradients beside them, in the same order) split by owner: the ops'
+/// as one slice, and each factor's pooling query, cell `w`, `u`, `b` and codes.
 struct Parameters<'a> {
     ops: &'a [&'a RustArray],
     queries: Vec<&'a RustArray>,
@@ -244,83 +275,191 @@ struct Parameters<'a> {
     codes: Vec<Option<&'a RustArray>>,
 }
 
+/// Where each factor's arrays are in a call's list: its pooling query, then its cell's `w`, `u`
+/// and `b`, its codes (if snapped) and its initial state.
+struct FactorAt {
+    query: usize,
+    codes: Option<usize>,
+}
+
+/// What a window's op keeps for the backward pass.
+enum Cache {
+    None,
+    LayerNorm {
+        xhat: RustArray,
+        std: RustArray,
+    },
+    Attention {
+        q: RustArray,
+        k: RustArray,
+        v: RustArray,
+        p: RustArray,
+        h: RustArray,
+        mask: Option<RustArray>,
+    },
+    Dropout {
+        mask: RustArray,
+    },
+}
+
+/// One window's forward pass, what its backward pass reads: each op's result (as the per-layer
+/// path keeps its activations, the window's columns first), the activation each op read and the
+/// one it gave (its input for a fork, or a dropout in inference), its cache, the tokens the
+/// poolings read, and the recurrence step.
+struct WindowTape {
+    activations: Vec<RustArray>,
+    inputs: Vec<usize>,
+    outputs: Vec<usize>,
+    caches: Vec<Cache>,
+    read: usize,
+    step: StepCore,
+}
+
+impl WindowTape {
+    fn floats(&self) -> usize {
+        let caches: usize = self
+            .caches
+            .iter()
+            .map(|cache| match cache {
+                Cache::None => 0,
+                Cache::LayerNorm { xhat, std } => xhat.data.len() + std.data.len(),
+                Cache::Attention { q, k, v, p, h, mask } => {
+                    q.data.len()
+                        + k.data.len()
+                        + v.data.len()
+                        + p.data.len()
+                        + h.data.len()
+                        + mask.as_ref().map_or(0, |m| m.data.len())
+                }
+                Cache::Dropout { mask } => mask.data.len(),
+            })
+            .sum();
+        self.activations.iter().map(|a| a.data.len()).sum::<usize>() + caches + self.step.floats()
+    }
+
+    /// The window's output, the last op's result.
+    fn output(&self) -> &RustArray {
+        &self.activations[*self.outputs.last().expect("a program has 1 or more ops")]
+    }
+}
+
 impl WindowProgram {
     fn op_parameters(&self) -> usize {
         self.ops.iter().map(Op::parameter_count).sum()
     }
 
-    fn split<'a>(&self, parameters: &'a [&'a RustArray], context: &str) -> PyResult<Parameters<'a>> {
-        let expected = self.parameter_count();
-        if parameters.len() != expected {
-            return Err(PyValueError::new_err(format!(
-                "{context} requires {expected} parameters, the ops' then each factor's, got {}",
-                parameters.len()
-            )));
-        }
-        let count = self.op_parameters();
-        let mut split = Parameters {
-            ops: &parameters[..count],
-            queries: Vec::new(),
-            w: Vec::new(),
-            u: Vec::new(),
-            b: Vec::new(),
-            codes: Vec::new(),
-        };
-        let mut at = count;
-        for &snapped in &self.snapped {
-            split.queries.push(parameters[at]);
-            split.w.push(parameters[at + 1]);
-            split.u.push(parameters[at + 2]);
-            split.b.push(parameters[at + 3]);
-            at += 4;
-            split.codes.push(if snapped { Some(parameters[at]) } else { None });
-            at += usize::from(snapped) + 1; // the codes, then the initial state
-        }
-        Ok(split)
+    /// Each op's first parameter's index in a call's list.
+    fn op_offsets(&self) -> Vec<usize> {
+        let mut at = 0;
+        self.ops
+            .iter()
+            .map(|op| {
+                let start = at;
+                at += op.parameter_count();
+                start
+            })
+            .collect()
     }
 
-    /// One window's ops from its columns `x` and its state `c`: its output and the tokens the
-    /// poolings read. Each op's result is kept, as the per-layer path keeps its activations, and a
-    /// fork, a dropout in inference and the poolings refer to theirs rather than copy it.
-    fn window(&self, x: RustArray, c: &RustArray, parameters: &[&RustArray]) -> PyResult<(RustArray, RustArray)> {
-        let mut activations = vec![x];
+    fn factors_at(&self) -> Vec<FactorAt> {
+        let mut at = self.op_parameters();
+        self.snapped
+            .iter()
+            .map(|&snapped| {
+                let factor = FactorAt {
+                    query: at,
+                    codes: snapped.then_some(at + 4),
+                };
+                at += 5 + usize::from(snapped); // the codes, then the initial state
+                factor
+            })
+            .collect()
+    }
+
+    fn check_count(&self, count: usize, name: &str, context: &str) -> PyResult<()> {
+        let expected = self.parameter_count();
+        if count != expected {
+            return Err(PyValueError::new_err(format!(
+                "{context} requires {expected} {name}, the ops' then each factor's, got {count}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn split<'a>(&self, arrays: &'a [&'a RustArray]) -> Parameters<'a> {
+        let factors = self.factors_at();
+        Parameters {
+            ops: &arrays[..self.op_parameters()],
+            queries: factors.iter().map(|f| arrays[f.query]).collect(),
+            w: factors.iter().map(|f| arrays[f.query + 1]).collect(),
+            u: factors.iter().map(|f| arrays[f.query + 2]).collect(),
+            b: factors.iter().map(|f| arrays[f.query + 3]).collect(),
+            codes: factors.iter().map(|f| f.codes.map(|e| arrays[e])).collect(),
+        }
+    }
+
+    /// One window's ops from its columns `x` and its state `c`, then its recurrence step: the
+    /// window's tape. In training (`rng` given) dropout draws its masks from `rng` in the ops'
+    /// order, as the per-layer path's layers draw them; in inference it passes its input on.
+    fn window(
+        &self,
+        x: RustArray,
+        c: &RustArray,
+        split: &Parameters<'_>,
+        rng: Option<&Bound<'_, Generator>>,
+        context: &str,
+    ) -> PyResult<WindowTape> {
+        let parameters = split.ops;
+        let mut tape = WindowTape {
+            activations: vec![x],
+            inputs: Vec::with_capacity(self.ops.len()),
+            outputs: Vec::with_capacity(self.ops.len()),
+            caches: Vec::with_capacity(self.ops.len()),
+            read: 0,
+            step: StepCore::empty(),
+        };
         let mut current = 0; // the activation the next op reads
         let mut forks: Vec<usize> = Vec::new();
-        let mut read = 0;
         let mut at = 0;
         for (i, op) in self.ops.iter().enumerate() {
             if i == self.reads {
-                read = current;
+                tape.read = current;
             }
             let p = &parameters[at..at + op.parameter_count()];
             at += op.parameter_count();
-            let a = &activations[current];
+            tape.inputs.push(current);
+            let a = &tape.activations[current];
+            let mut cache = Cache::None;
             let next = match op {
-                Op::Embedding => embedding_forward(a, p[0])?,
+                Op::Embedding => Some(embedding_forward(a, p[0])?),
                 Op::Position => {
-                    a.combine_with_array(&RustArray::from_vector(p[0].data.clone()), |x, y| x + y, "add")?
+                    Some(a.combine_with_array(&RustArray::from_vector(p[0].data.clone()), |x, y| x + y, "add")?)
                 }
-                Op::StateInput { tokens } => state_input_forward(a, c, p[0], *tokens)?,
+                Op::StateInput { tokens } => Some(state_input_forward(a, c, p[0], *tokens)?),
                 Op::Fork => {
                     forks.push(current);
-                    continue;
+                    None
                 }
                 Op::Add => {
                     let Some(skip) = forks.pop() else {
-                        return Err(PyValueError::new_err("window_program_forward: an add without its fork"));
+                        return Err(PyValueError::new_err(format!("{context}: an add without its fork")));
                     };
-                    a.combine_with_array(&activations[skip], |x, y| x + y, "add")?
+                    Some(a.combine_with_array(&tape.activations[skip], |x, y| x + y, "add")?)
                 }
-                Op::LayerNorm { epsilon } => layer_norm_forward_batch(a, p[0], p[1], *epsilon)?.0,
+                Op::LayerNorm { epsilon } => {
+                    let (out, xhat, std) = layer_norm_forward_batch(a, p[0], p[1], *epsilon)?;
+                    cache = Cache::LayerNorm { xhat, std };
+                    Some(out)
+                }
                 Op::TokenDense { tokens, relu } => {
                     let forward = if *relu {
                         layer_relu_forward_batch
                     } else {
                         affine_forward_batch
                     };
-                    token_rows(a, *tokens, p[0], p[1], forward)?
+                    Some(token_rows(a, *tokens, p[0], p[1], forward)?)
                 }
-                Op::TokenOutput { tokens } => token_rows(a, *tokens, p[0], p[1], layer_softmax_forward_batch)?,
+                Op::TokenOutput { tokens } => Some(token_rows(a, *tokens, p[0], p[1], layer_softmax_forward_batch)?),
                 Op::Attention {
                     heads,
                     causal,
@@ -328,7 +467,7 @@ impl WindowProgram {
                     cos,
                     sin,
                 } => {
-                    attention_forward_batch(
+                    let (out, q, k, v, pw, h, mask) = attention_forward_batch(
                         a,
                         p[0],
                         p[1],
@@ -341,24 +480,80 @@ impl WindowProgram {
                         *heads,
                         *causal,
                         *dropout,
-                        false,
-                        None,
+                        rng.is_some(),
+                        rng.map(|r| r.borrow_mut()),
                         cos.as_ref(),
                         sin.as_ref(),
-                    )?
-                    .0
+                    )?;
+                    if rng.is_some() {
+                        cache = Cache::Attention {
+                            q,
+                            k,
+                            v,
+                            p: pw,
+                            h,
+                            mask,
+                        };
+                    }
+                    Some(out)
                 }
-                Op::Dropout => continue,
+                Op::Dropout { p: drop } => match rng {
+                    Some(rng) => {
+                        let (out, mask) = token_dropout_forward(a, *drop, rng.borrow_mut())?;
+                        cache = Cache::Dropout { mask };
+                        Some(out)
+                    }
+                    None => None,
+                },
             };
-            activations.push(next);
-            current = activations.len() - 1;
+            if rng.is_none() {
+                // inference keeps no cache: only the activations the later ops and the step read
+                cache = Cache::None;
+            }
+            if let Some(next) = next {
+                tape.activations.push(next);
+                current = tape.activations.len() - 1;
+            }
+            tape.outputs.push(current);
+            tape.caches.push(cache);
         }
-        if read == current {
-            let output = activations.swap_remove(current);
-            return Ok((output.clone(), output));
+        tape.step = step_forward(
+            &tape.activations[tape.read],
+            c,
+            &split.queries,
+            &split.w,
+            &split.u,
+            &split.b,
+            &split.codes,
+            self.columns,
+            self.cross,
+            context,
+        )?;
+        if tape.step.sizes != self.sizes {
+            return Err(PyValueError::new_err(format!(
+                "{context}: the cells' state sizes {:?} aren't the program's {:?}",
+                tape.step.sizes, self.sizes
+            )));
         }
-        let output = activations.swap_remove(current);
-        Ok((output, activations.swap_remove(read)))
+        Ok(tape)
+    }
+
+    fn check_input(&self, x: &RustArray, c0: &RustArray, context: &str) -> PyResult<usize> {
+        let (rows, width) = matrix_shape(x, "x", context)?;
+        let k = self.columns;
+        if width == 0 || width % k != 0 {
+            return Err(PyValueError::new_err(format!(
+                "{context} reads whole windows of {k} columns, got {width} columns"
+            )));
+        }
+        let total: usize = self.sizes.iter().sum();
+        if c0.shape != Shape::Matrix(rows, total) {
+            return Err(PyValueError::new_err(format!(
+                "{context} requires c0 of shape ({rows}, {total}), got {:?}",
+                c0.shape
+            )));
+        }
+        Ok(width / k)
     }
 }
 
@@ -371,25 +566,36 @@ fn token_rows(
     b: &RustArray,
     forward: fn(&RustArray, &RustArray, &RustArray) -> PyResult<RustArray>,
 ) -> PyResult<RustArray> {
-    let context = "window_program_forward";
-    let (examples, _) = matrix_shape(a, "a token-wise layer's input", context)?;
-    let (size, input_size) = matrix_shape(w, "a token-wise layer's w", context)?;
+    let (_, input_size) = matrix_shape(w, "a token-wise layer's w", "window program")?;
+    let (examples, rows) = token_shape(a, tokens, input_size)?;
+    let out = forward(w, &reshaped(a, rows, input_size), b)?;
+    let width = out.data.len() / examples.max(1);
+    Ok(RustArray {
+        data: out.data,
+        shape: Shape::Matrix(examples, width),
+    })
+}
+
+/// `a` `(N, T * features)`'s examples and its rows of tokens, `N * T`, refused unless whole.
+fn token_shape(a: &RustArray, tokens: usize, features: usize) -> PyResult<(usize, usize)> {
+    let context = "window program";
+    let (examples, _) = matrix_shape(a, "a token-wise layer's array", context)?;
     let rows = examples * tokens;
-    if a.data.len() != rows * input_size {
+    if a.data.len() != rows * features {
         return Err(PyValueError::new_err(format!(
-            "{context}: a token-wise layer of {tokens} tokens of {input_size} features got shape {:?}",
+            "{context}: a token-wise layer of {tokens} tokens of {features} features got shape {:?}",
             a.shape
         )));
     }
-    let rows_of = RustArray {
+    Ok((examples, rows))
+}
+
+/// `a`'s values as a `(rows, cols)` matrix, a copy (as `Array.reshape`).
+fn reshaped(a: &RustArray, rows: usize, cols: usize) -> RustArray {
+    RustArray {
         data: a.data.clone(),
-        shape: Shape::Matrix(rows, input_size),
-    };
-    let out = forward(w, &rows_of, b)?;
-    Ok(RustArray {
-        data: out.data,
-        shape: Shape::Matrix(examples, tokens * size),
-    })
+        shape: Shape::Matrix(rows, cols),
+    }
 }
 
 /// `window_program_forward`'s result: the outputs, and, as kept, each window's next state, its
@@ -414,47 +620,18 @@ pub fn window_program_forward(
 ) -> PyResult<ProgramForward> {
     let context = "window_program_forward";
     let parameters: Vec<&RustArray> = parameters.iter().map(|p| &**p).collect();
-    let split = program.split(&parameters, context)?;
-    let (_, width) = matrix_shape(x, "x", context)?;
-    let k = program.columns;
-    if width == 0 || width % k != 0 {
-        return Err(PyValueError::new_err(format!(
-            "{context} reads whole windows of {k} columns, got {width} columns"
-        )));
-    }
-    let total: usize = program.sizes.iter().sum();
-    let (rows, _) = matrix_shape(x, "x", context)?;
-    if c0.shape != Shape::Matrix(rows, total) {
-        return Err(PyValueError::new_err(format!(
-            "{context} requires c0 of shape ({rows}, {total}), got {:?}",
-            c0.shape
-        )));
-    }
-    let windows = width / k;
+    program.check_count(parameters.len(), "parameters", context)?;
+    let split = program.split(&parameters);
+    let windows = program.check_input(x, c0, context)?;
+    let (k, width) = (program.columns, windows * program.columns);
     let mut outputs = Vec::with_capacity(windows);
     let (mut kept_states, mut kept_cells, mut kept_indices) = (Vec::new(), Vec::new(), Vec::new());
     let mut c = c0.clone();
     for w in 0..windows {
-        let (output, read) = program.window(columns(x, width, w * k, (w + 1) * k), &c, split.ops)?;
-        let step = step_forward(
-            &read,
-            &c,
-            &split.queries,
-            &split.w,
-            &split.u,
-            &split.b,
-            &split.codes,
-            k,
-            program.cross,
-            context,
-        )?;
-        if step.sizes != program.sizes {
-            return Err(PyValueError::new_err(format!(
-                "{context}: the cells' state sizes {:?} aren't the program's {:?}",
-                step.sizes, program.sizes
-            )));
-        }
-        outputs.push(output);
+        let mut tape = program.window(columns(x, width, w * k, (w + 1) * k), &c, &split, None, context)?;
+        let last = *tape.outputs.last().expect("a program has 1 or more ops");
+        outputs.push(tape.activations.swap_remove(last));
+        let step = tape.step;
         if codes {
             kept_indices.push(step.indices());
         }
@@ -466,6 +643,408 @@ pub fn window_program_forward(
     }
     let refs: Vec<&RustArray> = outputs.iter().collect();
     Ok((join_columns(&refs, context)?, kept_states, kept_cells, kept_indices))
+}
+
+/// One window's backward pass's gradients: each op's delta and what the ops before read of it.
+struct Backward<'t> {
+    program: &'t WindowProgram,
+    tape: &'t WindowTape,
+    parameters: &'t [&'t RustArray],
+    offsets: &'t [usize],
+    deltas: Vec<Option<RustArray>>,
+    /// an attention's `(dx, dq, dk, dv)`, from its backward pass when its delta is set
+    attention: Vec<Option<(RustArray, RustArray, RustArray, RustArray)>>,
+    /// a StateInput's `(state delta, P's gradient)`
+    state_inputs: Vec<Option<(RustArray, RustArray)>>,
+}
+
+impl Backward<'_> {
+    fn delta(&self, j: usize) -> &RustArray {
+        self.deltas[j]
+            .as_ref()
+            .expect("an op's delta is set before the ops before it read it")
+    }
+
+    /// Op `j`'s downstream, what the op before it reads (each indrajala-ml layer's
+    /// `downstream_batch`); a fork's, its body's first op's plus its add's delta.
+    fn downstream(&self, j: usize) -> PyResult<RustArray> {
+        let p = &self.parameters[self.offsets[j]..];
+        let delta = || self.delta(j).clone();
+        Ok(match &self.program.ops[j] {
+            Op::Embedding => {
+                return Err(PyValueError::new_err(
+                    "window program: an embedding is the first op, nothing reads its downstream",
+                ))
+            }
+            Op::Position | Op::Add | Op::StateInput { .. } => delta(),
+            Op::Fork => {
+                let add = self.program.adds[j];
+                self.downstream(j + 1)?
+                    .combine_with_array(self.delta(add), |x, y| x + y, "add")?
+            }
+            Op::LayerNorm { .. } => {
+                let Cache::LayerNorm { xhat, std } = &self.tape.caches[j] else {
+                    unreachable!("a layer norm's cache")
+                };
+                layer_norm_downstream_batch(self.delta(j), p[0], xhat, std)?
+            }
+            Op::TokenDense { tokens, .. } | Op::TokenOutput { tokens } => {
+                let (size, input_size) = matrix_shape(p[0], "a token-wise layer's w", "window program")?;
+                let (examples, rows) = token_shape(self.delta(j), *tokens, size)?;
+                let out = layer_downstream_batch(p[0], &reshaped(self.delta(j), rows, size))?;
+                RustArray {
+                    data: out.data,
+                    shape: Shape::Matrix(examples, tokens * input_size),
+                }
+            }
+            Op::Attention { .. } => self.attention[j]
+                .as_ref()
+                .expect("an attention's backward pass")
+                .0
+                .clone(),
+            Op::Dropout { p: drop } => match &self.tape.caches[j] {
+                Cache::Dropout { mask } => token_dropout_downstream(self.delta(j), mask, *drop)?,
+                _ => delta(),
+            },
+        })
+    }
+}
+
+/// The tape's step parameters' gradient view, each factor's, from the gradients list.
+fn step_gradients<'a>(gradients: &'a [&'a RustArray], factors: &[FactorAt]) -> [Vec<&'a RustArray>; 4] {
+    [
+        factors.iter().map(|f| gradients[f.query]).collect(),
+        factors.iter().map(|f| gradients[f.query + 1]).collect(),
+        factors.iter().map(|f| gradients[f.query + 2]).collect(),
+        factors.iter().map(|f| gradients[f.query + 3]).collect(),
+    ]
+}
+
+impl WindowProgram {
+    /// One window's backward pass after its forward pass (its tape), from the next state's
+    /// gradient `dc_next` and its targets `y` `(N, k * classes)`, as indrajala-ml's
+    /// `WindowRecurrentShape._window_backward` runs it: each gradient accumulated onto its entry in
+    /// `gradients`, and the window's state's gradient returned.
+    #[allow(clippy::too_many_arguments)]
+    fn window_backward(
+        &self,
+        tape: &WindowTape,
+        c: &RustArray,
+        y: &RustArray,
+        dc_next: &RustArray,
+        parameters: &[&RustArray],
+        gradients: &mut [RustArray],
+        weight: f64,
+        commitments: &[f64],
+        context: &str,
+    ) -> PyResult<RustArray> {
+        let split = self.split(parameters);
+        let factors = self.factors_at();
+        // the recurrence's step: its parts' gradients, and the poolings' gradient of the tokens
+        let (pooled, dc_step, gq, gw, gu, gb, gcodes) = {
+            let refs: Vec<&RustArray> = gradients.iter().collect();
+            let [queries, w, u, b] = step_gradients(&refs, &factors);
+            let codes: Vec<Option<&RustArray>> = factors.iter().map(|f| f.codes.map(|e| refs[e])).collect();
+            let grads = StepGradients {
+                queries: &queries,
+                w: &w,
+                u: &u,
+                b: &b,
+                codes: &codes,
+            };
+            tape.step.backward(
+                &tape.activations[tape.read],
+                dc_next,
+                &split.queries,
+                &split.w,
+                &split.u,
+                &grads,
+                weight,
+                commitments,
+                context,
+            )?
+        };
+        for (f, (q, (w, (u, (b, e))))) in factors.iter().zip(
+            gq.into_iter()
+                .zip(gw.into_iter().zip(gu.into_iter().zip(gb.into_iter().zip(gcodes)))),
+        ) {
+            gradients[f.query] = q;
+            gradients[f.query + 1] = w;
+            gradients[f.query + 2] = u;
+            gradients[f.query + 3] = b;
+            if let (Some(at), Some(e)) = (f.codes, e) {
+                gradients[at] = e;
+            }
+        }
+
+        let offsets = self.op_offsets();
+        let last = self.ops.len() - 1;
+        let mut back = Backward {
+            program: self,
+            tape,
+            parameters,
+            offsets: &offsets,
+            deltas: vec![None; self.ops.len()],
+            attention: (0..self.ops.len()).map(|_| None).collect(),
+            state_inputs: (0..self.ops.len()).map(|_| None).collect(),
+        };
+        // the output layer's delta, (P - Y) / T, then times 1 / W
+        let Op::TokenOutput { tokens } = self.ops[last] else {
+            return Err(PyValueError::new_err(format!(
+                "{context}: a window ends in its token_output op"
+            )));
+        };
+        let a = tape.output();
+        let difference = a.combine_with_array(y, |p, t| p - t, "subtract")?;
+        let delta = scaled(&scaled(&difference, |v| v / tokens as f64), |v| v * weight);
+        back.deltas[last] = Some(delta);
+        // the hidden ops' deltas, last first; the poolings' gradient joins the downstream the op
+        // before the one they read reads
+        for i in (0..last).rev() {
+            if matches!(self.ops[i], Op::Fork) {
+                continue; // its delta is never read: its downstream is its body's and its add's
+            }
+            let mut d = back.downstream(i + 1)?;
+            if i + 1 == self.reads {
+                d = d.combine_with_array(&pooled, |x, y| x + y, "add")?;
+            }
+            let p = &parameters[offsets[i]..];
+            match &self.ops[i] {
+                Op::TokenDense { relu: true, .. } => {
+                    d = array_relu_mask(&d, &tape.activations[tape.outputs[i]])?;
+                }
+                Op::Attention {
+                    heads,
+                    dropout,
+                    cos,
+                    sin,
+                    ..
+                } => {
+                    let Cache::Attention {
+                        q, k, v, p: pw, mask, ..
+                    } = &tape.caches[i]
+                    else {
+                        unreachable!("an attention's cache in training")
+                    };
+                    back.attention[i] = Some(attention_downstream_batch(
+                        &d,
+                        p[0],
+                        p[2],
+                        p[4],
+                        p[6],
+                        q,
+                        k,
+                        v,
+                        pw,
+                        *heads,
+                        mask.as_ref(),
+                        *dropout,
+                        cos.as_ref(),
+                        sin.as_ref(),
+                    )?);
+                }
+                Op::StateInput { tokens } => {
+                    let grad_p = &gradients[offsets[i]];
+                    back.state_inputs[i] = Some(state_input_backward(&d, c, p[0], grad_p, *tokens)?);
+                }
+                _ => {}
+            }
+            back.deltas[i] = Some(d);
+        }
+        // each op's gradients accumulated, from its delta and the activation it read
+        for (i, op) in self.ops.iter().enumerate() {
+            let at = offsets[i];
+            let input = &tape.activations[tape.inputs[i]];
+            match op {
+                Op::Embedding => {
+                    gradients[at] = embedding_accumulate_gradient(back.delta(i), input, &gradients[at])?;
+                }
+                Op::Position => {
+                    let sum = sum_axis0(back.delta(i))?;
+                    let shaped = RustArray {
+                        data: sum.data,
+                        shape: gradients[at].shape,
+                    };
+                    gradients[at] = gradients[at].combine_with_array(&shaped, |x, y| x + y, "add")?;
+                }
+                Op::StateInput { .. } => {
+                    gradients[at] = back.state_inputs[i]
+                        .as_ref()
+                        .expect("a StateInput's backward pass")
+                        .1
+                        .clone();
+                }
+                Op::LayerNorm { .. } => {
+                    let Cache::LayerNorm { xhat, .. } = &tape.caches[i] else {
+                        unreachable!("a layer norm's cache")
+                    };
+                    let (gg, gbeta) =
+                        layer_norm_accumulate_gradient_batch(back.delta(i), xhat, &gradients[at], &gradients[at + 1])?;
+                    gradients[at] = gg;
+                    gradients[at + 1] = gbeta;
+                }
+                Op::TokenDense { tokens, .. } | Op::TokenOutput { tokens } => {
+                    let (size, input_size) = matrix_shape(parameters[at], "a token-wise layer's w", context)?;
+                    let (_, rows) = token_shape(back.delta(i), *tokens, size)?;
+                    let (gw, gbias) = layer_accumulate_gradient_batch(
+                        &reshaped(back.delta(i), rows, size),
+                        &reshaped(input, rows, input_size),
+                        &gradients[at],
+                        &gradients[at + 1],
+                    )?;
+                    gradients[at] = gw;
+                    gradients[at + 1] = gbias;
+                }
+                Op::Attention { .. } => {
+                    let Cache::Attention { h, .. } = &tape.caches[i] else {
+                        unreachable!("an attention's cache in training")
+                    };
+                    let (_, dq, dk, dv) = back.attention[i].as_ref().expect("an attention's backward pass");
+                    let g = &gradients[at..at + 8];
+                    let new = attention_accumulate_gradient_batch(
+                        back.delta(i),
+                        input,
+                        h,
+                        dq,
+                        dk,
+                        dv,
+                        &g[0],
+                        &g[1],
+                        &g[2],
+                        &g[3],
+                        &g[4],
+                        &g[5],
+                        &g[6],
+                        &g[7],
+                    )?;
+                    let (a0, a1, a2, a3, a4, a5, a6, a7) = new;
+                    for (slot, value) in gradients[at..at + 8].iter_mut().zip([a0, a1, a2, a3, a4, a5, a6, a7]) {
+                        *slot = value;
+                    }
+                }
+                Op::Fork | Op::Add | Op::Dropout { .. } => {}
+            }
+        }
+        // the state's gradient: the step's, then each StateInput's, in the ops' order
+        let mut dc = dc_step;
+        for state_input in back.state_inputs.iter().flatten() {
+            dc = dc.combine_with_array(&state_input.0, |x, y| x + y, "add")?;
+        }
+        Ok(dc)
+    }
+}
+
+/// `a` with `f` applied to each value, as an `Array`'s scalar operation.
+fn scaled(a: &RustArray, f: impl Fn(f64) -> f64) -> RustArray {
+    RustArray {
+        data: a.data.iter().map(|&v| f(v)).collect(),
+        shape: a.shape,
+    }
+}
+
+/// The default bound on what a training call keeps of its windows' forward passes (D5): 2 GiB.
+const MEMORY_BUDGET: usize = 2 << 30;
+
+/// A training step's gradients over every window of `x` `(N, W * k)` with targets `y`
+/// `(N, W * k * classes)`, from the snapped initial state `c0`, as indrajala-ml's
+/// `WindowRecurrentShape._accumulate_gradients` computes them: the windows forward in training,
+/// each op's dropout masks drawn from `rng` in the per-layer path's order, keeping every window's
+/// results (D5: no recomputed forward pass); then backward from the last window, each window's
+/// gradients accumulated onto `gradients` (each parameter's, in `parameters`' order; each entry
+/// replaced by its sum) with the codes' losses `weight` (`1 / W`) times `commitments`. Returns the
+/// initial state's gradient `(N, S)`, which the caller takes through the initial state's codes.
+/// Refused before the windows past the first run when what they keep would pass `memory_budget`
+/// bytes.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (program, x, y, parameters, gradients, c0, rng, weight, commitments, *, memory_budget = MEMORY_BUDGET))]
+pub fn window_program_learn(
+    program: &WindowProgram,
+    x: &RustArray,
+    y: &RustArray,
+    parameters: Vec<PyRef<'_, RustArray>>,
+    mut gradients: Vec<PyRefMut<'_, RustArray>>,
+    c0: &RustArray,
+    rng: Bound<'_, Generator>,
+    weight: f64,
+    commitments: Vec<f64>,
+    memory_budget: usize,
+) -> PyResult<RustArray> {
+    let context = "window_program_learn";
+    let parameters: Vec<&RustArray> = parameters.iter().map(|p| &**p).collect();
+    program.check_count(parameters.len(), "parameters", context)?;
+    program.check_count(gradients.len(), "gradients", context)?;
+    if commitments.len() != program.sizes.len() {
+        return Err(PyValueError::new_err(format!(
+            "{context} requires a commitment per factor, {} factors, got {}",
+            program.sizes.len(),
+            commitments.len()
+        )));
+    }
+    let windows = program.check_input(x, c0, context)?;
+    let (k, width) = (program.columns, windows * program.columns);
+    let (rows, _) = matrix_shape(x, "x", context)?;
+    let (y_rows, targets) = matrix_shape(y, "y", context)?;
+    if y_rows != rows || targets % windows != 0 {
+        return Err(PyValueError::new_err(format!(
+            "{context} requires y of one row an example and whole windows of targets, got {:?}",
+            y.shape
+        )));
+    }
+    let per_window = targets / windows;
+    let split = program.split(&parameters);
+
+    let mut tapes = Vec::with_capacity(windows);
+    let mut states = Vec::with_capacity(windows);
+    let mut c = c0.clone();
+    for w in 0..windows {
+        let tape = program.window(columns(x, width, w * k, (w + 1) * k), &c, &split, Some(&rng), context)?;
+        if w == 0 {
+            let bytes = tape.floats() * std::mem::size_of::<f64>() * windows;
+            if bytes > memory_budget {
+                return Err(PyValueError::new_err(format!(
+                    "{context}: keeping {windows} windows' forward passes takes about {bytes} bytes, past the \
+                     memory budget of {memory_budget} (memory_budget)"
+                )));
+            }
+        }
+        let next = tape.step.state.clone();
+        states.push(std::mem::replace(&mut c, next));
+        tapes.push(tape);
+    }
+
+    // every gradient taken out of its array for the pass and put back, whatever its result
+    let mut owned: Vec<RustArray> = gradients
+        .iter_mut()
+        .map(|g| std::mem::replace(&mut **g, RustArray::from_vector(Vec::new())))
+        .collect();
+    let total: usize = program.sizes.iter().sum();
+    let mut dc = RustArray::from_matrix(vec![0.0; rows * total], rows, total);
+    let mut outcome = Ok(());
+    for w in (0..windows).rev() {
+        let yw = columns(y, targets, w * per_window, (w + 1) * per_window);
+        match program.window_backward(
+            &tapes[w],
+            &states[w],
+            &yw,
+            &dc,
+            &parameters,
+            &mut owned,
+            weight,
+            &commitments,
+            context,
+        ) {
+            Ok(next) => dc = next,
+            Err(error) => {
+                outcome = Err(error);
+                break;
+            }
+        }
+    }
+    for (g, value) in gradients.iter_mut().zip(owned) {
+        **g = value;
+    }
+    outcome.map(|()| dc)
 }
 
 /// Each row's runs of `classes` values, each run's index of its largest, the first of equal
