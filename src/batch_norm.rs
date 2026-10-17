@@ -21,7 +21,9 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::array::{RustArray, Shape};
+use crate::cr_exp::exp;
 use crate::linalg::{matmul, matmul_add, matmul_nt};
+use crate::scalar::relu;
 
 /// A batch-norm layer's activation, fused into it as into a dense layer.
 #[derive(Clone, Copy)]
@@ -44,8 +46,8 @@ impl Activation {
     /// `fused.rs`'s sigmoid and ReLU, per value.
     fn apply(self, y: f64) -> f64 {
         match self {
-            Activation::Sigmoid => 1.0 / (1.0 + (-y).exp()),
-            Activation::Relu => y.max(0.0),
+            Activation::Sigmoid => 1.0 / (1.0 + exp(-y)),
+            Activation::Relu => relu(y),
         }
     }
 }

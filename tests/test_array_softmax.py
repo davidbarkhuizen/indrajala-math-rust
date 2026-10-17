@@ -97,3 +97,10 @@ def test_array_softmax_sums_each_row_by_a_left_fold_by_bits(shape: tuple[int, ..
         expected = e / np.cumsum(e, axis=-1)[..., -1:]
         actual = np.array(array_softmax(Array(z.tolist())).tolist())
         assert [v.tobytes() for v in actual.ravel()] == [v.tobytes() for v in expected.ravel()]
+
+
+def test_array_softmax_row_maximum_is_a_left_fold_that_propagates_nan():
+    # the crate's rule (indrajala-ml's aarch64 workplan, D6): a NaN anywhere in a row makes the row NaN
+    out = array_softmax(Array([[1.0, math.nan, 2.0], [-0.0, 0.0, -1.0]])).tolist()
+    assert all(math.isnan(v) for v in out[0])
+    assert out[1] == array_softmax(Array([0.0, 0.0, -1.0])).tolist()

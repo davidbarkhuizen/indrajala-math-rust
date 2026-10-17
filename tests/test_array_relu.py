@@ -4,7 +4,9 @@ before ReLUArrayLayer relies on them, the same "prove the primitive against nump
 building the layer" discipline test_ufuncs_exp.py's own exp check follows.
 """
 
+import math
 import random
+import struct
 
 import numpy as np
 import pytest
@@ -73,3 +75,14 @@ def test_array_relu_mask_preserves_shape_for_2d_arrays():
 def test_array_relu_mask_rejects_mismatched_shapes():
     with pytest.raises(ValueError):
         array_relu_mask(Array.zeros((2, 3)), Array.zeros((3, 2)))
+
+
+def test_array_relu_gives_positive_zero_for_both_zeros_and_propagates_nan_by_bits():
+    # the crate's rule (indrajala-ml's aarch64 workplan, D6), the same on every machine: f64::max
+    # left the zero's sign to the hardware and dropped a NaN
+    negative_nan = struct.unpack("<d", struct.pack("<Q", 0xFFF8000000000000))[0]
+    out = array_relu(Array([-0.0, 0.0, math.nan, negative_nan, -1.5, 2.5])).tolist()
+    bits = [struct.unpack("<Q", struct.pack("<d", v))[0] for v in out]
+    assert bits[:2] == [0, 0]
+    assert bits[2] == 0x7FF8000000000000 and bits[3] == 0xFFF8000000000000
+    assert out[4:] == [0.0, 2.5]

@@ -4,6 +4,7 @@ mod array;
 mod attention;
 mod batch_norm;
 mod conv;
+mod cr_exp;
 mod factored;
 mod fused;
 mod generator;
@@ -14,6 +15,7 @@ mod ops;
 mod program;
 mod random;
 mod recurrent;
+mod scalar;
 mod tokens;
 mod ufuncs;
 

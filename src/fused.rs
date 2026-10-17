@@ -13,6 +13,7 @@ use crate::generator::Generator;
 use crate::linalg::{matmul, matmul_add, matmul_nt};
 use crate::ops::same_shape_elementwise;
 use crate::random::draw_bernoulli_mask;
+use crate::scalar::{powi, relu};
 use crate::ufuncs::{array_softmax, sum_axis0};
 
 fn require_same_shape(a: &RustArray, b: &RustArray, context: &str) -> PyResult<()> {
@@ -34,7 +35,7 @@ fn require_batch_size(batch_size: usize, context: &str) -> PyResult<()> {
 
 fn sigmoid(z: &RustArray) -> RustArray {
     RustArray {
-        data: z.data.iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect(),
+        data: crate::cr_exp::map(&z.data, |v| 1.0 / (1.0 + crate::cr_exp::exp_inline(-v))),
         shape: z.shape,
     }
 }
@@ -327,8 +328,8 @@ fn adam_update(
     learning_rate: f64,
     batch_size: f64,
 ) -> (RustArray, RustArray, RustArray) {
-    let bias_correction1 = 1.0 - beta1.powi(t as i32);
-    let bias_correction2 = 1.0 - beta2.powi(t as i32);
+    let bias_correction1 = 1.0 - powi(beta1, t);
+    let bias_correction2 = 1.0 - powi(beta2, t);
 
     let n = param.data.len();
     let mut new_param_data = Vec::with_capacity(n);
@@ -524,7 +525,7 @@ pub fn layer_momentum_apply_accumulated_gradient(
 pub fn layer_relu_forward(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
     let z = linear_preactivation(w, x, b)?;
     Ok(RustArray {
-        data: z.data.iter().map(|&v| v.max(0.0)).collect(),
+        data: z.data.iter().map(|&v| relu(v)).collect(),
         shape: z.shape,
     })
 }
@@ -534,7 +535,7 @@ pub fn layer_relu_forward(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResu
 pub fn layer_relu_forward_batch(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
     let z = linear_preactivation_batch(w, x, b)?;
     Ok(RustArray {
-        data: z.data.iter().map(|&v| v.max(0.0)).collect(),
+        data: z.data.iter().map(|&v| relu(v)).collect(),
         shape: z.shape,
     })
 }
