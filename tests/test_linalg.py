@@ -451,8 +451,8 @@ def _fma_chain(a_row, b, col):
     return total
 
 
-# widths hit each of the kernel's column paths: 16-wide tiles, 4-wide tiles, the scalar tail, and
-# mixes of them
+# widths hit each of the kernel's column paths: 16-wide tiles, then 4-wide (AVX2) or 2-wide (NEON)
+# tiles, the scalar tail, and mixes of them
 TILE_WIDTHS = (1, 3, 4, 5, 15, 16, 17, 20, 21, 35)
 
 
