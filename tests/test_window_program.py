@@ -440,7 +440,19 @@ def _forward_training(window: Window, read_at: int, a: Array, C: Array, rng: Gen
     return inputs, results, caches, read
 
 
-def _learn_per_layer(window: Window, recurrence: Recurrence, read_at: int, X: Array, Y: Array, C0: Array, rng):
+def _consolidated(representatives: dict[tuple[int, ...], tuple[int, ...]], indices, codes) -> list[Array | None] | None:
+    # each factor's commitment target, the codes of each row's representative (its own if none):
+    # the program's lookup, by hand
+    if not representatives:
+        return None
+    joint = [tuple(int(i) for i in row) for row in zip(*indices, strict=True)]
+    chosen = [representatives.get(code, code) for code in joint]
+    return [Array(np.array(e.tolist())[[c[g] for c in chosen]].tolist()) for g, e in enumerate(codes)]
+
+
+def _learn_per_layer(
+    window: Window, recurrence: Recurrence, read_at: int, X: Array, Y: Array, C0: Array, rng, consolidation=()
+):
     k, ops, L = window.tokens, window.ops, len(window.ops)
     windows = X.shape[1] // k
     weight = 1.0 / windows
@@ -449,6 +461,7 @@ def _learn_per_layer(window: Window, recurrence: Recurrence, read_at: int, X: Ar
     g_parts = {name: [_zeros(a) for a in getattr(recurrence, name)] for name in ("q", "W", "U", "b")}
     g_codes = [None if e is None else _zeros(e) for e in recurrence.E]
     commitments = [0.25 if e is not None else 0.0 for e in recurrence.E]
+    representatives = {tuple(d): tuple(r) for d, r in consolidation}
     states, generators, C = [], [], C0
     for w in range(windows):
         states.append(C)
@@ -493,6 +506,7 @@ def _learn_per_layer(window: Window, recurrence: Recurrence, read_at: int, X: Ar
             g_codes,
             weight,
             commitments,
+            _consolidated(representatives, step.indices, recurrence.E),
         )
         g_parts.update(q=gq, W=gW, U=gU, b=gb)
         g_codes = gE
@@ -581,7 +595,7 @@ def _learn_per_layer(window: Window, recurrence: Recurrence, read_at: int, X: Ar
     return [array for arrays in grads for array in arrays] + parts, dC
 
 
-def _check_learn(window: Window, recurrence: Recurrence, n: int, windows: int, seed: int = 0) -> None:
+def _check_learn(window: Window, recurrence: Recurrence, n: int, windows: int, seed: int = 0, consolidation=()) -> None:
     rng = np.random.default_rng(seed)
     X = _ids(rng, n, windows * window.tokens, window.vocabulary)
     classes = window.parameters[-1][0].shape[0]
@@ -595,8 +609,21 @@ def _check_learn(window: Window, recurrence: Recurrence, n: int, windows: int, s
     gradients = [_zeros(p) for p in parameters]
     commitments = [0.25 if e is not None else 0.0 for e in recurrence.E]
     rng_program, rng_per_layer = default_rng(seed), default_rng(seed)
-    dC = window_program_learn(program, X, Y, parameters, gradients, C0, rng_program, 1.0 / windows, commitments)
-    expected, expected_dC = _learn_per_layer(window, recurrence, len(window.ops) - 1, X, Y, C0, rng_per_layer)
+    dC = window_program_learn(
+        program,
+        X,
+        Y,
+        parameters,
+        gradients,
+        C0,
+        rng_program,
+        1.0 / windows,
+        commitments,
+        consolidation=[(list(d), list(r)) for d, r in consolidation],
+    )
+    expected, expected_dC = _learn_per_layer(
+        window, recurrence, len(window.ops) - 1, X, Y, C0, rng_per_layer, consolidation
+    )
     assert len(gradients) == len(expected)
     for actual, wanted in zip(gradients, expected, strict=True):
         _assert_bits(actual, wanted)
@@ -628,6 +655,58 @@ def test_a_threaded_training_step_is_the_per_layer_path():
     window.fork().layer_norm().dense(d, "relu").join()
     window.layer_norm().output(3)
     _check_learn(window, Recurrence(d, [(s, 16), (s, 16)], False, seed=12), n, 2)
+
+
+def _every_other(counts: list[int]) -> list[tuple[tuple[int, ...], tuple[int, ...]]]:
+    # a consolidation of half the joint codes (those whose first index is odd), each onto the code
+    # before it in its first factor
+    codes = np.ndindex(*counts)
+    return [(code, (code[0] - 1, *code[1:])) for code in codes if code[0] % 2 == 1]
+
+
+@pytest.mark.parametrize("factors", [[(16, 16)], [(8, 6), (8, 6)]])
+def test_a_consolidated_training_step_is_the_per_layer_path_with_its_targets(factors: Factors):
+    # a window's state on a duplicate code is held to its representative's codes, the others to
+    # their own (the code-consolidation workplan, D1)
+    consolidation = _every_other([m for _, m in factors if m is not None])
+    window = _family(3, 16, seed=15, rotary=True, dropout=0.25)
+    _check_learn(window, Recurrence(16, factors, False, seed=16), 6, 4, consolidation=consolidation)
+
+
+def test_an_empty_consolidation_is_no_consolidation():
+    window, recurrence = _linear(2, 8, seed=17), Recurrence(16, [(4, 5), (4, 3)], True, seed=18)
+    _check_learn(window, recurrence, 4, 3, consolidation=[])
+
+
+@pytest.mark.parametrize(
+    "factors, consolidation, message",
+    [
+        ([(4, 4), (4, None)], [([1, 0], [0, 0])], "every factor is snapped"),
+        ([(4, 4), (4, 3)], [([1], [0])], "a code index per factor"),
+        ([(4, 4), (4, 3)], [([1, 3], [0, 0])], "a code index per factor"),
+        ([(4, 4), (4, 3)], [([1, 0], [0, 0]), ([1, 0], [2, 0])], "each duplicate once"),
+    ],
+)
+def test_a_training_step_refuses_a_malformed_consolidation(factors: Factors, consolidation, message: str):
+    size = sum(s for s, _ in factors)
+    window, recurrence = _linear(1, size, seed=19), Recurrence(16, factors, False, seed=20)
+    program = WindowProgram(window.ops, 1, len(window.ops) - 1, recurrence.sizes, recurrence.snapped, cross=False)
+    parameters = [*window.flat(), *recurrence.flat()]
+    X, Y = Array([[1.0]]), Array([[1.0, 0.0, 0.0]])
+    commitments = [0.25 if e is not None else 0.0 for e in recurrence.E]
+    with pytest.raises(ValueError, match=message):
+        window_program_learn(
+            program,
+            X,
+            Y,
+            parameters,
+            [_zeros(p) for p in parameters],
+            Array([[0.0] * size]),
+            default_rng(0),
+            1.0,
+            commitments,
+            consolidation=consolidation,
+        )
 
 
 def test_a_training_step_refuses_past_its_memory_budget_and_keeps_its_gradients():

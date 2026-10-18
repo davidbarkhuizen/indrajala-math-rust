@@ -17,8 +17,11 @@
 //!               dW += dA^T u;  db += sum_n dA;  dU_r,z += dA_r,z^T c;  dU_h += dA_h^T (r * c)
 //!               du = dA W;  dc = (dh * z + d(rc) * r) + dA_r,z U_r,z
 //! codes         i = argmin_k ||h - e_k||^2 (lowest k on a tie);  q = e_i
-//!               dE_i += (-2 w) (h - q), row by row;  dh = dq + (2 w beta) (h - q)
+//!               dE_i += (-2 w) (h - q), row by row;  dh = dq + (2 w beta) (h - t)
 //! ```
+//!
+//! where `t`, the commitment's target, is `q` unless a target is given (indrajala-ml's
+//! code-consolidation workplan, D1: a duplicate code's state pulled to its representative's code).
 //!
 //! with `sigmoid(x) = 1 / (1 + exp(-x))` and `tanh(x) = 1 - 2 / (exp(2x) + 1)` (the workplan's W15),
 //! `exp` Rust's `f64::exp`, as `exp` (`ufuncs.rs`) is. The products are the crate's (`matmul`,
@@ -440,9 +443,12 @@ pub fn codes_forward(h: &RustArray, e: &RustArray) -> PyResult<(RustArray, Vec<u
 
 /// `CodesArrayLayer.backward_batch` after `codes_forward` gave `q` and `indices`: with `D = h -
 /// q`, `e`'s gradient `grad_e` with `(-2 weight) D` added row by row to the rows `indices` name,
-/// in row order (`np.add.at`), and `h`'s gradient `dq + (2 weight commitment) D`. Returns `(dh,
-/// grad_e)`.
+/// in row order (`np.add.at`), and `h`'s gradient `dq + (2 weight commitment) (h - t)`, the
+/// commitment's target `t` the rows of `target` `(N, size)`, or `q` without one (then `h - t` is
+/// `D`, the same bits). Returns `(dh, grad_e)`.
+#[allow(clippy::too_many_arguments)]
 #[pyfunction]
+#[pyo3(signature = (dq, h, q, indices, grad_e, weight, commitment, target = None))]
 pub fn codes_backward(
     dq: &RustArray,
     h: &RustArray,
@@ -451,11 +457,15 @@ pub fn codes_backward(
     grad_e: &RustArray,
     weight: f64,
     commitment: f64,
+    target: Option<&RustArray>,
 ) -> PyResult<(RustArray, RustArray)> {
     let context = "codes_backward";
     let (rows, count, size) = codes_shape(h, grad_e, context)?;
     require_shape(q, h.shape, "q", context)?;
     require_shape(dq, h.shape, "dq", context)?;
+    if let Some(t) = target {
+        require_shape(t, h.shape, "target", context)?;
+    }
     if indices.len() != rows || indices.iter().any(|&i| i >= count) {
         return Err(PyValueError::new_err(format!(
             "{context} requires an index in [0, {count}) for each of the {rows} rows, got {indices:?}"
@@ -470,7 +480,13 @@ pub fn codes_backward(
             *acc += code_scale * d;
         }
     }
-    let dh = same_shape_elementwise(&dq.data, &differences, |g, d| g + state_scale * d);
+    let dh = match target {
+        None => same_shape_elementwise(&dq.data, &differences, |g, d| g + state_scale * d),
+        Some(t) => {
+            let pulled = same_shape_elementwise(&h.data, &t.data, |hv, tv| hv - tv);
+            same_shape_elementwise(&dq.data, &pulled, |g, d| g + state_scale * d)
+        }
+    };
     Ok((
         RustArray::from_matrix(dh, rows, size),
         RustArray {

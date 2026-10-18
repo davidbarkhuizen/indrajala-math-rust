@@ -264,6 +264,46 @@ def test_codes_backward_is_numpys_straight_through_and_scatter_add(n: int, count
     assert _bits(_numpy(dH).reshape(n, size)) == _bits(dQ + (2.0 * weight * commitment) * differences)
 
 
+@pytest.mark.parametrize("n,count,size", CODES)
+def test_codes_backward_holds_h_to_a_given_target_and_the_codes_to_h(n: int, count: int, size: int):
+    # the commitment pulls h to the target's rows; the codebook's loss still pulls each code to its h
+    H, E = _codes_inputs(n, count, size)
+    rng = np.random.default_rng(count + 1)
+    dQ, grad_E = rng.uniform(-1, 1, (n, size)), rng.uniform(-1, 1, (count, size))
+    weight, commitment = 1.0 / 3.0, 0.25
+    indices = _nearest(H, E)
+    Q, T = E[indices], E[(indices + 1) % count]
+    dH, new_grad_E = codes_backward(
+        _array(dQ), _array(H), _array(Q), indices.tolist(), _array(grad_E), weight, commitment, _array(T)
+    )
+    expected_grad_E = grad_E.copy()
+    np.add.at(expected_grad_E, indices, -2.0 * weight * (H - Q))
+    assert _bits(_numpy(new_grad_E)) == _bits(expected_grad_E)
+    assert _bits(_numpy(dH).reshape(n, size)) == _bits(dQ + (2.0 * weight * commitment) * (H - T))
+
+    # q as the target is no target, by bits
+    untargeted = codes_backward(_array(dQ), _array(H), _array(Q), indices.tolist(), _array(grad_E), weight, commitment)
+    targeted = codes_backward(
+        _array(dQ), _array(H), _array(Q), indices.tolist(), _array(grad_E), weight, commitment, _array(Q)
+    )
+    for a, b in zip(untargeted, targeted, strict=True):
+        assert _bits(_numpy(a)) == _bits(_numpy(b))
+
+
+def test_codes_backward_refuses_a_target_of_another_shape():
+    with pytest.raises(ValueError, match="target"):
+        codes_backward(
+            Array.zeros((1, 2)),
+            Array.zeros((1, 2)),
+            Array.zeros((1, 2)),
+            [0],
+            Array.zeros((3, 2)),
+            1.0,
+            0.25,
+            Array.zeros((2, 2)),
+        )
+
+
 def test_codes_backward_refuses_an_index_past_the_codes():
     with pytest.raises(ValueError, match="an index in"):
         codes_backward(
