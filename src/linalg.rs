@@ -81,6 +81,10 @@ fn dot_product(a: &[f64], b: &[f64]) -> f64 {
             return unsafe { dot_product_avx2_fma(a, b) };
         }
     }
+    // NEON is part of aarch64's baseline: no runtime check, and the scalar path never runs there
+    #[cfg(target_arch = "aarch64")]
+    return unsafe { dot_product_neon(a, b) };
+    #[cfg(not(target_arch = "aarch64"))]
     dot_product_scalar(a, b)
 }
 
@@ -94,8 +98,8 @@ fn dot_product(a: &[f64], b: &[f64]) -> f64 {
 /// keep its grouping, so a batched forward's rows stay bit-identical to the single-example forward.
 fn dot_products_into(rows: &[f64], k: usize, v: &[f64], out: &mut [f64]) {
     #[cfg_attr(
-        not(target_arch = "x86_64"),
-        expect(unused_mut, reason = "only the AVX2 blocks move it")
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        expect(unused_mut, reason = "only the vector blocks move it")
     )]
     let mut row = 0;
     #[cfg(target_arch = "x86_64")]
@@ -106,7 +110,13 @@ fn dot_products_into(rows: &[f64], k: usize, v: &[f64], out: &mut [f64]) {
             row = unsafe { dot_product_blocks_avx2_fma::<2>(rows, k, v, out, row) };
         }
     }
-    // the rows left over after the last full block, or every row without AVX2
+    #[cfg(target_arch = "aarch64")]
+    {
+        row = unsafe { dot_product_blocks_neon::<8>(rows, k, v, out, row) };
+        row = unsafe { dot_product_blocks_neon::<4>(rows, k, v, out, row) };
+        row = unsafe { dot_product_blocks_neon::<2>(rows, k, v, out, row) };
+    }
+    // the rows left over after the last full block, or every row without the vector blocks
     for r in row..out.len() {
         out[r] = dot_product(&rows[r * k..(r + 1) * k], v);
     }
@@ -178,6 +188,7 @@ fn dot_product_tail(a: &[f64], b: &[f64], start: usize, initial: f64) -> f64 {
     sum
 }
 
+#[cfg_attr(target_arch = "aarch64", expect(dead_code, reason = "NEON replaces it on aarch64"))]
 #[inline]
 fn dot_product_scalar(a: &[f64], b: &[f64]) -> f64 {
     let len = a.len();
@@ -376,6 +387,7 @@ pub(crate) fn matmul_nt(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
     }
     let mut out = vec![0.0; m * n];
     for_each_row_range(&mut out, m, n, m * k * n, |chunk, row_start, row_end| {
+        #[cfg(not(target_arch = "aarch64"))]
         #[cfg_attr(
             not(target_arch = "x86_64"),
             expect(unused_mut, reason = "only the AVX2 blocks move it")
@@ -387,7 +399,10 @@ pub(crate) fn matmul_nt(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
                 row = unsafe { matmul_nt_blocks_avx2_fma(&a.data, &b.data, chunk, row_start, row_end, k, n) };
             }
         }
-        // the rows left over after the last full block, or every row without AVX2
+        // NEON is part of aarch64's baseline: its blocks always run there
+        #[cfg(target_arch = "aarch64")]
+        let row = unsafe { matmul_nt_blocks_neon(&a.data, &b.data, chunk, row_start, row_end, k, n) };
+        // the rows left over after the last full block, or every row without the vector blocks
         for row in row..row_end {
             let a_row = &a.data[row * k..(row + 1) * k];
             let out_row = &mut chunk[(row - row_start) * n..(row - row_start + 1) * n];
@@ -490,6 +505,179 @@ unsafe fn dot_product_tile_avx2_fma<const RA: usize, const RB: usize>(
                 &a_rows[r * k..(r + 1) * k],
                 i,
                 combine_lanes(lanes),
+            );
+        }
+    }
+    out
+}
+
+/// `dot_product`'s 4 lanes held as NEON's two 2-lane registers, `lo` lanes 0-1 and `hi` lanes 2-3:
+/// each group of 4 is one FMA into each, so lane `j`'s sum is exactly `dot_product_scalar`'s
+/// `lanes[j]` (`vfmaq_f64` is the fused multiply-add `f64::mul_add` is; the aarch64 workplan's D5).
+/// Safety: none beyond NEON, aarch64's baseline (the lane reads are intrinsics).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn neon_lanes(lo: std::arch::aarch64::float64x2_t, hi: std::arch::aarch64::float64x2_t) -> [f64; 4] {
+    use std::arch::aarch64::vgetq_lane_f64;
+
+    [
+        vgetq_lane_f64::<0>(lo),
+        vgetq_lane_f64::<1>(lo),
+        vgetq_lane_f64::<0>(hi),
+        vgetq_lane_f64::<1>(hi),
+    ]
+}
+
+/// NEON path of `dot_product`, its lanes as `neon_lanes` holds them, combined and finished as the
+/// scalar path does. Safety: `a` and `b` are the same length.
+#[cfg(target_arch = "aarch64")]
+unsafe fn dot_product_neon(a: &[f64], b: &[f64]) -> f64 {
+    use std::arch::aarch64::{vdupq_n_f64, vfmaq_f64, vld1q_f64};
+
+    let len = a.len();
+    let (mut lo, mut hi) = (vdupq_n_f64(0.0), vdupq_n_f64(0.0));
+    let mut i = 0;
+    while i + 4 <= len {
+        lo = vfmaq_f64(lo, vld1q_f64(a.as_ptr().add(i)), vld1q_f64(b.as_ptr().add(i)));
+        hi = vfmaq_f64(hi, vld1q_f64(a.as_ptr().add(i + 2)), vld1q_f64(b.as_ptr().add(i + 2)));
+        i += 4;
+    }
+    dot_product_tail(a, b, i, combine_lanes(neon_lanes(lo, hi)))
+}
+
+/// Fills `out[row..]` in blocks of `R` rows while a whole block fits; returns the first row left.
+/// Safety: as `dot_product_rows_neon`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn dot_product_blocks_neon<const R: usize>(
+    rows: &[f64],
+    k: usize,
+    v: &[f64],
+    out: &mut [f64],
+    mut row: usize,
+) -> usize {
+    while row + R <= out.len() {
+        let block = dot_product_rows_neon::<R>(&rows[row * k..(row + R) * k], k, v);
+        out[row..row + R].copy_from_slice(&block);
+        row += R;
+    }
+    row
+}
+
+/// `R` consecutive `k`-wide rows of `rows` against `v`, each row's accumulators exactly
+/// `dot_product_neon`'s for it (2R of NEON's 32 registers, R up to 8), combined and finished as
+/// there. Safety: `rows` holds `R * k` values and `v` `k`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn dot_product_rows_neon<const R: usize>(rows: &[f64], k: usize, v: &[f64]) -> [f64; R] {
+    use std::arch::aarch64::{vdupq_n_f64, vfmaq_f64, vld1q_f64};
+
+    let rows_ptr = rows.as_ptr();
+    let mut acc = [[vdupq_n_f64(0.0); 2]; R];
+    let mut i = 0;
+    while i + 4 <= k {
+        let v_lo = vld1q_f64(v.as_ptr().add(i));
+        let v_hi = vld1q_f64(v.as_ptr().add(i + 2));
+        for (r, acc_row) in acc.iter_mut().enumerate() {
+            acc_row[0] = vfmaq_f64(acc_row[0], vld1q_f64(rows_ptr.add(r * k + i)), v_lo);
+            acc_row[1] = vfmaq_f64(acc_row[1], vld1q_f64(rows_ptr.add(r * k + i + 2)), v_hi);
+        }
+        i += 4;
+    }
+    let mut out = [0.0; R];
+    for (r, acc_row) in acc.iter().enumerate() {
+        let lanes = neon_lanes(acc_row[0], acc_row[1]);
+        out[r] = dot_product_tail(&rows[r * k..(r + 1) * k], v, i, combine_lanes(lanes));
+    }
+    out
+}
+
+/// `matmul_nt`'s NEON register tile, as AVX2's: 4 rows of `a` by 2 of `b`, its 8 accumulators each
+/// two 2-lane registers (16 of NEON's 32, with 6 loads). Untuned: the aarch64 workplan's stage 7
+/// times it on the Pi.
+#[cfg(target_arch = "aarch64")]
+const NEON_NT_A_ROWS: usize = 4;
+#[cfg(target_arch = "aarch64")]
+const NEON_NT_B_ROWS: usize = 2;
+
+/// `matmul_nt_blocks_avx2_fma` in NEON: `matmul_nt`'s rows `row_start..` in blocks of
+/// `NEON_NT_A_ROWS`, each against `b` `NEON_NT_B_ROWS` rows at a time, every output one
+/// `dot_product` in its grouping. Safety: `a_data` holds `row_end * k` values, `b_data` `n * k`,
+/// and `chunk` `(row_end - row_start) * n`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn matmul_nt_blocks_neon(
+    a_data: &[f64],
+    b_data: &[f64],
+    chunk: &mut [f64],
+    row_start: usize,
+    row_end: usize,
+    k: usize,
+    n: usize,
+) -> usize {
+    let mut row = row_start;
+    while row + NEON_NT_A_ROWS <= row_end {
+        let a_block = &a_data[row * k..(row + NEON_NT_A_ROWS) * k];
+        let out_block = &mut chunk[(row - row_start) * n..(row - row_start + NEON_NT_A_ROWS) * n];
+        let mut col = 0;
+        while col + NEON_NT_B_ROWS <= n {
+            let tile = dot_product_tile_neon::<NEON_NT_A_ROWS, NEON_NT_B_ROWS>(
+                a_block,
+                &b_data[col * k..(col + NEON_NT_B_ROWS) * k],
+                k,
+            );
+            for r in 0..NEON_NT_A_ROWS {
+                out_block[r * n + col..r * n + col + NEON_NT_B_ROWS].copy_from_slice(&tile[r]);
+            }
+            col += NEON_NT_B_ROWS;
+        }
+        if col < n {
+            for r in 0..NEON_NT_A_ROWS {
+                dot_products_into(
+                    &b_data[col * k..n * k],
+                    k,
+                    &a_block[r * k..(r + 1) * k],
+                    &mut out_block[r * n + col..(r + 1) * n],
+                );
+            }
+        }
+        row += NEON_NT_A_ROWS;
+    }
+    row
+}
+
+/// `tile[r][c] = dot_product(b_rows[c], a_rows[r])`, as `dot_product_tile_avx2_fma` computes it, each
+/// pair's accumulators exactly `dot_product_neon`'s. Safety: as `dot_product_rows_neon`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn dot_product_tile_neon<const RA: usize, const RB: usize>(
+    a_rows: &[f64],
+    b_rows: &[f64],
+    k: usize,
+) -> [[f64; RB]; RA] {
+    use std::arch::aarch64::{vdupq_n_f64, vfmaq_f64, vld1q_f64};
+
+    let a_ptr = a_rows.as_ptr();
+    let b_ptr = b_rows.as_ptr();
+    let mut acc = [[[vdupq_n_f64(0.0); 2]; RB]; RA];
+    let mut i = 0;
+    while i + 4 <= k {
+        let b_vecs: [[_; 2]; RB] =
+            std::array::from_fn(|c| [vld1q_f64(b_ptr.add(c * k + i)), vld1q_f64(b_ptr.add(c * k + i + 2))]);
+        for r in 0..RA {
+            let a_lo = vld1q_f64(a_ptr.add(r * k + i));
+            let a_hi = vld1q_f64(a_ptr.add(r * k + i + 2));
+            for c in 0..RB {
+                acc[r][c][0] = vfmaq_f64(acc[r][c][0], b_vecs[c][0], a_lo);
+                acc[r][c][1] = vfmaq_f64(acc[r][c][1], b_vecs[c][1], a_hi);
+            }
+        }
+        i += 4;
+    }
+    let mut out = [[0.0; RB]; RA];
+    for r in 0..RA {
+        for c in 0..RB {
+            out[r][c] = dot_product_tail(
+                &b_rows[c * k..(c + 1) * k],
+                &a_rows[r * k..(r + 1) * k],
+                i,
+                combine_lanes(neon_lanes(acc[r][c][0], acc[r][c][1])),
             );
         }
     }
