@@ -7,8 +7,16 @@ on:
     branches: [main]
 
 jobs:
+  # glibc on both architectures (the aarch64 workplan in indrajala-ml, stage 4): the crate's bits
+  # are claimed the same on every machine (its D1), and aarch64 runs the scalar fallbacks that no
+  # x86_64 job reaches, clippy included (their `cfg(target_arch)` paths).
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    name: test (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -62,3 +70,31 @@ jobs:
         run: |
           source .venv/bin/activate
           pytest tests/
+
+  # musl (Alpine) on both architectures: the build and the tests, with musl's own C library and
+  # allocator. Run by `docker run` after the host's checkout, not as a job `container:`: GitHub's
+  # JavaScript actions (checkout, setup-python) don't run inside Alpine containers on arm runners.
+  # Lints and the stub checks stay on the glibc jobs (the same source).
+  musl:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    name: musl (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and test in Alpine
+        run: |
+          docker run --rm -v "$PWD:/crate" -w /crate python:3.14-alpine sh -euxc '
+            apk add --no-cache build-base curl
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            . "$HOME/.cargo/env"
+            rustup toolchain install
+            python -m venv /venv
+            . /venv/bin/activate
+            pip install maturin==1.15.0 pytest numpy
+            maturin develop --release
+            python -c "import platform; print(platform.machine(), platform.libc_ver())"
+            pytest tests/
+          '
