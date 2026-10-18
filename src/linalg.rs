@@ -287,7 +287,7 @@ static MAX_THREADS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 static THRESHOLD_FLOPS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 
 /// Test/benchmark hook: max threads (0 = default) and threshold in flops (0 = default) for every
-/// threaded matmul (`matmul_2d`, `matmul_nt`, `matmul_narrow`), process-wide until reset with
+/// threaded matmul (`matmul_2d`, `matmul_nt`, `matmul_long_k`, the conv downstream), process-wide until reset with
 /// `(0, 0)`. An overridden thread count isn't capped at the machine's parallelism, so a test can
 /// run 8 threads anywhere. Can't change any output's value; that is what the tests check. A
 /// function, not an env var, so one run can sweep settings.
@@ -312,7 +312,7 @@ pub(crate) fn set_matmul_threading(max_threads: usize, threshold_flops: usize) {
 /// No rows-per-thread floor either: products with few output rows and a long `k` gain the most
 /// (conv's accumulate, 8 rows, halves on 8 threads at N = 512). With a floor of 32 rows per
 /// thread, the MNIST conv mini-batch 512 epoch took 1.03-1.12 s against 0.84-0.88.
-fn matmul_thread_count(rows: usize, total_flops: usize) -> usize {
+pub(crate) fn matmul_thread_count(rows: usize, total_flops: usize) -> usize {
     const THREADING_THRESHOLD_FLOPS: usize = 8_000_000;
     const MAX_THREADS: usize = 8;
 
@@ -337,8 +337,7 @@ pub(crate) fn matmul_threads_for(m: usize, k: usize, n: usize) -> usize {
     matmul_thread_count(m, m * k * n)
 }
 
-/// The threading decision `matmul_thread_count` makes, shared by `matmul_2d`, `matmul_nt` and
-/// `matmul_narrow`: calls `compute(chunk, row_start, row_end)` once on the whole `rows x cols`
+/// The threading decision `matmul_thread_count` makes, shared by `matmul_2d` and `matmul_nt`: calls `compute(chunk, row_start, row_end)` once on the whole `rows x cols`
 /// output, or once per thread on disjoint row ranges. Each call owns complete output rows, so
 /// the split can't change any output's value.
 fn for_each_row_range<F>(out: &mut [f64], rows: usize, cols: usize, total_flops: usize, compute: F)
@@ -684,7 +683,7 @@ unsafe fn dot_product_tile_neon<const RA: usize, const RB: usize>(
     out
 }
 
-/// Rows per block in `matmul_narrow`. Against 1 row, on one thread at N = 32: the second-conv
+/// Rows per block in the conv downstream's product (`narrow_rows_per_block`). Against 1 row, on one thread at N = 32: the second-conv
 /// accumulate (`(8, N*P) @ (N*P, 72)`) about 40% faster, 4 rows ahead of 2 and 8; the
 /// downstream (`(N*P, 8) @ (8, 72)`) 10-15% faster single-example and at 26x26x8 stride 2.
 const NARROW_ROWS_PER_BLOCK: usize = 4;
@@ -698,7 +697,7 @@ const LONG_K_BLOCK: usize = 64;
 static NARROW_ROWS_PER_BLOCK_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 static LONG_K_BLOCK_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 
-/// Benchmark hook: `matmul_narrow`'s rows per block and `matmul_long_k`'s slab rows (0 = the
+/// Benchmark hook: the conv downstream's rows per block and `matmul_long_k`'s slab rows (0 = the
 /// default, `NARROW_ROWS_PER_BLOCK` and `LONG_K_BLOCK`), process-wide until reset with `(0, 0)`. A
 /// slab of `K` rows or more runs `matmul_long_k` unblocked. Kept as instrumentation, so a later
 /// change can re-measure these choices in one build; like `set_matmul_threading`, it can't change
@@ -716,20 +715,10 @@ fn overridden_or(overridden: &AtomicUsize, default: usize) -> usize {
     }
 }
 
-/// `a @ b` for `a` (`M, K`) and a narrow `b` (`K, N`, `N` a few dozen at most), the conv forward's
-/// and downstream's matmul: the same kernel and bits as `matmul`'s matrix @ matrix case, in blocks
-/// of `NARROW_ROWS_PER_BLOCK` rows. Both pass a tall `a` (`N * P` rows, `K` the fan-in or the
-/// channel count). Threaded over `M` rows like `matmul_2d`, which doesn't change any output's
-/// value.
-pub(crate) fn matmul_narrow(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
-    let (m, k, n) = product_shape(a, b)?;
-    let rows_per_block = overridden_or(&NARROW_ROWS_PER_BLOCK_OVERRIDE, NARROW_ROWS_PER_BLOCK);
-    let mut out = vec![0.0; m * n];
-    for_each_row_range(&mut out, m, n, m * k * n, |chunk, row_start, row_end| {
-        let panel = Panel::whole(row_start, row_end, k, n, rows_per_block);
-        tiled_row_range::<OVERWRITE>(&a.data, &b.data, chunk, panel);
-    });
-    Ok(RustArray::from_matrix(out, m, n))
+/// Rows per block in the conv downstream's `(P, O) @ (O, C*k*k)` product: `NARROW_ROWS_PER_BLOCK`
+/// unless `set_kernel_overrides` set it. Blocking never changes an output's value.
+pub(crate) fn narrow_rows_per_block() -> usize {
+    overridden_or(&NARROW_ROWS_PER_BLOCK_OVERRIDE, NARROW_ROWS_PER_BLOCK)
 }
 
 /// `a @ b` for `a` (`M, K`) with few rows and a long `K`, and a narrow `b` (`K, N`): the conv

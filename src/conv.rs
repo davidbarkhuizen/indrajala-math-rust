@@ -13,8 +13,8 @@
 //! - the cached im2col columns are `(N*P, C*k*k)`, `P = out_height * out_width`, row `n*P + p`
 //!   with `p` in row-major output order, columns in `W`-row order.
 //!
-//! Every conv reduction goes through `linalg`'s tiled kernel, `tiled_row_range` (the forward one example at a time,
-//! the downstream through `matmul_narrow`, the accumulate through `matmul_long_k`), which gives `matmul`'s bits: the summation order is that file's one fixed grouping -
+//! Every conv reduction goes through `linalg`'s tiled kernel, `tiled_row_range` (the forward and the downstream one
+//! example at a time, the accumulate through `matmul_long_k`), which gives `matmul`'s bits: the summation order is that file's one fixed grouping -
 //! machine-independent, and within `rtol` of numpy rather than bit-identical to it. Pooling does no arithmetic beyond
 //! the scatter-add, so it matches numpy exactly.
 
@@ -22,7 +22,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::array::{RustArray, Shape};
-use crate::linalg::{matmul_long_k, matmul_narrow, tiled_row_range, Panel, OVERWRITE};
+use crate::linalg::{matmul_long_k, matmul_thread_count, narrow_rows_per_block, tiled_row_range, Panel, OVERWRITE};
 use crate::scalar::relu;
 
 /// The shape arithmetic for one conv or pool layer, built once by the Python layer and passed to
@@ -157,21 +157,6 @@ fn channel_count(w: &RustArray, geometry: &ConvGeometry, context: &str) -> PyRes
     }
 }
 
-/// `(N, O*P)` channel-major deltas to `(N*P, O)` - one row per output position, the layout
-/// `cols @ W.T` produced them in.
-fn deltas_by_position(delta: &RustArray, n: usize, o: usize, p: usize) -> RustArray {
-    let mut out = vec![0.0; n * p * o];
-    for example in 0..n {
-        for channel in 0..o {
-            let src = &delta.data[(example * o + channel) * p..(example * o + channel + 1) * p];
-            for (position, &value) in src.iter().enumerate() {
-                out[(example * p + position) * o + channel] = value;
-            }
-        }
-    }
-    RustArray::from_matrix(out, n * p, o)
-}
-
 /// `(N, O*P)` channel-major deltas to `(O, N*P)` - each channel's deltas over every example and
 /// position in one row, the left operand of the kernel-gradient matmul.
 fn deltas_by_channel(delta: &RustArray, n: usize, o: usize, p: usize) -> RustArray {
@@ -187,7 +172,7 @@ fn deltas_by_channel(delta: &RustArray, n: usize, o: usize, p: usize) -> RustArr
 }
 
 /// `ConvArrayLayer.forward_batch`, one example at a time: im2col appended to `cols`, the example's
-/// `P` rows of `cols @ W.T` with `matmul_narrow`'s kernel into one `(P, O)` buffer reused for every
+/// `P` rows of `cols @ W.T` with the tiled kernel into one `(P, O)` buffer reused for every
 /// example (so each output has `matmul`'s bits), then `A`'s channel-major row appended in order,
 /// adding `b` and applying the ReLU as it goes. Returns `(A, cols)`, `A` a vector when `X` is one,
 /// `cols` always `(N*P, C*k*k)`: `cols` is kept by the caller for `conv_accumulate_gradient_batch`,
@@ -199,7 +184,7 @@ fn deltas_by_channel(delta: &RustArray, n: usize, o: usize, p: usize) -> RustArr
 /// them and then scattering into `A` made the op cost 1.5-2.8x its N single-example calls. Here
 /// only `cols` and `A` are batch-sized, and each is written once, in order; the example's slab
 /// of `cols` and its 43 KB product are still in cache when they are read. The product runs on
-/// one thread: `matmul_narrow`'s row threading made no difference at N = 512.
+/// one thread: threading the whole batch's product over its rows made no difference at N = 512.
 #[pyfunction]
 pub fn conv_forward_batch(
     w: &RustArray,
@@ -295,37 +280,72 @@ pub fn conv_linear_forward_batch(
     Ok((batch_output(a, n, o * p, is_vector), cols))
 }
 
-/// `ConvArrayLayer._downstream`: `dcols = D @ W` with `matmul_narrow`, `D` the deltas regrouped to
-/// `(N*P, O)`, then col2im as a scatter-add. The loop runs kernel offset `(kr, kc)` outside
-/// output position, so each input accumulates its contributions in the same order as numpy's
+/// `ConvArrayLayer._downstream`: per example, `dcols = D @ W`, `D` the example's deltas regrouped to
+/// `(P, O)`, then col2im as a scatter-add. The loop runs kernel offset `(kr, kc)` outside output
+/// position, so each input accumulates its contributions in the same order as numpy's
 /// one-slice-add-per-offset loop. `dX` is a vector when `delta_batch` is one.
+///
+/// Per example, as `conv_forward_batch`: each example's `(P, C*k*k)` product goes into one buffer
+/// reused for every example, still in cache when col2im reads it. The whole batch's product
+/// (10.6 MB at 26x26x8, N = 32), threaded over its rows, was memory-bound on the Pi: with the
+/// NEON kernel 4 threads ran no faster than one, and the op took 15 ms against the scalar kernel's
+/// 9.5 (the aarch64 workplan's stage 7). Threads take whole examples, each with its own buffers
+/// and `dX` rows, so no output's value depends on the split.
 #[pyfunction]
 pub fn conv_downstream_batch(w: &RustArray, delta_batch: &RustArray, geometry: &ConvGeometry) -> PyResult<RustArray> {
     let o = channel_count(w, geometry, "conv_downstream_batch")?;
     let g = geometry;
-    let (p, k, fan_in) = (g.positions, g.kernel_size, g.fan_in);
+    let (p, fan_in) = (g.positions, g.fan_in);
     let (n, is_vector) = require_batch(delta_batch, o * p, "conv_downstream_batch delta_batch")?;
 
-    let dcols = matmul_narrow(&deltas_by_position(delta_batch, n, o, p), w)?; // (N*P, C*k*k)
     let mut dx = vec![0.0; n * g.input_size];
-    for example in 0..n {
-        let out = &mut dx[example * g.input_size..(example + 1) * g.input_size];
-        for c in 0..g.input_channels {
-            for kr in 0..k {
-                for kc in 0..k {
-                    let column = (c * k + kr) * k + kc;
-                    for out_row in 0..g.out_height {
-                        for out_col in 0..g.out_width {
-                            let position = out_row * g.out_width + out_col;
-                            out[g.input_index(c, out_row, out_col, kr, kc)] +=
-                                dcols.data[(example * p + position) * fan_in + column];
-                        }
+    let examples_per_thread = n.div_ceil(matmul_thread_count(n, n * p * o * fan_in));
+    let downstream = |first: usize, out: &mut [f64]| {
+        let mut by_position = vec![0.0; p * o]; // one example's D, (P, O)
+        let mut dcols = vec![0.0; p * fan_in]; // its D @ W, (P, C*k*k)
+        for (offset, example_dx) in out.chunks_mut(g.input_size).enumerate() {
+            let example = first + offset;
+            for channel in 0..o {
+                let src = &delta_batch.data[(example * o + channel) * p..(example * o + channel + 1) * p];
+                for (position, &value) in src.iter().enumerate() {
+                    by_position[position * o + channel] = value;
+                }
+            }
+            let panel = Panel::whole(0, p, o, fan_in, narrow_rows_per_block());
+            tiled_row_range::<OVERWRITE>(&by_position, &w.data, &mut dcols, panel);
+            col2im(example_dx, &dcols, g);
+        }
+    };
+    if examples_per_thread >= n {
+        downstream(0, &mut dx);
+    } else {
+        let downstream = &downstream;
+        std::thread::scope(|scope| {
+            for (chunk, out) in dx.chunks_mut(examples_per_thread * g.input_size).enumerate() {
+                scope.spawn(move || downstream(chunk * examples_per_thread, out));
+            }
+        });
+    }
+    Ok(batch_output(dx, n, g.input_size, is_vector))
+}
+
+/// One example's col2im: `dcols` (`P, C*k*k`) scattered into its `dX` (`out`, zeroed), kernel
+/// offset outside output position.
+fn col2im(out: &mut [f64], dcols: &[f64], g: &ConvGeometry) {
+    let (k, fan_in) = (g.kernel_size, g.fan_in);
+    for c in 0..g.input_channels {
+        for kr in 0..k {
+            for kc in 0..k {
+                let column = (c * k + kr) * k + kc;
+                for out_row in 0..g.out_height {
+                    for out_col in 0..g.out_width {
+                        let position = out_row * g.out_width + out_col;
+                        out[g.input_index(c, out_row, out_col, kr, kc)] += dcols[position * fan_in + column];
                     }
                 }
             }
         }
     }
-    Ok(batch_output(dx, n, g.input_size, is_vector))
 }
 
 /// `ConvArrayLayer._accumulate`: `grad_W += D @ cols` with `matmul_long_k`, `D` the deltas regrouped to
