@@ -636,7 +636,7 @@ pub(crate) struct Panel {
     pub(crate) row_start: usize,
     pub(crate) row_end: usize,
     #[cfg_attr(
-        not(target_arch = "x86_64"),
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
         expect(dead_code, reason = "only the vector kernels block rows")
     )]
     pub(crate) rows_per_block: usize,
@@ -697,9 +697,16 @@ pub(crate) fn tiled_row_range<const MODE: u8>(a_data: &[f64], b_data: &[f64], ou
             return;
         }
     }
+    // NEON is part of aarch64's baseline: no runtime check, and the scalar path never runs there
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        tiled_row_range_neon::<MODE>(a_data, b_data, out, panel)
+    };
+    #[cfg(not(target_arch = "aarch64"))]
     tiled_row_range_scalar::<MODE>(a_data, b_data, out, panel);
 }
 
+#[cfg_attr(target_arch = "aarch64", expect(dead_code, reason = "NEON replaces it on aarch64"))]
 fn tiled_row_range_scalar<const MODE: u8>(a_data: &[f64], b_data: &[f64], out: &mut [f64], panel: Panel) {
     let Panel { k, n, .. } = panel;
     for row in panel.row_start..panel.row_end {
@@ -862,6 +869,139 @@ unsafe fn store_lanes<const MODE: u8>(out: *mut f64, acc: std::arch::x86_64::__m
         _mm256_storeu_pd(out, _mm256_add_pd(_mm256_loadu_pd(out), acc));
     } else {
         _mm256_storeu_pd(out, acc);
+    }
+}
+
+/// Rows per 16-column register tile in `tiled_row_range_neon`, as `TILE_ROWS` for AVX2: two rows'
+/// 16 accumulators and the tile's 8 loads of `b` fit NEON's 32 registers. Untuned: the aarch64
+/// workplan's stage 7 times it on the Pi.
+#[cfg(target_arch = "aarch64")]
+const NEON_TILE_ROWS: usize = 2;
+
+/// NEON path: output columns in tiles of 16 (eight 2-lane accumulators), then 2, then the odd
+/// column, each tile running the panel's `k` before it is stored, its rows blocked as the AVX2
+/// path's. `vfmaq_f64` is the IEEE fused multiply-add `f64::mul_add` is, so lane `j`'s accumulator
+/// is exactly `tiled_row_range_scalar`'s `sum` for that column, whichever tile computes it (the
+/// aarch64 workplan's D5: no order the hardware chooses). Safety: every pointer offset stays inside
+/// `a`'s rows `row_start..row_end`, `b`'s `k x n` data, or `out`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn tiled_row_range_neon<const MODE: u8>(a_data: &[f64], b_data: &[f64], out: &mut [f64], panel: Panel) {
+    use std::arch::aarch64::{vdupq_n_f64, vfmaq_f64, vld1q_f64};
+
+    let Panel {
+        row_start,
+        row_end,
+        rows_per_block,
+        col_start,
+        col_end,
+        k_start,
+        k_end,
+        k,
+        n,
+        out_stride,
+    } = panel;
+    // as the AVX2 path: only RESUME computes part of a product
+    let (col_start, col_end, k_start, k_end, out_stride) = if MODE == RESUME {
+        (col_start, col_end, k_start, k_end, out_stride)
+    } else {
+        (0, n, 0, k, n)
+    };
+    let a_ptr = a_data.as_ptr();
+    let b_ptr = b_data.as_ptr();
+    let out_ptr = out.as_mut_ptr();
+    let out_at = move |row: usize, col: usize| out_ptr.add((row - row_start) * out_stride + col - col_start);
+    let mut block_start = row_start;
+    while block_start < row_end {
+        let block_end = (block_start + rows_per_block).min(row_end);
+        let mut col = col_start;
+        while col + 16 <= col_end {
+            let mut row = block_start;
+            while row + NEON_TILE_ROWS <= block_end {
+                let mut acc = [[vdupq_n_f64(0.0); 8]; NEON_TILE_ROWS];
+                for (r, acc_row) in acc.iter_mut().enumerate() {
+                    for (j, acc_lanes) in acc_row.iter_mut().enumerate() {
+                        *acc_lanes = chain_start_neon::<MODE>(out_at(row + r, col + 2 * j));
+                    }
+                }
+                for kk in k_start..k_end {
+                    let b_row = b_ptr.add(kk * n + col);
+                    let b_tile: [_; 8] = std::array::from_fn(|j| vld1q_f64(b_row.add(2 * j)));
+                    for r in 0..NEON_TILE_ROWS {
+                        let a_vec = vdupq_n_f64(*a_ptr.add((row + r) * k + kk));
+                        for j in 0..8 {
+                            acc[r][j] = vfmaq_f64(acc[r][j], a_vec, b_tile[j]);
+                        }
+                    }
+                }
+                for (r, acc_row) in acc.iter().enumerate() {
+                    for (j, &acc_lanes) in acc_row.iter().enumerate() {
+                        store_lanes_neon::<MODE>(out_at(row + r, col + 2 * j), acc_lanes);
+                    }
+                }
+                row += NEON_TILE_ROWS;
+            }
+            for row in row..block_end {
+                let mut acc: [_; 8] = std::array::from_fn(|j| chain_start_neon::<MODE>(out_at(row, col + 2 * j)));
+                for (i, &a_value) in a_data[row * k + k_start..row * k + k_end].iter().enumerate() {
+                    let a_vec = vdupq_n_f64(a_value);
+                    let b_row = b_ptr.add((k_start + i) * n + col);
+                    for (j, acc_lanes) in acc.iter_mut().enumerate() {
+                        *acc_lanes = vfmaq_f64(*acc_lanes, a_vec, vld1q_f64(b_row.add(2 * j)));
+                    }
+                }
+                for (j, &acc_lanes) in acc.iter().enumerate() {
+                    store_lanes_neon::<MODE>(out_at(row, col + 2 * j), acc_lanes);
+                }
+            }
+            col += 16;
+        }
+        while col + 2 <= col_end {
+            for row in block_start..block_end {
+                let mut acc = chain_start_neon::<MODE>(out_at(row, col));
+                for (i, &a_value) in a_data[row * k + k_start..row * k + k_end].iter().enumerate() {
+                    acc = vfmaq_f64(acc, vdupq_n_f64(a_value), vld1q_f64(b_ptr.add((k_start + i) * n + col)));
+                }
+                store_lanes_neon::<MODE>(out_at(row, col), acc);
+            }
+            col += 2;
+        }
+        if col < col_end {
+            for row in block_start..block_end {
+                let out_value = out_at(row, col);
+                let mut sum = if MODE == RESUME { *out_value } else { 0.0f64 };
+                for (i, &a_value) in a_data[row * k + k_start..row * k + k_end].iter().enumerate() {
+                    sum = a_value.mul_add(*b_ptr.add((k_start + i) * n + col), sum);
+                }
+                *out_value = if MODE == ADD { *out_value + sum } else { sum };
+            }
+        }
+        block_start = block_end;
+    }
+}
+
+/// 2 chains' starting values: the partials at `out` under `RESUME`, else 0.0. Safety: as
+/// `tiled_row_range_neon`; `out` points at 2 values of its `out`.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn chain_start_neon<const MODE: u8>(out: *const f64) -> std::arch::aarch64::float64x2_t {
+    if MODE == RESUME {
+        std::arch::aarch64::vld1q_f64(out)
+    } else {
+        std::arch::aarch64::vdupq_n_f64(0.0)
+    }
+}
+
+/// `tiled_row_range_neon`'s store of 2 chains, added to the 2 values at `out` under `ADD`.
+/// Safety: as `tiled_row_range_neon`; `out` points at 2 values of its `out`.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn store_lanes_neon<const MODE: u8>(out: *mut f64, acc: std::arch::aarch64::float64x2_t) {
+    use std::arch::aarch64::{vaddq_f64, vld1q_f64, vst1q_f64};
+
+    if MODE == ADD {
+        vst1q_f64(out, vaddq_f64(vld1q_f64(out), acc));
+    } else {
+        vst1q_f64(out, acc);
     }
 }
 
