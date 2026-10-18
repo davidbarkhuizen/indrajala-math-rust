@@ -93,6 +93,10 @@ fn dot_product(a: &[f64], b: &[f64]) -> f64 {
 /// 30-row `W`) overlap too. The matrix @ vector case goes through it, and `matmul_nt`'s tiles
 /// keep its grouping, so a batched forward's rows stay bit-identical to the single-example forward.
 fn dot_products_into(rows: &[f64], k: usize, v: &[f64], out: &mut [f64]) {
+    #[cfg_attr(
+        not(target_arch = "x86_64"),
+        expect(unused_mut, reason = "only the AVX2 blocks move it")
+    )]
     let mut row = 0;
     #[cfg(target_arch = "x86_64")]
     {
@@ -372,6 +376,10 @@ pub(crate) fn matmul_nt(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
     }
     let mut out = vec![0.0; m * n];
     for_each_row_range(&mut out, m, n, m * k * n, |chunk, row_start, row_end| {
+        #[cfg_attr(
+            not(target_arch = "x86_64"),
+            expect(unused_mut, reason = "only the AVX2 blocks move it")
+        )]
         let mut row = row_start;
         #[cfg(target_arch = "x86_64")]
         {
@@ -392,7 +400,9 @@ pub(crate) fn matmul_nt(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
 /// `matmul_nt`'s register tile, 4 rows of `a` by 2 of `b`: 8 accumulators and 6 loads, in
 /// AVX2's 16 registers. Measured against 2 x 4, 3 x 3 and 2 x 2 (dense `forward_batch` at 32 x
 /// 5408, batch 32-512, and 30 x 784, batch 32 and 512), it was the fastest or tied at every shape.
+#[cfg(target_arch = "x86_64")]
 const NT_A_ROWS: usize = 4;
+#[cfg(target_arch = "x86_64")]
 const NT_B_ROWS: usize = 2;
 
 /// `matmul_nt`'s rows `row_start..` in blocks of `NT_A_ROWS` rows of `a`, while a whole block
@@ -625,6 +635,10 @@ pub(crate) const RESUME: u8 = 2;
 pub(crate) struct Panel {
     pub(crate) row_start: usize,
     pub(crate) row_end: usize,
+    #[cfg_attr(
+        not(target_arch = "x86_64"),
+        expect(dead_code, reason = "only the vector kernels block rows")
+    )]
     pub(crate) rows_per_block: usize,
     pub(crate) col_start: usize,
     pub(crate) col_end: usize,
@@ -705,6 +719,7 @@ fn tiled_row_range_scalar<const MODE: u8>(a_data: &[f64], b_data: &[f64], out: &
 /// row once for all of them, and their `4 * TILE_ROWS` independent FMA chains hide more of the FMA
 /// latency than one row's 4 chains. A probe measured 2 rows 10-18% faster than 1 at short `k`
 /// (`(32, 32) @ (32, 5408)`) and 7-31% at `k` = 512; 3 rows won only at `k` = 128.
+#[cfg(target_arch = "x86_64")]
 const TILE_ROWS: usize = 2;
 
 /// AVX2+FMA path: output columns in tiles of 16 (four 4-lane accumulators), then 4, then a
