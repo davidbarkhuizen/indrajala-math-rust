@@ -616,8 +616,8 @@ CONV_CASES = [((28, 28, 1, 3, 32, 1), 4), ((9, 7, 3, 3, 5, 2), 3)]
 
 @pytest.mark.parametrize("shape, n", CONV_CASES)
 def test_thread_count_cannot_change_conv_bits(reset_matmul_threading, shape, n):
-    # matmul_narrow through all three conv ops: forward (cols @ W.T), downstream (D @ W) and
-    # accumulate (D @ cols)
+    # the tiled kernel through all three conv ops: forward (cols @ W.T), downstream (D @ W, threaded
+    # over examples) and accumulate (D @ cols)
     height, width, channels, kernel_size, channel_count, stride = shape
     g = ConvGeometry(height, width, channels, kernel_size, stride)
     rng = np.random.default_rng(height * 100 + n)

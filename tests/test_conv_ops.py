@@ -165,7 +165,7 @@ def test_conv_forward_batch_matches_the_brute_force_definition(shape):
     np.testing.assert_array_equal(_np(cols), expected_cols)
 
 
-# (shape, N) beyond SHAPES x (1, BATCH_SIZE) for the forward's matmul_narrow kernel, which it
+# (shape, N) beyond SHAPES x (1, BATCH_SIZE) for the forward's tiled kernel, which it
 # runs one example at a time on one thread: output channel counts that hit each of its paths
 # (16-wide blocks, 4-wide blocks, the scalar tail, and mixes), a 28x28 input at N = 256, fan_in
 # 800 x 48 channels (many 16-wide blocks), and 13x13x8 x 32 at N = 32. The last two batch sizes
@@ -189,7 +189,7 @@ def test_conv_forward_batch_is_relu_of_the_matmul_scatter_exactly(shape, n):
     # A is relu(Z) with the ReLU applied during the scatter, and no Z is kept. Rebuild that from
     # its parts - the crate's own matmul (Array @) on the returned cols, the b add, the
     # channel-major scatter, then np.maximum - and require the same bits. The op computes cols @
-    # W.T with matmul_narrow, so this is also its exact check against matmul
+    # W.T with the tiled kernel, so this is also its exact check against matmul
     rng = np.random.default_rng(5)
     height, width, channels, k, channel_count, _s = shape
     W = rng.uniform(-1.0, 1.0, size=(channel_count, channels * k * k))
@@ -230,7 +230,7 @@ def test_a_vector_operand_is_one_example_with_the_same_bits(shape):
     assert [r.tolist() for r in vec] == [r.tolist() for r in row]
 
 
-# (shape, N) beyond SHAPES x (1, BATCH_SIZE) for the backward ops' matmul_narrow calls, whose
+# (shape, N) beyond SHAPES x (1, BATCH_SIZE) for the backward ops' products, whose
 # output rows are fan_in wide: 9 (4-wide blocks and a tail), 12 (4-wide blocks only), 18 (a
 # 16-wide block and a tail) and 72 (16- and 4-wide blocks); fan_in 800 (many 16-wide blocks); a
 # 28x28 input at N = 256 and 13x13x8 x 32 at N = 32 (downstream and accumulate over the 8M-flop
@@ -250,7 +250,7 @@ THREADED_CASES = [((28, 28, 1, 3, 8, 1), 256), ((13, 13, 8, 3, 32, 1), 32)]
 
 
 def test_the_threaded_cases_are_over_the_threading_threshold():
-    # the backward ops' matmul_narrow products at these cases split across threads at the default
+    # the backward ops' products at these cases split across threads at the default
     # threshold (8 threads allowed on any machine), so a threshold change can't silently drop them.
     # The forward runs per example on one thread; its whole-batch product is checked too, as the
     # size its cases were chosen for
@@ -261,7 +261,7 @@ def test_the_threaded_cases_are_over_the_threading_threshold():
             g = _geometry(shape)
             rows, channel_count = n * g.positions, shape[4]
             assert matmul_threads_for(rows, g.fan_in, channel_count) == 8  # forward, whole batch
-            assert matmul_threads_for(rows, channel_count, g.fan_in) == 8  # downstream
+            assert matmul_threads_for(n, g.positions * channel_count, g.fan_in) == 8  # downstream, over examples
             assert matmul_threads_for(channel_count, rows, g.fan_in) == 8  # accumulate
     finally:
         set_matmul_threading(0, 0)
@@ -315,7 +315,7 @@ def _backward_case(seed, shape, n):
 def test_conv_downstream_batch_is_the_matmul_col2im_exactly(shape, n):
     # rebuild dX from its parts: the crate's own matmul (Array @) on the deltas regrouped to
     # (N*P, O), then col2im as a sequential scatter-add in the op's order (kernel offset outside
-    # output position). The op computes D @ W with matmul_narrow, so this is its exact check
+    # output position). The op computes D @ W per example with the same kernel, so this is its exact check
     W, _X, delta, g = _backward_case(8, shape, n)
     o, p, k = len(W), g.positions, g.kernel_size
     by_position = delta.reshape(n, o, p).transpose(0, 2, 1).reshape(n * p, o)
@@ -339,7 +339,7 @@ def test_conv_downstream_batch_is_the_matmul_col2im_exactly(shape, n):
 @pytest.mark.parametrize("shape, n", [(shape, n) for shape in SHAPES for n in (1, BATCH_SIZE)] + BACKWARD_EXTRA_CASES)
 def test_conv_accumulate_gradient_batch_is_the_matmul_update_exactly(shape, n):
     # grad_W: grad_W0 + (the crate's own matmul of the deltas regrouped to (O, N*P) with cols),
-    # one add per element. The op computes D @ cols with matmul_narrow, so this is its exact check
+    # one add per element. The op computes D @ cols with matmul_long_k, so this is its exact check
     W, X, delta, g = _backward_case(9, shape, n)
     o, p = len(W), g.positions
     b = np.zeros(o)
