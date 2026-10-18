@@ -372,7 +372,14 @@ def gru_backward(
 ) -> tuple[Array, Array, Array, Array, Array]: ...
 def codes_forward(h: Array, e: Array) -> tuple[Array, list[int]]: ...
 def codes_backward(
-    dq: Array, h: Array, q: Array, indices: list[int], grad_e: Array, weight: float, commitment: float
+    dq: Array,
+    h: Array,
+    q: Array,
+    indices: list[int],
+    grad_e: Array,
+    weight: float,
+    commitment: float,
+    target: Array | None = None,
 ) -> tuple[Array, Array]: ...
 def concatenate_columns(arrays: list[Array]) -> Array: ...
 def factored_codes_forward(
@@ -387,6 +394,7 @@ def factored_codes_backward(
     grad_codes: list[Array | None],
     weight: float,
     commitments: list[float],
+    targets: list[Array | None] | None = None,
 ) -> tuple[Array, list[Array | None]]: ...
 
 @final
@@ -425,6 +433,7 @@ def recurrence_step_backward(
     grad_codes: list[Array | None],
     weight: float,
     commitments: list[float],
+    targets: list[Array | None] | None = None,
 ) -> tuple[Array, Array, list[Array], list[Array], list[Array], list[Array], list[Array | None]]: ...
 
 @final
@@ -463,5 +472,6 @@ def window_program_learn(
     weight: float,
     commitments: list[float],
     *,
+    consolidation: list[tuple[list[int], list[int]]] = ...,
     memory_budget: int = ...,
 ) -> Array: ...

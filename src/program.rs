@@ -22,7 +22,7 @@ use pyo3::types::PyTuple;
 
 use crate::array::{RustArray, Shape};
 use crate::attention::{attention_accumulate_gradient_batch, attention_downstream_batch, attention_forward_batch};
-use crate::factored::{step_forward, StepCore, StepGradients};
+use crate::factored::{step_forward, Consolidation, StepCore, StepGradients};
 use crate::fused::{
     affine_forward_batch, layer_accumulate_gradient_batch, layer_downstream_batch, layer_relu_forward_batch,
     layer_softmax_forward_batch,
@@ -722,7 +722,8 @@ fn step_gradients<'a>(gradients: &'a [&'a RustArray], factors: &[FactorAt]) -> [
 
 impl WindowProgram {
     /// One window's backward pass after its forward pass (its tape), from the next state's
-    /// gradient `dc_next` and its targets `y` `(N, k * classes)`, as indrajala-ml's
+    /// gradient `dc_next` and its targets `y` `(N, k * classes)`, each duplicate code's state held
+    /// to its representative's code by `consolidation`, as indrajala-ml's
     /// `WindowRecurrentShape._window_backward` runs it: each gradient accumulated onto its entry in
     /// `gradients`, and the window's state's gradient returned.
     #[allow(clippy::too_many_arguments)]
@@ -736,10 +737,13 @@ impl WindowProgram {
         gradients: &mut [RustArray],
         weight: f64,
         commitments: &[f64],
+        consolidation: &Consolidation,
         context: &str,
     ) -> PyResult<RustArray> {
         let split = self.split(parameters);
         let factors = self.factors_at();
+        let targets = consolidation.targets(&tape.step, &split.codes);
+        let targets: Vec<Option<&RustArray>> = targets.iter().map(Option::as_ref).collect();
         // the recurrence's step: its parts' gradients, and the poolings' gradient of the tokens
         let (pooled, dc_step, gq, gw, gu, gb, gcodes) = {
             let refs: Vec<&RustArray> = gradients.iter().collect();
@@ -761,6 +765,7 @@ impl WindowProgram {
                 &grads,
                 weight,
                 commitments,
+                &targets,
                 context,
             )?
         };
@@ -951,13 +956,16 @@ const MEMORY_BUDGET: usize = 2 << 30;
 /// each op's dropout masks drawn from `rng` in the per-layer path's order, keeping every window's
 /// results (D5: no recomputed forward pass); then backward from the last window, each window's
 /// gradients accumulated onto `gradients` (each parameter's, in `parameters`' order; each entry
-/// replaced by its sum) with the codes' losses `weight` (`1 / W`) times `commitments`. Returns the
+/// replaced by its sum) with the codes' losses `weight` (`1 / W`) times `commitments`. With a
+/// `consolidation`, pairs of joint codes (a code index per factor) `(duplicate, representative)`,
+/// a window's state snapped to a duplicate is held by the commitment to its representative's codes
+/// instead (indrajala-ml's code-consolidation workplan, D1); empty, as without it. Returns the
 /// initial state's gradient `(N, S)`, which the caller takes through the initial state's codes.
 /// Refused before the windows past the first run when what they keep would pass `memory_budget`
 /// bytes.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (program, x, y, parameters, gradients, c0, rng, weight, commitments, *, memory_budget = MEMORY_BUDGET))]
+#[pyo3(signature = (program, x, y, parameters, gradients, c0, rng, weight, commitments, *, consolidation = Vec::new(), memory_budget = MEMORY_BUDGET))]
 pub fn window_program_learn(
     program: &WindowProgram,
     x: &RustArray,
@@ -968,6 +976,7 @@ pub fn window_program_learn(
     rng: Bound<'_, Generator>,
     weight: f64,
     commitments: Vec<f64>,
+    consolidation: Vec<(Vec<usize>, Vec<usize>)>,
     memory_budget: usize,
 ) -> PyResult<RustArray> {
     let context = "window_program_learn";
@@ -993,6 +1002,7 @@ pub fn window_program_learn(
     }
     let per_window = targets / windows;
     let split = program.split(&parameters);
+    let consolidation = Consolidation::new(consolidation, &split.codes, context)?;
 
     let mut tapes = Vec::with_capacity(windows);
     let mut states = Vec::with_capacity(windows);
@@ -1032,6 +1042,7 @@ pub fn window_program_learn(
             &mut owned,
             weight,
             &commitments,
+            &consolidation,
             context,
         ) {
             Ok(next) => dc = next,

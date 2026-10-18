@@ -23,6 +23,8 @@
 //! `RecurrenceStep`, which holds what `recurrence_step_backward` reads; `factored_codes_*` snap a
 //! state over the factors' codes alone (the learned initial state, W8).
 
+use std::collections::HashMap;
+
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -93,8 +95,8 @@ fn snap(h: &RustArray, codes: Option<&RustArray>) -> PyResult<(RustArray, Option
     }
 }
 
-/// `snap`'s backward pass: `codes_backward`, or `dq` itself for a continuous factor. Returns
-/// `(dh, grad_e)`.
+/// `snap`'s backward pass: `codes_backward` (with the commitment's `target`, if any), or `dq`
+/// itself for a continuous factor. Returns `(dh, grad_e)`.
 #[allow(clippy::too_many_arguments)]
 fn snap_backward(
     dq: RustArray,
@@ -104,14 +106,20 @@ fn snap_backward(
     grad_e: Option<&RustArray>,
     weight: f64,
     commitment: f64,
+    target: Option<&RustArray>,
     context: &str,
 ) -> PyResult<(RustArray, Option<RustArray>)> {
     match (indices, grad_e) {
         (Some(indices), Some(grad_e)) => {
-            let (dh, grad_e) = codes_backward(&dq, h, q, indices.clone(), grad_e, weight, commitment)?;
+            let (dh, grad_e) = codes_backward(&dq, h, q, indices.clone(), grad_e, weight, commitment, target)?;
             Ok((dh, Some(grad_e)))
         }
-        (None, None) => Ok((dq, None)),
+        (None, None) => match target {
+            None => Ok((dq, None)),
+            Some(_) => Err(PyValueError::new_err(format!(
+                "{context} requires None as a continuous factor's commitment target"
+            ))),
+        },
         (Some(_), None) => Err(PyValueError::new_err(format!(
             "{context} requires a codes gradient for each snapped factor, got None"
         ))),
@@ -146,10 +154,12 @@ pub fn factored_codes_forward(
 }
 
 /// `factored_codes_forward`'s backward pass: factor by factor, `codes_backward` of its columns of
-/// `dq`, `h` and `q` with its own commitment, or `dq`'s columns straight through for a continuous
+/// `dq`, `h` and `q` with its own commitment and its commitment target `targets[g]` (None: its
+/// `q`; no `targets`, every factor's `q`), or `dq`'s columns straight through for a continuous
 /// factor (its `grad_codes` None). Returns `(dh, grad_codes)`.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
+#[pyo3(signature = (dq, h, q, sizes, indices, grad_codes, weight, commitments, targets = None))]
 pub fn factored_codes_backward(
     dq: &RustArray,
     h: &RustArray,
@@ -159,14 +169,17 @@ pub fn factored_codes_backward(
     grad_codes: Vec<Option<PyRef<'_, RustArray>>>,
     weight: f64,
     commitments: Vec<f64>,
+    targets: Option<Vec<Option<PyRef<'_, RustArray>>>>,
 ) -> PyResult<(RustArray, Vec<Option<RustArray>>)> {
     let context = "factored_codes_backward";
+    let targets = target_refs(targets.as_deref(), sizes.len());
     factor_count(
         &[
             (sizes.len(), "sizes"),
             (indices.len(), "indices"),
             (grad_codes.len(), "grad_codes"),
             (commitments.len(), "commitments"),
+            (targets.len(), "targets"),
         ],
         context,
     )?;
@@ -190,6 +203,7 @@ pub fn factored_codes_backward(
             grad_codes[g].as_deref(),
             weight,
             commitments[g],
+            targets[g],
             context,
         )?;
         dh.push(dh_g);
@@ -337,6 +351,103 @@ fn refs<'a>(arrays: &'a [PyRef<'_, RustArray>]) -> Vec<&'a RustArray> {
     arrays.iter().map(|a| &**a).collect()
 }
 
+/// A `targets` argument as plain references, each factor's (None: its `q`); no `targets`, None for
+/// each of `count` factors.
+fn target_refs<'a>(targets: Option<&'a [Option<PyRef<'_, RustArray>>]>, count: usize) -> Vec<Option<&'a RustArray>> {
+    match targets {
+        Some(targets) => targets.iter().map(|t| t.as_deref()).collect(),
+        None => vec![None; count],
+    }
+}
+
+/// Codes `e`'s `(count, size)`; a vector, which no factor's codes are, `(0, 0)`.
+fn code_shape(e: &RustArray) -> (usize, usize) {
+    match e.shape {
+        Shape::Matrix(count, size) => (count, size),
+        Shape::Vector(_) => (0, 0),
+    }
+}
+
+/// The consolidation table (indrajala-ml's code-consolidation workplan, D1): each duplicate joint
+/// code, a code index per factor, to its representative's, checked against the factors' `codes`
+/// (every factor snapped, every index one of its factor's codes, each duplicate once).
+pub(crate) struct Consolidation {
+    table: HashMap<Vec<usize>, Vec<usize>>,
+}
+
+impl Consolidation {
+    pub(crate) fn new(
+        pairs: Vec<(Vec<usize>, Vec<usize>)>,
+        codes: &[Option<&RustArray>],
+        context: &str,
+    ) -> PyResult<Consolidation> {
+        if !pairs.is_empty() && codes.iter().any(Option::is_none) {
+            return Err(PyValueError::new_err(format!(
+                "{context} consolidates only when every factor is snapped: a continuous factor has no codes"
+            )));
+        }
+        let counts: Vec<usize> = codes.iter().map(|e| e.map_or(0, |e| code_shape(e).0)).collect();
+        let mut table = HashMap::with_capacity(pairs.len());
+        for (duplicate, representative) in pairs {
+            for code in [&duplicate, &representative] {
+                if code.len() != counts.len() || code.iter().zip(&counts).any(|(&i, &m)| i >= m) {
+                    return Err(PyValueError::new_err(format!(
+                        "{context} requires each consolidation code as a code index per factor, below its factor's \
+                         code counts {counts:?}, got {code:?}"
+                    )));
+                }
+            }
+            if let Some(earlier) = table.insert(duplicate.clone(), representative) {
+                return Err(PyValueError::new_err(format!(
+                    "{context} requires each duplicate once in the consolidation, got {duplicate:?} twice (first to \
+                     {earlier:?})"
+                )));
+            }
+        }
+        Ok(Consolidation { table })
+    }
+
+    /// Each factor's commitment target after `step`: the rows of its codes at each example's
+    /// representative's index, or its own where its joint code is no duplicate (then its `q`'s
+    /// row, the same bits). None for every factor when the table is empty, so the step's backward
+    /// pass is as without one.
+    pub(crate) fn targets(&self, step: &StepCore, codes: &[Option<&RustArray>]) -> Vec<Option<RustArray>> {
+        if self.table.is_empty() {
+            return vec![None; codes.len()];
+        }
+        let own: Vec<&Vec<usize>> = step
+            .factors
+            .iter()
+            .map(|f| f.indices.as_ref().expect("a consolidated factor is snapped"))
+            .collect();
+        let rows = own.first().map_or(0, |i| i.len());
+        let mut key = vec![0; own.len()];
+        let mut chosen: Vec<Vec<usize>> = vec![Vec::with_capacity(rows); own.len()];
+        for row in 0..rows {
+            for (k, i) in key.iter_mut().zip(&own) {
+                *k = i[row];
+            }
+            let to = self.table.get(&key).unwrap_or(&key);
+            for (c, &t) in chosen.iter_mut().zip(to) {
+                c.push(t);
+            }
+        }
+        chosen
+            .iter()
+            .zip(codes)
+            .map(|(t, e)| {
+                let e = e.expect("a consolidated factor is snapped");
+                let size = code_shape(e).1;
+                let mut data = Vec::with_capacity(rows * size);
+                for &i in t {
+                    data.extend_from_slice(&e.data[i * size..(i + 1) * size]);
+                }
+                Some(RustArray::from_matrix(data, rows, size))
+            })
+            .collect()
+    }
+}
+
 /// `recurrence_step_forward`'s computation over plain references, under `context`'s name.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn step_forward(
@@ -463,12 +574,13 @@ pub fn recurrence_step_forward(
 }
 
 /// `recurrence_step_forward`'s backward pass, from the next state's gradient `dq` `(N, S)`: factor
-/// by factor, its codes' (`codes_backward`, weight and its `commitments[g]`; straight through if
-/// continuous), its cell's (`gru_backward`) and its pooling's (`attention_pooling_backward`), each
+/// by factor, its codes' (`codes_backward`, weight, its `commitments[g]` and its commitment target
+/// `targets[g]`, None or no `targets` its `q`; straight through if continuous), its cell's (`gru_backward`) and its pooling's (`attention_pooling_backward`), each
 /// parameter's gradient accumulated onto the one given. Returns `(dx, dc, grad_queries, grad_w,
 /// grad_u, grad_b, grad_codes)`: the tokens' gradient, the state's, and each factor's parameters'.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 #[pyfunction]
+#[pyo3(signature = (step, dq, queries, w, u_weights, grad_queries, grad_w, grad_u, grad_b, grad_codes, weight, commitments, targets = None))]
 pub fn recurrence_step_backward(
     py: Python<'_>,
     step: PyRef<'_, RecurrenceStep>,
@@ -483,6 +595,7 @@ pub fn recurrence_step_backward(
     grad_codes: Vec<Option<PyRef<'_, RustArray>>>,
     weight: f64,
     commitments: Vec<f64>,
+    targets: Option<Vec<Option<PyRef<'_, RustArray>>>>,
 ) -> PyResult<(
     RustArray,
     RustArray,
@@ -509,6 +622,7 @@ pub fn recurrence_step_backward(
         },
         weight,
         &commitments,
+        &target_refs(targets.as_deref(), commitments.len()),
         "recurrence_step_backward",
     )
 }
@@ -535,7 +649,7 @@ pub(crate) type StepBackward = (
 
 impl StepCore {
     /// `recurrence_step_backward`'s computation, from the tokens `x` the step read, under
-    /// `context`'s name.
+    /// `context`'s name; each factor's commitment target `targets[g]` (None: its `q`).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn backward(
         &self,
@@ -547,6 +661,7 @@ impl StepCore {
         grads: &StepGradients<'_>,
         weight: f64,
         commitments: &[f64],
+        targets: &[Option<&RustArray>],
         context: &str,
     ) -> PyResult<StepBackward> {
         let count = factor_count(
@@ -561,6 +676,7 @@ impl StepCore {
                 (grads.b.len(), "grad_b"),
                 (grads.codes.len(), "grad_codes"),
                 (commitments.len(), "commitments"),
+                (targets.len(), "targets"),
             ],
             context,
         )?;
@@ -587,6 +703,7 @@ impl StepCore {
                 grads.codes[g],
                 weight,
                 commitments[g],
+                targets[g],
                 context,
             )?;
             let (d_input, dc, gw, gu, gb) = gru_backward(

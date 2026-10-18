@@ -132,7 +132,23 @@ def _gradients(params: Parameters, rng: np.random.Generator) -> Parameters:
     )
 
 
-def _backward(step: RecurrenceStep, dQ: np.ndarray, params: Parameters, grads: Parameters, weight: float, commitments):
+def _targets(params: Parameters, indices: list[list[int] | None]) -> list[np.ndarray | None]:
+    # each snapped factor's commitment target: the code after each row's own, so none is its q
+    return [
+        None if E is None or idx is None else E[(np.array(idx) + 1) % E.shape[0]]
+        for E, idx in zip(params.E, indices, strict=True)
+    ]
+
+
+def _backward(
+    step: RecurrenceStep,
+    dQ: np.ndarray,
+    params: Parameters,
+    grads: Parameters,
+    weight: float,
+    commitments,
+    targets=None,
+):
     return recurrence_step_backward(
         step,
         _array(dQ),
@@ -146,6 +162,7 @@ def _backward(step: RecurrenceStep, dQ: np.ndarray, params: Parameters, grads: P
         _crate_codes(grads.E),
         weight,
         commitments,
+        None if targets is None else _crate_codes(targets),
     )
 
 
@@ -178,7 +195,7 @@ def _compose_forward(X: np.ndarray, C: np.ndarray, params: Parameters, factors: 
     return Composed(np.concatenate(states, axis=1), np.concatenate(hs, axis=1), indices, saved)
 
 
-def _compose_backward(X, dQ, params, grads, composed, factors, tokens, cross, weight, commitments):
+def _compose_backward(X, dQ, params, grads, composed, factors, tokens, cross, weight, commitments, targets=None):
     n = X.shape[0]
     S = sum(s for s, _ in factors)
     d = X.shape[1] // tokens
@@ -189,7 +206,8 @@ def _compose_backward(X, dQ, params, grads, composed, factors, tokens, cross, we
         if idx is None:
             dh, grad_e = dq, None
         else:
-            dh, grad_e = codes_backward(_array(dq), h, q, idx, _array(grads.E[g]), weight, commitments[g])
+            target = None if targets is None or targets[g] is None else _array(targets[g])
+            dh, grad_e = codes_backward(_array(dq), h, q, idx, _array(grads.E[g]), weight, commitments[g], target)
             dh = _numpy(dh).reshape(n, s)
         d_i, dc, gw, gu, gb = gru_backward(
             _array(dh),
@@ -223,8 +241,11 @@ def _compose_backward(X, dQ, params, grads, composed, factors, tokens, cross, we
     return dX, dC, new
 
 
+@pytest.mark.parametrize("targeted", [False, True])
 @pytest.mark.parametrize("n,tokens,d,factors,cross", STEPS_AND_CROSS)
-def test_the_step_is_its_composition_factor_by_factor(n: int, tokens: int, d: int, factors: Factors, cross: bool):
+def test_the_step_is_its_composition_factor_by_factor(
+    n: int, tokens: int, d: int, factors: Factors, cross: bool, targeted: bool
+):
     X, C, params = _inputs(n, tokens, d, factors, cross, n + tokens + d + len(factors))
     step = _forward(X, C, params, tokens, cross)
     composed = _compose_forward(X, C, params, factors, tokens, cross)
@@ -236,9 +257,12 @@ def test_the_step_is_its_composition_factor_by_factor(n: int, tokens: int, d: in
     rng = np.random.default_rng(n * d)
     dQ, grads = rng.uniform(-1, 1, composed.state.shape), _gradients(params, rng)
     weight, commitments = 1.0 / 3.0, [0.25 + 0.5 * g for g in range(len(factors))]
-    dX, dC, grad_q, grad_w, grad_u, grad_b, grad_codes = _backward(step, dQ, params, grads, weight, commitments)
+    targets = _targets(params, composed.indices) if targeted else None
+    dX, dC, grad_q, grad_w, grad_u, grad_b, grad_codes = _backward(
+        step, dQ, params, grads, weight, commitments, targets
+    )
     expected_dX, expected_dC, expected = _compose_backward(
-        X, dQ, params, grads, composed, factors, tokens, cross, weight, commitments
+        X, dQ, params, grads, composed, factors, tokens, cross, weight, commitments, targets
     )
     _assert_bits(dX, expected_dX)
     _assert_bits(dC, expected_dC)
@@ -257,8 +281,9 @@ def test_the_large_step_is_threaded():
     assert matmul_threads_for(n, d, 3 * s) > 1
 
 
+@pytest.mark.parametrize("targeted", [False, True])
 @pytest.mark.parametrize("n,_tokens,_d,factors", STEPS)
-def test_factored_codes_are_each_factors_codes(n: int, _tokens: int, _d: int, factors: Factors):
+def test_factored_codes_are_each_factors_codes(n: int, _tokens: int, _d: int, factors: Factors, targeted: bool):
     _, _, params = _inputs(n, 1, 1, factors, False, n + len(factors))
     rng = np.random.default_rng(n)
     sizes = [s for s, _ in factors]
@@ -281,8 +306,9 @@ def test_factored_codes_are_each_factors_codes(n: int, _tokens: int, _d: int, fa
     dQ = rng.uniform(-1, 1, H.shape)
     grads = [None if E is None else rng.uniform(-1, 1, E.shape) for E in params.E]
     weight, commitments = 0.5, [0.25] * len(factors)
+    targets: list[np.ndarray | None] = _targets(params, indices) if targeted else [None] * len(factors)
     dH, grad_codes = factored_codes_backward(
-        _array(dQ), _array(H), Q, sizes, indices, _crate_codes(grads), weight, commitments
+        _array(dQ), _array(H), Q, sizes, indices, _crate_codes(grads), weight, commitments, _crate_codes(targets)
     )
     expected_dH = []
     for g, ((s, _), start) in enumerate(zip(factors, _starts(factors), strict=True)):
@@ -299,6 +325,7 @@ def test_factored_codes_are_each_factors_codes(n: int, _tokens: int, _d: int, fa
             _array(grad),
             weight,
             commitments[g],
+            None if (target := targets[g]) is None else _array(target),
         )
         expected_dH.append(_numpy(dh).reshape(n, s))
         actual = grad_codes[g]
@@ -404,6 +431,12 @@ def test_the_cross_term_needs_the_wider_input_weights():
     X, C, params = _inputs(2, 1, 3, [(2, 4), (2, 4)], False, 1)
     with pytest.raises(ValueError, match="each w of shape"):
         _forward(X, C, params, 1, True)
+
+
+def test_a_continuous_factor_takes_no_commitment_target():
+    H = Array.zeros((1, 2))
+    with pytest.raises(ValueError, match="continuous factor's commitment target"):
+        factored_codes_backward(H, H, H, [2], [None], [None], 0.5, [0.0], [Array.zeros((1, 2))])
 
 
 def test_the_backward_pass_needs_a_codes_gradient_for_each_snapped_factor():
