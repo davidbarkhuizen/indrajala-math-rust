@@ -409,7 +409,7 @@ class RecurrenceStep:
     def sizes(self) -> list[int]: ...
 
 def recurrence_step_forward(
-    x: Array,
+    x: Array | list[Array],
     c: Array,
     queries: list[Array],
     w: list[Array],
@@ -434,7 +434,7 @@ def recurrence_step_backward(
     weight: float,
     commitments: list[float],
     targets: list[Array | None] | None = None,
-) -> tuple[Array, Array, list[Array], list[Array], list[Array], list[Array], list[Array | None]]: ...
+) -> tuple[Array | list[Array], Array, list[Array], list[Array], list[Array], list[Array], list[Array | None]]: ...
 
 @final
 class WindowProgram:
@@ -442,7 +442,7 @@ class WindowProgram:
         cls,
         ops: list[tuple[Any, ...]],
         columns: int,
-        reads: int,
+        reads: int | list[int],
         sizes: list[int],
         snapped: list[bool],
         *,

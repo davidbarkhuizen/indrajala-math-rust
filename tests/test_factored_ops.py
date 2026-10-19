@@ -264,6 +264,7 @@ def test_the_step_is_its_composition_factor_by_factor(
     expected_dX, expected_dC, expected = _compose_backward(
         X, dQ, params, grads, composed, factors, tokens, cross, weight, commitments, targets
     )
+    assert isinstance(dX, Array)  # one array read: its poolings' gradients summed
     _assert_bits(dX, expected_dX)
     _assert_bits(dC, expected_dC)
     for g, (gq, gw, gu, gb, ge) in enumerate(expected):
@@ -396,6 +397,7 @@ def test_the_step_agrees_with_the_numpy_mirror_and_its_gradients_with_central_di
     def close(actual: Array, values: np.ndarray) -> None:
         np.testing.assert_allclose(_numpy(actual).reshape(values.shape), central(values), rtol=1e-6, atol=1e-8)
 
+    assert isinstance(dX, Array)
     close(dX, X)
     close(dC, C)
     for g in range(len(factors)):

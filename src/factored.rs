@@ -236,7 +236,8 @@ struct FactorTape {
 /// `recurrence_step_backward` reads.
 #[pyclass(module = "indrajala_math_rust", frozen, skip_from_py_object)]
 pub struct RecurrenceStep {
-    x: Py<RustArray>,
+    /// the tokens the poolings read: one array for every factor, or one a factor
+    x: StepTokens,
     /// the step, its state and cells' outputs moved to `state` and `h`
     core: StepCore,
     state: Py<RustArray>,
@@ -448,10 +449,12 @@ impl Consolidation {
     }
 }
 
-/// `recurrence_step_forward`'s computation over plain references, under `context`'s name.
+/// `recurrence_step_forward`'s computation over plain references, under `context`'s name: factor
+/// `g`'s pooling reads `xs[g]` (the same tokens for every factor, or each its own: the window
+/// program's branches), every one of the same shape.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn step_forward(
-    x: &RustArray,
+    xs: &[&RustArray],
     c: &RustArray,
     queries: &[&RustArray],
     w: &[&RustArray],
@@ -464,6 +467,7 @@ pub(crate) fn step_forward(
 ) -> PyResult<StepCore> {
     factor_count(
         &[
+            (xs.len(), "x"),
             (queries.len(), "queries"),
             (w.len(), "w"),
             (u_weights.len(), "u_weights"),
@@ -483,13 +487,16 @@ pub(crate) fn step_forward(
             sizes.len()
         )));
     }
-    let (rows, width) = matrix_shape(x, "x", context)?;
+    let (rows, width) = matrix_shape(xs[0], "x", context)?;
+    for x in xs {
+        require_shape(x, Shape::Matrix(rows, width), "each x", context)?;
+    }
     require_shape(c, Shape::Matrix(rows, total), "c", context)?;
     let features = features_per_token(tokens, width, context)?;
 
     let mut factors = Vec::with_capacity(sizes.len());
     for (g, c_g) in split(c, total, &starts, &sizes).into_iter().enumerate() {
-        let (u, p) = attention_pooling_forward(x, queries[g], tokens)?;
+        let (u, p) = attention_pooling_forward(xs[g], queries[g], tokens)?;
         let input_size = features + if cross { total - sizes[g] } else { 0 };
         let input = if cross {
             join(&[u, others(c, total, starts[g], sizes[g])], rows, input_size)
@@ -527,8 +534,17 @@ pub(crate) fn step_forward(
     })
 }
 
+/// The tokens a step's poolings read, as `recurrence_step_forward` was given them.
+enum StepTokens {
+    /// one array every factor's pooling reads
+    Shared(Py<RustArray>),
+    /// factor `g`'s pooling reads the `g`-th (the window program's branches)
+    Each(Vec<Py<RustArray>>),
+}
+
 /// A window's recurrence over G factors in one call: from the tokens the window's output layer
-/// reads, `x` `(N, T * d)`, and the state `c` `(N, S)`, each factor `g`'s pooling
+/// reads, `x` `(N, T * d)` (or a list of G such arrays, factor `g`'s pooling reading the `g`-th),
+/// and the state `c` `(N, S)`, each factor `g`'s pooling
 /// (`queries[g]`, `(d,)`), cell (`w[g]`, `u_weights[g]`, `b[g]`, as `gru_forward`'s, `w[g]` `(3
 /// s_g, d)`, or `(3 s_g, d + S - s_g)` with `cross`) and codes (`codes[g]`, `(m_g, s_g)`, or None
 /// for a continuous factor), in factor order. Returns the `RecurrenceStep`.
@@ -537,7 +553,7 @@ pub(crate) fn step_forward(
 #[pyo3(signature = (x, c, queries, w, u_weights, b, codes, tokens, *, cross))]
 pub fn recurrence_step_forward(
     py: Python<'_>,
-    x: Bound<'_, RustArray>,
+    x: Bound<'_, PyAny>,
     c: &RustArray,
     queries: Vec<PyRef<'_, RustArray>>,
     w: Vec<PyRef<'_, RustArray>>,
@@ -548,9 +564,16 @@ pub fn recurrence_step_forward(
     cross: bool,
 ) -> PyResult<RecurrenceStep> {
     let codes: Vec<Option<&RustArray>> = codes.iter().map(|e| e.as_deref()).collect();
-    let x_ref = x.borrow();
+    let x = match x.cast::<RustArray>() {
+        Ok(one) => StepTokens::Shared(one.clone().unbind()),
+        Err(_) => StepTokens::Each(x.extract::<Vec<Py<RustArray>>>()?),
+    };
+    let borrowed: Vec<PyRef<'_, RustArray>> = match &x {
+        StepTokens::Shared(one) => (0..queries.len()).map(|_| one.bind(py).borrow()).collect(),
+        StepTokens::Each(each) => each.iter().map(|a| a.bind(py).borrow()).collect(),
+    };
     let core = step_forward(
-        &x_ref,
+        &refs(&borrowed),
         c,
         &refs(&queries),
         &refs(&w),
@@ -561,14 +584,14 @@ pub fn recurrence_step_forward(
         cross,
         "recurrence_step_forward",
     )?;
-    drop(x_ref);
+    drop(borrowed);
     let mut core = core;
     let state = std::mem::replace(&mut core.state, RustArray::from_vector(Vec::new()));
     let h = std::mem::replace(&mut core.h, RustArray::from_vector(Vec::new()));
     Ok(RecurrenceStep {
         state: Py::new(py, state)?,
         h: Py::new(py, h)?,
-        x: x.unbind(),
+        x,
         core,
     })
 }
@@ -577,7 +600,9 @@ pub fn recurrence_step_forward(
 /// by factor, its codes' (`codes_backward`, weight, its `commitments[g]` and its commitment target
 /// `targets[g]`, None or no `targets` its `q`; straight through if continuous), its cell's (`gru_backward`) and its pooling's (`attention_pooling_backward`), each
 /// parameter's gradient accumulated onto the one given. Returns `(dx, dc, grad_queries, grad_w,
-/// grad_u, grad_b, grad_codes)`: the tokens' gradient, the state's, and each factor's parameters'.
+/// grad_u, grad_b, grad_codes)`: the tokens' gradient (one array, the factors' poolings' summed in
+/// factor order, if the step read one; a list, each factor's, if it read one a factor), the
+/// state's, and each factor's parameters'.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 #[pyfunction]
 #[pyo3(signature = (step, dq, queries, w, u_weights, grad_queries, grad_w, grad_u, grad_b, grad_codes, weight, commitments, targets = None))]
@@ -597,7 +622,7 @@ pub fn recurrence_step_backward(
     commitments: Vec<f64>,
     targets: Option<Vec<Option<PyRef<'_, RustArray>>>>,
 ) -> PyResult<(
-    RustArray,
+    Py<PyAny>,
     RustArray,
     Vec<RustArray>,
     Vec<RustArray>,
@@ -605,10 +630,13 @@ pub fn recurrence_step_backward(
     Vec<RustArray>,
     Vec<Option<RustArray>>,
 )> {
-    let x = step.x.bind(py).borrow();
+    let borrowed: Vec<PyRef<'_, RustArray>> = match &step.x {
+        StepTokens::Shared(one) => (0..queries.len()).map(|_| one.bind(py).borrow()).collect(),
+        StepTokens::Each(each) => each.iter().map(|a| a.bind(py).borrow()).collect(),
+    };
     let codes: Vec<Option<&RustArray>> = grad_codes.iter().map(|e| e.as_deref()).collect();
-    step.core.backward(
-        &x,
+    let (dxs, dc, gq, gw, gu, gb, ge) = step.core.backward(
+        &refs(&borrowed),
         dq,
         &refs(&queries),
         &refs(&w),
@@ -624,7 +652,21 @@ pub fn recurrence_step_backward(
         &commitments,
         &target_refs(targets.as_deref(), commitments.len()),
         "recurrence_step_backward",
-    )
+    )?;
+    let dx = match &step.x {
+        StepTokens::Shared(_) => {
+            let all: Vec<usize> = (0..dxs.len()).collect();
+            Py::new(py, sum_in_order(&dxs, &all).expect("a step has 1 or more factors"))?.into_any()
+        }
+        StepTokens::Each(_) => dxs
+            .into_iter()
+            .map(|dx| Py::new(py, dx))
+            .collect::<PyResult<Vec<_>>>()?
+            .into_pyobject(py)?
+            .into_any()
+            .unbind(),
+    };
+    Ok((dx, dc, gq, gw, gu, gb, ge))
 }
 
 /// The parameters' gradients a step's backward pass accumulates onto, each factor's.
@@ -636,9 +678,10 @@ pub(crate) struct StepGradients<'a> {
     pub(crate) codes: &'a [Option<&'a RustArray>],
 }
 
-/// `recurrence_step_backward`'s result: `(dx, dc, grad_queries, grad_w, grad_u, grad_b, grad_codes)`.
+/// `StepCore::backward`'s result: `(dxs, dc, grad_queries, grad_w, grad_u, grad_b, grad_codes)`,
+/// `dxs` each factor's pooling's gradient of its tokens.
 pub(crate) type StepBackward = (
-    RustArray,
+    Vec<RustArray>,
     RustArray,
     Vec<RustArray>,
     Vec<RustArray>,
@@ -648,12 +691,14 @@ pub(crate) type StepBackward = (
 );
 
 impl StepCore {
-    /// `recurrence_step_backward`'s computation, from the tokens `x` the step read, under
-    /// `context`'s name; each factor's commitment target `targets[g]` (None: its `q`).
+    /// `recurrence_step_backward`'s computation, from the tokens `xs` the step read (one a factor),
+    /// under `context`'s name; each factor's commitment target `targets[g]` (None: its `q`). Its
+    /// tokens' gradient is each factor's pooling's, apart (`sum_in_order` sums those that read the
+    /// same tokens).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn backward(
         &self,
-        x: &RustArray,
+        xs: &[&RustArray],
         dq: &RustArray,
         queries: &[&RustArray],
         w: &[&RustArray],
@@ -667,6 +712,7 @@ impl StepCore {
         let count = factor_count(
             &[
                 (self.sizes.len(), "the step's factors"),
+                (xs.len(), "x"),
                 (queries.len(), "queries"),
                 (w.len(), "w"),
                 (u_weights.len(), "u_weights"),
@@ -685,7 +731,7 @@ impl StepCore {
         require_shape(dq, Shape::Matrix(rows, total), "dq", context)?;
         let features = self.features;
 
-        let mut dx: Option<RustArray> = None;
+        let mut dxs = Vec::with_capacity(count);
         let mut dc_own = Vec::with_capacity(count);
         let mut dc_cross = Vec::with_capacity(count);
         let mut new_grad_q = Vec::with_capacity(count);
@@ -727,15 +773,8 @@ impl StepCore {
             } else {
                 d_input
             };
-            let (dx_g, gq) = attention_pooling_backward(x, &f.p, queries[g], &du, grads.queries[g], self.tokens)?;
-            dx = Some(match dx {
-                None => dx_g,
-                Some(sum) => RustArray::from_matrix(
-                    same_shape_elementwise(&sum.data, &dx_g.data, |a, v| a + v),
-                    rows,
-                    self.tokens * features,
-                ),
-            });
+            let (dx_g, gq) = attention_pooling_backward(xs[g], &f.p, queries[g], &du, grads.queries[g], self.tokens)?;
+            dxs.push(dx_g);
             dc_own.push(dc);
             new_grad_q.push(gq);
             new_grad_w.push(gw);
@@ -757,7 +796,24 @@ impl StepCore {
                 }
             }
         }
-        let dx = dx.expect("a step has 1 or more factors");
-        Ok((dx, dc, new_grad_q, new_grad_w, new_grad_u, new_grad_b, new_grad_codes))
+        Ok((dxs, dc, new_grad_q, new_grad_w, new_grad_u, new_grad_b, new_grad_codes))
     }
+}
+
+/// The poolings' gradients `dxs[g]` of the factors `factors` (indices into `dxs`, in factor order)
+/// summed in that order, as one step's backward pass summed every factor's before the window
+/// program's branches: `dxs[f_0] + dxs[f_1] + ...`, left to right. None for no factors.
+pub(crate) fn sum_in_order(dxs: &[RustArray], factors: &[usize]) -> Option<RustArray> {
+    let mut sum: Option<RustArray> = None;
+    for &g in factors {
+        let dx = &dxs[g];
+        sum = Some(match sum {
+            None => dx.clone(),
+            Some(acc) => RustArray {
+                data: same_shape_elementwise(&acc.data, &dx.data, |a, v| a + v),
+                shape: acc.shape,
+            },
+        });
+    }
+    sum
 }
