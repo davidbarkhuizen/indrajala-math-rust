@@ -1,0 +1,4 @@
+# A probe only (indrajala-ml's aarch64 workplan, stage 7's open item): every function aligned to 64 bytes,
+# so code placement can't move small hot loops between an A/B's two builds. Never merged.
+[build]
+rustflags = ["-C", "llvm-args=-align-all-functions=6"]
