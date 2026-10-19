@@ -4,8 +4,9 @@ The window program (indrajala-ml's window-program workplan, stage 2): `WindowPro
 per-layer path, the crate's functions called layer by layer as indrajala-ml's layers call them
 (`WindowRecurrentRustArrayNetwork.forward_windows`): each op kind alone in a window, the studies'
 windows (the linear window, the attention window of the division family), a rotary attention, two
-factors, a continuous factor, the cross-term, and a batch over the threading threshold. The kept
-states, cells and code indices are each window's step's.
+factors, a continuous factor, the cross-term, a batch over the threading threshold, and branched
+windows (a branch a factor and one for the answers, each factor reading its own: indrajala-ml's
+window branches workplan). The kept states, cells and code indices are each window's step's.
 """
 
 import math
@@ -50,6 +51,20 @@ from indrajala_math_rust import (
 # each factor's (state size, codes; None for a continuous factor)
 type Factors = list[tuple[int, int | None]]
 type Op = tuple[Any, ...]
+# the op whose input the poolings read: one for every factor, or each factor's
+type Reads = int | list[int]
+
+
+def _each(reads: Reads, factors: int) -> list[int]:
+    return [reads] * factors if isinstance(reads, int) else reads
+
+
+def _tokens(read: list[Array | None]) -> Array | list[Array]:
+    # what the step reads: one array if every factor reads the same op's input, else each factor's
+    assert all(a is not None for a in read)
+    first = read[0]
+    assert first is not None
+    return first if all(a is first for a in read) else [a for a in read if a is not None]
 
 
 def _bits(array: Array) -> list[bytes]:
@@ -82,6 +97,8 @@ class Window:
         self.rng = np.random.default_rng(seed)
         self.ops: list[Op] = [("embedding",)]
         self.parameters: list[list[Array]] = [[_random(self.rng, vocabulary, features)]]
+        self.split_features = features
+        self.ends: list[int] = []  # each branch op's index: the factors' reads
 
     def add(self, op: Op, *parameters: Array) -> Window:
         self.ops.append(op)
@@ -114,6 +131,16 @@ class Window:
 
     def join(self) -> Window:
         return self.add(("add",))
+
+    def split(self) -> Window:
+        self.split_features = self.features
+        return self.add(("split",))
+
+    def branch(self) -> Window:
+        # ends a branch, the next starting from the split's input
+        self.ends.append(len(self.ops))
+        self.features = self.split_features
+        return self.add(("branch",))
 
     def dropout(self, p: float) -> Window:
         return self.add(("dropout", p))
@@ -153,19 +180,20 @@ class Recurrence:
         ]
 
 
-def _per_layer(window: Window, recurrence: Recurrence, reads: int, X: Array, C0: Array):
+def _per_layer(window: Window, recurrence: Recurrence, reads: Reads, X: Array, C0: Array):
     # the per-layer path: indrajala-ml's forward_windows, its layers' crate calls one by one
     k = window.tokens
     windows = X.shape[1] // k
+    each = _each(reads, len(recurrence.sizes))
     C = C0
     outputs, states, cells, indices = [], [], [], []
     for w in range(windows):
         a = X[:, w * k : (w + 1) * k]
         forks: list[Array] = []
-        read = None
+        splits: list[Array] = []
+        read: list[Array | None] = [None] * len(each)
         for i, (op, parameters) in enumerate(zip(window.ops, window.parameters, strict=True)):
-            if i == reads:
-                read = a
+            read = [a if r == i else old for r, old in zip(each, read, strict=True)]
             kind = op[0]
             if kind == "embedding":
                 a = embedding_forward(a, parameters[0])
@@ -178,6 +206,10 @@ def _per_layer(window: Window, recurrence: Recurrence, reads: int, X: Array, C0:
                 forks.append(a)
             elif kind == "add":
                 a = a + forks.pop()
+            elif kind == "split":
+                splits.append(a)
+            elif kind == "branch":
+                a = splits[-1]
             elif kind == "layer_norm":
                 gamma, beta = parameters
                 a = layer_norm_forward_batch(a, gamma, beta, op[1])[0]
@@ -209,9 +241,16 @@ def _per_layer(window: Window, recurrence: Recurrence, reads: int, X: Array, C0:
                 a = result[0]
             else:
                 assert kind == "dropout"
-        assert read is not None
         step = recurrence_step_forward(
-            read, C, recurrence.q, recurrence.W, recurrence.U, recurrence.b, recurrence.E, k, cross=recurrence.cross
+            _tokens(read),
+            C,
+            recurrence.q,
+            recurrence.W,
+            recurrence.U,
+            recurrence.b,
+            recurrence.E,
+            k,
+            cross=recurrence.cross,
         )
         outputs.append(a)
         states.append(step.state)
@@ -225,7 +264,7 @@ def _ids(rng: np.random.Generator, n: int, columns: int, vocabulary: int) -> Arr
     return Array(rng.integers(0, vocabulary, (n, columns)).astype(float).tolist())
 
 
-def _check(window: Window, recurrence: Recurrence, reads: int, n: int, windows: int, seed: int = 0) -> None:
+def _check(window: Window, recurrence: Recurrence, reads: Reads, n: int, windows: int, seed: int = 0) -> None:
     rng = np.random.default_rng(seed)
     X = _ids(rng, n, windows * window.tokens, window.vocabulary)
     C0 = _random(rng, n, sum(recurrence.sizes))
@@ -389,14 +428,15 @@ def _zeros(like: Array) -> Array:
     return Array.zeros(like.shape[0] if len(like.shape) == 1 else (like.shape[0], like.shape[1]))
 
 
-def _forward_training(window: Window, read_at: int, a: Array, C: Array, rng: Generator):
-    # one window's per-layer forward pass in training: each layer's input and result and its cache
+def _forward_training(window: Window, read_at: list[int], a: Array, C: Array, rng: Generator):
+    # one window's per-layer forward pass in training: each layer's input and result and its cache,
+    # and what each factor's pooling reads
     inputs, results, caches = [], [], []
     forks: list[Array] = []
-    read = None
+    splits: list[Array] = []
+    read: list[Array | None] = [None] * len(read_at)
     for i, (op, parameters) in enumerate(zip(window.ops, window.parameters, strict=True)):
-        if i == read_at:
-            read = a
+        read = [a if r == i else old for r, old in zip(read_at, read, strict=True)]
         inputs.append(a)
         kind, cache = op[0], None
         if kind == "embedding":
@@ -410,6 +450,10 @@ def _forward_training(window: Window, read_at: int, a: Array, C: Array, rng: Gen
             forks.append(a)
         elif kind == "add":
             a = a + forks.pop()
+        elif kind == "split":
+            splits.append(a)
+        elif kind == "branch":
+            a = splits[-1]
         elif kind == "layer_norm":
             gamma, beta = parameters
             a, xhat, std = layer_norm_forward_batch(a, gamma, beta, op[1])
@@ -436,8 +480,7 @@ def _forward_training(window: Window, read_at: int, a: Array, C: Array, rng: Gen
             a, cache = token_dropout_forward(a, op[1], rng)
         results.append(a)
         caches.append(cache)
-    assert read is not None
-    return inputs, results, caches, read
+    return inputs, results, caches, _tokens(read)
 
 
 def _consolidated(representatives: dict[tuple[int, ...], tuple[int, ...]], indices, codes) -> list[Array | None] | None:
@@ -451,9 +494,10 @@ def _consolidated(representatives: dict[tuple[int, ...], tuple[int, ...]], indic
 
 
 def _learn_per_layer(
-    window: Window, recurrence: Recurrence, read_at: int, X: Array, Y: Array, C0: Array, rng, consolidation=()
+    window: Window, recurrence: Recurrence, reads: Reads, X: Array, Y: Array, C0: Array, rng, consolidation=()
 ):
     k, ops, L = window.tokens, window.ops, len(window.ops)
+    read_at = _each(reads, len(recurrence.sizes))
     windows = X.shape[1] // k
     weight = 1.0 / windows
     width = Y.shape[1] // windows
@@ -472,13 +516,17 @@ def _learn_per_layer(
         ).state
     after = rng.state
     dC = Array.zeros((X.shape[0], sum(recurrence.sizes)))
-    adds = {}
-    open_forks = []
+    adds: dict[int, int] = {}
+    branches: dict[int, list[int]] = {}
+    open_blocks: list[int] = []
     for i, op in enumerate(ops):
-        if op[0] == "fork":
-            open_forks.append(i)
+        if op[0] in ("fork", "split"):
+            open_blocks.append(i)
+            branches.setdefault(i, []) if op[0] == "split" else None
         elif op[0] == "add":
-            adds[open_forks.pop()] = i
+            adds[open_blocks.pop()] = i
+        elif op[0] == "branch":
+            branches[open_blocks[-1]].append(i)
     for w in reversed(range(windows)):
         rng.state = generators[w]
         inputs, results, caches, read = _forward_training(window, read_at, X[:, w * k : (w + 1) * k], states[w], rng)
@@ -519,6 +567,12 @@ def _learn_per_layer(
             kind, ps, delta = ops[j][0], window.parameters[j], deltas[j]
             if kind == "fork":
                 return downstream(j + 1, deltas, caches, attention_back) + deltas[adds[j]]
+            if kind == "split":
+                total = downstream(j + 1, deltas, caches, attention_back)
+                for b in branches[j]:
+                    total = total + downstream(b + 1, deltas, caches, attention_back)
+                return total
+            assert kind != "branch", "a branch's result is read by the poolings alone"
             assert delta is not None
             if kind in ("position", "add", "state_input"):
                 return delta
@@ -535,11 +589,25 @@ def _learn_per_layer(
 
         for i in reversed(range(L - 1)):
             kind, ps = ops[i][0], window.parameters[i]
-            if kind == "fork":
+            if kind in ("fork", "split", "branch"):
                 continue
-            d = downstream(i + 1)
-            if i + 1 == read_at:
-                d = d + pooled
+            readers = [g for g, r in enumerate(read_at) if r == i + 1]
+            pooling = None
+            if readers:
+                # the step's one gradient if it read one array, else each reader's summed in order
+                if isinstance(pooled, Array):
+                    pooling = pooled
+                else:
+                    pooling = pooled[readers[0]]
+                    for g in readers[1:]:
+                        pooling = pooling + pooled[g]
+            if ops[i + 1][0] == "branch":
+                assert pooling is not None
+                d = pooling
+            else:
+                d = downstream(i + 1)
+                if pooling is not None:
+                    d = d + pooling
             if kind == "token_dense" and ops[i][2] == "relu":
                 d = array_relu_mask(d, results[i])
             elif kind == "attention":
@@ -595,7 +663,16 @@ def _learn_per_layer(
     return [array for arrays in grads for array in arrays] + parts, dC
 
 
-def _check_learn(window: Window, recurrence: Recurrence, n: int, windows: int, seed: int = 0, consolidation=()) -> None:
+def _check_learn(
+    window: Window,
+    recurrence: Recurrence,
+    n: int,
+    windows: int,
+    seed: int = 0,
+    consolidation=(),
+    reads: Reads | None = None,
+) -> None:
+    reads = len(window.ops) - 1 if reads is None else reads
     rng = np.random.default_rng(seed)
     X = _ids(rng, n, windows * window.tokens, window.vocabulary)
     classes = window.parameters[-1][0].shape[0]
@@ -603,7 +680,7 @@ def _check_learn(window: Window, recurrence: Recurrence, n: int, windows: int, s
     Y = Array(np.eye(classes)[labels].reshape(n, -1).tolist())
     C0 = _random(rng, n, sum(recurrence.sizes))
     program = WindowProgram(
-        window.ops, window.tokens, len(window.ops) - 1, recurrence.sizes, recurrence.snapped, cross=recurrence.cross
+        window.ops, window.tokens, reads, recurrence.sizes, recurrence.snapped, cross=recurrence.cross
     )
     parameters = [*window.flat(), *recurrence.flat()]
     gradients = [_zeros(p) for p in parameters]
@@ -621,9 +698,7 @@ def _check_learn(window: Window, recurrence: Recurrence, n: int, windows: int, s
         commitments,
         consolidation=[(list(d), list(r)) for d, r in consolidation],
     )
-    expected, expected_dC = _learn_per_layer(
-        window, recurrence, len(window.ops) - 1, X, Y, C0, rng_per_layer, consolidation
-    )
+    expected, expected_dC = _learn_per_layer(window, recurrence, reads, X, Y, C0, rng_per_layer, consolidation)
     assert len(gradients) == len(expected)
     for actual, wanted in zip(gradients, expected, strict=True):
         _assert_bits(actual, wanted)
@@ -720,3 +795,123 @@ def test_a_training_step_refuses_past_its_memory_budget_and_keeps_its_gradients(
             program, X, Y, parameters, gradients, Array([[0.0] * 4]), default_rng(0), 0.5, [0.25], memory_budget=100
         )
     assert all(g.shape == p.shape for g, p in zip(gradients, parameters, strict=True))
+
+
+def _branched(
+    tokens: int, factors: int, state_size: int, seed: int, rotary: bool = False, dropout: float = 0.0
+) -> Window:
+    # the window branches workplan's window: two shared blocks, then a single-head block a factor,
+    # each ending in its layer norm, and one for the answers
+    w = Window(tokens, 12, 16, seed).position()
+
+    def block(heads: int) -> None:
+        w.state_input(state_size)
+        w.fork().layer_norm().attention(heads, True, rotary).join()
+        w.fork().layer_norm().dense(32, "relu")
+        if dropout:
+            w.dropout(dropout)
+        w.dense(16, "linear").join()
+
+    for _ in range(2):
+        block(2)
+    w.split()
+    for _ in range(factors):
+        block(1)
+        w.layer_norm().branch()
+    block(1)
+    return w.layer_norm().output(5)
+
+
+@pytest.mark.parametrize(
+    "factors, cross", [([(8, 6), (8, 6)], False), ([(3, 5), (5, None)], False), ([(2, 3), (4, None), (2, 2)], True)]
+)
+def test_a_branched_window_is_the_per_layer_path(factors: Factors, cross: bool):
+    size = sum(s for s, _ in factors)
+    window = _branched(3, len(factors), size, seed=21)
+    assert len(window.ends) == len(factors)
+    _check(window, Recurrence(16, factors, cross, seed=22), window.ends, 4, 5)
+
+
+def test_a_branched_windows_training_step_with_rotary_attention_and_dropout_is_the_per_layer_path():
+    window = _branched(3, 2, 16, seed=23, rotary=True, dropout=0.25)
+    _check_learn(window, Recurrence(16, [(8, 6), (8, 6)], False, seed=24), 5, 4, reads=window.ends)
+
+
+@pytest.mark.parametrize("factors, cross", [([(3, 5), (5, None)], False), ([(2, 3), (4, None), (2, 2)], True)])
+def test_branched_continuous_and_crossed_training_steps_are_the_per_layer_path(factors: Factors, cross: bool):
+    size = sum(s for s, _ in factors)
+    window = _branched(2, len(factors), size, seed=25)
+    _check_learn(window, Recurrence(16, factors, cross, seed=26), 3, 3, reads=window.ends)
+
+
+def test_factors_reading_one_op_as_a_list_are_the_shared_read_by_bits():
+    # a list of equal reads is the one read: today's networks keep their bits however reads is given
+    window = _family(3, 16, seed=27)
+    recurrence = Recurrence(16, [(8, 6), (8, 6)], False, seed=28)
+    last = len(window.ops) - 1
+    _check(window, recurrence, [last, last], 3, 4)
+    _check_learn(window, recurrence, 3, 3, reads=[last, last])
+
+
+def test_a_steps_tokens_given_a_factor_each_are_its_shared_gradient_apart():
+    rng = np.random.default_rng(29)
+    recurrence = Recurrence(6, [(3, 4), (2, None)], False, seed=30)
+    x, C = _random(rng, 5, 2 * 6), _random(rng, 5, 5)
+    shared = recurrence_step_forward(
+        x, C, recurrence.q, recurrence.W, recurrence.U, recurrence.b, recurrence.E, 2, cross=False
+    )
+    each = recurrence_step_forward(
+        [x, x], C, recurrence.q, recurrence.W, recurrence.U, recurrence.b, recurrence.E, 2, cross=False
+    )
+    _assert_bits(each.state, shared.state)
+    dq = _random(rng, 5, 5)
+    grads = [[_zeros(a) for a in getattr(recurrence, name)] for name in ("q", "W", "U", "b")]
+    codes = [None if e is None else _zeros(e) for e in recurrence.E]
+    gq, gw, gu, gb = grads
+    one = recurrence_step_backward(
+        shared, dq, recurrence.q, recurrence.W, recurrence.U, gq, gw, gu, gb, codes, 0.5, [0.25, 0.0]
+    )
+    apart = recurrence_step_backward(
+        each, dq, recurrence.q, recurrence.W, recurrence.U, gq, gw, gu, gb, codes, 0.5, [0.25, 0.0]
+    )
+    assert isinstance(one[0], Array) and isinstance(apart[0], list) and len(apart[0]) == 2
+    _assert_bits(apart[0][0] + apart[0][1], one[0])
+    for got, want in zip(apart[1:], one[1:], strict=True):
+        for g, w in zip(
+            got if isinstance(got, list) else [got], want if isinstance(want, list) else [want], strict=True
+        ):
+            assert (g is None) == (w is None)
+            if g is not None and w is not None:
+                _assert_bits(g, w)
+
+
+@pytest.mark.parametrize(
+    "ops, reads, message",
+    [
+        ([("embedding",), ("branch",), ("token_output", 1)], 1, "without its split"),
+        (
+            [("embedding",), ("split",), ("fork",), ("branch",), ("add",), ("token_output", 1)],
+            3,
+            "inside an open residual",
+        ),
+        ([("embedding",), ("split",), ("token_output", 1)], 1, "every split with a branch"),
+        ([("embedding",), ("token_output", 1)], [1, 1], "one a factor"),
+    ],
+)
+def test_the_program_refuses_malformed_branches(ops, reads, message):
+    with pytest.raises(ValueError, match=message):
+        WindowProgram(ops, 1, reads, [4], [True], cross=False)
+
+
+def test_a_training_step_refuses_a_branch_no_factor_reads():
+    window = _branched(1, 2, 8, seed=31)
+    recurrence = Recurrence(16, [(8, 4)], False, seed=32)
+    program = WindowProgram(window.ops, 1, window.ends[0], [8], [True], cross=False)
+    rng = np.random.default_rng(33)
+    X, C0 = _ids(rng, 2, 2, 12), _random(rng, 2, 8)
+    Y = Array(np.eye(5)[rng.integers(0, 5, (2, 2))].reshape(2, -1).tolist())
+    parameters = [*window.flat(), *recurrence.flat()]
+    with pytest.raises(ValueError, match="ends unread"):
+        window_program_learn(
+            program, X, Y, parameters, [_zeros(p) for p in parameters], C0, default_rng(0), 0.5, [0.25]
+        )

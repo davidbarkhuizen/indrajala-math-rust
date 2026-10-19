@@ -5,6 +5,8 @@
 //! ```text
 //! window w      a_0 = x[:, w k : (w + 1) k],  a_(i+1) = op_i(a_i)   (the StateInputs read c_w)
 //! step w        c_(w+1) = step(a_reads, c_w)                          (factored.rs's step_forward)
+//!                (factor g's pooling reads the input of op reads[g]: one op for every factor, or
+//!                each its own, the end of its branch)
 //! outputs       [a_L for each window], side by side
 //! ```
 //!
@@ -22,7 +24,7 @@ use pyo3::types::PyTuple;
 
 use crate::array::{RustArray, Shape};
 use crate::attention::{attention_accumulate_gradient_batch, attention_downstream_batch, attention_forward_batch};
-use crate::factored::{step_forward, Consolidation, StepCore, StepGradients};
+use crate::factored::{step_forward, sum_in_order, Consolidation, StepCore, StepGradients};
 use crate::fused::{
     affine_forward_batch, layer_accumulate_gradient_batch, layer_downstream_batch, layer_relu_forward_batch,
     layer_softmax_forward_batch,
@@ -48,6 +50,12 @@ enum Op {
     Fork,
     /// a residual block closes: the body's output plus the block's input
     Add,
+    /// branches open (indrajala-ml's window branches workplan, D5): their input kept, each branch
+    /// starting from it
+    Split,
+    /// a branch ends (its result kept for the poolings that read it) and the next starts from the
+    /// innermost open split's input
+    Branch,
     /// `layer_norm_forward_batch`; parameters `gamma`, `beta`
     LayerNorm { epsilon: f64 },
     /// a dense layer on each token's row, ReLU or affine; parameters `W`, `b`
@@ -70,7 +78,7 @@ impl Op {
     fn parameter_count(&self) -> usize {
         match self {
             Op::Embedding | Op::Position | Op::StateInput { .. } => 1,
-            Op::Fork | Op::Add | Op::Dropout { .. } => 0,
+            Op::Fork | Op::Add | Op::Split | Op::Branch | Op::Dropout { .. } => 0,
             Op::LayerNorm { .. } | Op::TokenDense { .. } | Op::TokenOutput { .. } => 2,
             Op::Attention { .. } => 8,
         }
@@ -113,6 +121,14 @@ impl Op {
             "add" => {
                 expect(0)?;
                 Op::Add
+            }
+            "split" => {
+                expect(0)?;
+                Op::Split
+            }
+            "branch" => {
+                expect(0)?;
+                Op::Branch
             }
             "layer_norm" => {
                 expect(1)?;
@@ -184,19 +200,41 @@ impl Op {
 /// `("state_input", tokens)`, `("fork",)`, `("add",)`, `("layer_norm", epsilon)`,
 /// `("token_dense", tokens, "relu" | "linear")`, `("token_output", tokens)`,
 /// `("attention", heads, causal, dropout, cos, sin)` (`cos`, `sin` the rotary table's arrays, or
-/// None for both), `("dropout", p)`. `columns` is a window's width `k` (its tokens), `reads` the
-/// op whose input the poolings read, `sizes` the factors' state sizes, `snapped` whether each has
-/// codes, `cross` the cross-term.
+/// None for both), `("dropout", p)`, `("split",)`, `("branch",)`. `columns` is a window's width `k`
+/// (its tokens), `reads` the op whose input the poolings read (one for every factor, or a list,
+/// each factor's), `sizes` the factors' state sizes, `snapped` whether each has codes, `cross` the
+/// cross-term.
+///
+/// Branches: `split` keeps its input; the ops after it are its first branch; each `branch` ends a
+/// branch and starts the next from the split's input, the last branch running to the program's
+/// end (the answers'). A factor reads its branch's result as the input of the `branch` op that ends
+/// it. A residual block closes within its branch; a split stays open to the end.
 #[pyclass(module = "indrajala_math_rust", frozen, skip_from_py_object)]
 pub struct WindowProgram {
     ops: Vec<Op>,
     columns: usize,
-    reads: usize,
+    /// the op whose input each factor's pooling reads
+    reads: Vec<usize>,
     sizes: Vec<usize>,
     snapped: Vec<bool>,
     cross: bool,
     /// each fork's add (the op that closes its block); 0 for any other op
     adds: Vec<usize>,
+    /// each split's branch ops, in order; empty for any other op
+    branches: Vec<Vec<usize>>,
+}
+
+/// `WindowProgram`'s `reads`: one op for every factor, or each factor's.
+#[derive(FromPyObject)]
+enum Reads {
+    One(usize),
+    Each(Vec<usize>),
+}
+
+/// A block open while the program's ops are checked.
+enum Open {
+    Fork(usize),
+    Split(usize),
 }
 
 #[pymethods]
@@ -206,17 +244,23 @@ impl WindowProgram {
     fn new(
         ops: Vec<Bound<'_, PyTuple>>,
         columns: usize,
-        reads: usize,
+        reads: Reads,
         sizes: Vec<usize>,
         snapped: Vec<bool>,
         cross: bool,
     ) -> PyResult<Self> {
         let context = "WindowProgram";
         let ops = ops.iter().map(Op::parse).collect::<PyResult<Vec<_>>>()?;
-        if ops.is_empty() || reads >= ops.len() {
+        let reads = match reads {
+            Reads::One(read) => vec![read; sizes.len()],
+            Reads::Each(each) => each,
+        };
+        if ops.is_empty() || reads.len() != sizes.len() || reads.iter().any(|&r| r >= ops.len()) {
             return Err(PyValueError::new_err(format!(
-                "{context} requires 1 or more ops and reads among them, got {} ops and reads {reads}",
-                ops.len()
+                "{context} requires 1 or more ops and reads among them, one or one a factor, got {} ops and \
+                 reads {reads:?} for {} factors",
+                ops.len(),
+                sizes.len()
             )));
         }
         if columns == 0 || sizes.is_empty() || sizes.len() != snapped.len() || sizes.contains(&0) {
@@ -226,24 +270,38 @@ impl WindowProgram {
             )));
         }
         let mut adds = vec![0; ops.len()];
+        let mut branches = vec![Vec::new(); ops.len()];
         let mut open = Vec::new();
         for (i, op) in ops.iter().enumerate() {
             match op {
-                Op::Fork => open.push(i),
+                Op::Fork => open.push(Open::Fork(i)),
+                Op::Split => open.push(Open::Split(i)),
                 Op::Add => {
-                    let Some(fork) = open.pop() else {
+                    let Some(Open::Fork(fork)) = open.pop() else {
                         return Err(PyValueError::new_err(format!(
-                            "{context}: an add at op {i} without its fork"
+                            "{context}: an add at op {i} without its fork in its branch"
                         )));
                     };
                     adds[fork] = i;
                 }
+                Op::Branch => {
+                    let Some(Open::Split(split)) = open.last() else {
+                        return Err(PyValueError::new_err(format!(
+                            "{context}: a branch at op {i} without its split, or inside an open residual block"
+                        )));
+                    };
+                    branches[*split].push(i);
+                }
                 _ => {}
             }
         }
-        if !open.is_empty() || !matches!(ops.last(), Some(Op::TokenOutput { .. })) {
+        let forks_closed = open.iter().all(|block| matches!(block, Open::Split(_)));
+        let splits_branched = open
+            .iter()
+            .all(|block| !matches!(block, Open::Split(split) if branches[*split].is_empty()));
+        if !forks_closed || !splits_branched || !matches!(ops.last(), Some(Op::TokenOutput { .. })) {
             return Err(PyValueError::new_err(format!(
-                "{context} requires every fork closed by an add and a token_output op last"
+                "{context} requires every fork closed by an add, every split with a branch and a token_output op last"
             )));
         }
         Ok(WindowProgram {
@@ -254,6 +312,7 @@ impl WindowProgram {
             snapped,
             cross,
             adds,
+            branches,
         })
     }
 
@@ -304,14 +363,14 @@ enum Cache {
 
 /// One window's forward pass, what its backward pass reads: each op's result (as the per-layer
 /// path keeps its activations, the window's columns first), the activation each op read and the
-/// one it gave (its input for a fork, or a dropout in inference), its cache, the tokens the
-/// poolings read, and the recurrence step.
+/// one it gave (its input for a fork, or a dropout in inference), its cache, the tokens each
+/// factor's pooling read, and the recurrence step.
 struct WindowTape {
     activations: Vec<RustArray>,
     inputs: Vec<usize>,
     outputs: Vec<usize>,
     caches: Vec<Cache>,
-    read: usize,
+    read: Vec<usize>,
     step: StepCore,
 }
 
@@ -415,21 +474,25 @@ impl WindowProgram {
             inputs: Vec::with_capacity(self.ops.len()),
             outputs: Vec::with_capacity(self.ops.len()),
             caches: Vec::with_capacity(self.ops.len()),
-            read: 0,
+            read: vec![0; self.reads.len()],
             step: StepCore::empty(),
         };
         let mut current = 0; // the activation the next op reads
         let mut forks: Vec<usize> = Vec::new();
+        let mut splits: Vec<usize> = Vec::new();
         let mut at = 0;
         for (i, op) in self.ops.iter().enumerate() {
-            if i == self.reads {
-                tape.read = current;
+            for (read, &op_read) in tape.read.iter_mut().zip(&self.reads) {
+                if op_read == i {
+                    *read = current;
+                }
             }
             let p = &parameters[at..at + op.parameter_count()];
             at += op.parameter_count();
             tape.inputs.push(current);
             let a = &tape.activations[current];
             let mut cache = Cache::None;
+            let mut restart = None; // a branch's: the split's input, current again
             let next = match op {
                 Op::Embedding => Some(embedding_forward(a, p[0])?),
                 Op::Position => {
@@ -438,6 +501,14 @@ impl WindowProgram {
                 Op::StateInput { tokens } => Some(state_input_forward(a, c, p[0], *tokens)?),
                 Op::Fork => {
                     forks.push(current);
+                    None
+                }
+                Op::Split => {
+                    splits.push(current);
+                    None
+                }
+                Op::Branch => {
+                    restart = splits.last().copied();
                     None
                 }
                 Op::Add => {
@@ -513,12 +584,15 @@ impl WindowProgram {
             if let Some(next) = next {
                 tape.activations.push(next);
                 current = tape.activations.len() - 1;
+            } else if let Some(split) = restart {
+                current = split;
             }
             tape.outputs.push(current);
             tape.caches.push(cache);
         }
+        let read: Vec<&RustArray> = tape.read.iter().map(|&r| &tape.activations[r]).collect();
         tape.step = step_forward(
-            &tape.activations[tape.read],
+            &read,
             c,
             &split.queries,
             &split.w,
@@ -666,7 +740,9 @@ impl Backward<'_> {
     }
 
     /// Op `j`'s downstream, what the op before it reads (each indrajala-ml layer's
-    /// `downstream_batch`); a fork's, its body's first op's plus its add's delta.
+    /// `downstream_batch`); a fork's, its body's first op's plus its add's delta; a split's, its
+    /// first branch's first op's plus each later branch's, in order. A branch's is never asked: what
+    /// reads the result it ends is the poolings alone (the backward pass's loop).
     fn downstream(&self, j: usize) -> PyResult<RustArray> {
         let p = &self.parameters[self.offsets[j]..];
         let delta = || self.delta(j).clone();
@@ -682,6 +758,14 @@ impl Backward<'_> {
                 self.downstream(j + 1)?
                     .combine_with_array(self.delta(add), |x, y| x + y, "add")?
             }
+            Op::Split => {
+                let mut sum = self.downstream(j + 1)?;
+                for &branch in &self.program.branches[j] {
+                    sum = sum.combine_with_array(&self.downstream(branch + 1)?, |x, y| x + y, "add")?;
+                }
+                sum
+            }
+            Op::Branch => unreachable!("a branch's downstream: its result is read by the poolings alone"),
             Op::LayerNorm { .. } => {
                 let Cache::LayerNorm { xhat, std } = &self.tape.caches[j] else {
                     unreachable!("a layer norm's cache")
@@ -756,8 +840,9 @@ impl WindowProgram {
                 b: &b,
                 codes: &codes,
             };
+            let read: Vec<&RustArray> = tape.read.iter().map(|&r| &tape.activations[r]).collect();
             tape.step.backward(
-                &tape.activations[tape.read],
+                &read,
                 dc_next,
                 &split.queries,
                 &split.w,
@@ -803,16 +888,28 @@ impl WindowProgram {
         let difference = a.combine_with_array(y, |p, t| p - t, "subtract")?;
         let delta = scaled(&scaled(&difference, |v| v / tokens as f64), |v| v * weight);
         back.deltas[last] = Some(delta);
-        // the hidden ops' deltas, last first; the poolings' gradient joins the downstream the op
-        // before the one they read reads
+        // the hidden ops' deltas, last first; each factor's pooling's gradient joins the downstream
+        // the op before the one it reads reads (those reading one op summed in factor order first);
+        // a branch's end is read by its poolings alone
         for i in (0..last).rev() {
-            if matches!(self.ops[i], Op::Fork) {
-                continue; // its delta is never read: its downstream is its body's and its add's
+            if matches!(self.ops[i], Op::Fork | Op::Split | Op::Branch) {
+                // its delta is never read: a fork's downstream is its body's and its add's, a
+                // split's its branches', and a branch has none
+                continue;
             }
-            let mut d = back.downstream(i + 1)?;
-            if i + 1 == self.reads {
-                d = d.combine_with_array(&pooled, |x, y| x + y, "add")?;
-            }
+            let readers: Vec<usize> = (0..self.reads.len()).filter(|&g| self.reads[g] == i + 1).collect();
+            let pooling = sum_in_order(&pooled, &readers);
+            let mut d = if matches!(self.ops[i + 1], Op::Branch) {
+                pooling.ok_or_else(|| {
+                    PyValueError::new_err(format!("{context}: the branch at op {} ends unread", i + 1))
+                })?
+            } else {
+                let d = back.downstream(i + 1)?;
+                match pooling {
+                    Some(pooling) => d.combine_with_array(&pooling, |x, y| x + y, "add")?,
+                    None => d,
+                }
+            };
             let p = &parameters[offsets[i]..];
             match &self.ops[i] {
                 Op::TokenDense { relu: true, .. } => {
@@ -927,7 +1024,7 @@ impl WindowProgram {
                         *slot = value;
                     }
                 }
-                Op::Fork | Op::Add | Op::Dropout { .. } => {}
+                Op::Fork | Op::Add | Op::Split | Op::Branch | Op::Dropout { .. } => {}
             }
         }
         // the state's gradient: the step's, then each StateInput's, in the ops' order
