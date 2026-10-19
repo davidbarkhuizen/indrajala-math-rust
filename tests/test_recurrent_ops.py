@@ -30,6 +30,8 @@ from indrajala_math_rust import (
     linear_accumulate_gradient_batch,
     linear_forward_batch,
     matmul_threads_for,
+    soft_codes_backward,
+    soft_codes_forward,
     state_input_backward,
     state_input_forward,
 )
@@ -308,6 +310,124 @@ def test_codes_backward_refuses_an_index_past_the_codes():
     with pytest.raises(ValueError, match="an index in"):
         codes_backward(
             Array.zeros((1, 2)), Array.zeros((1, 2)), Array.zeros((1, 2)), [3], Array.zeros((3, 2)), 1.0, 0.25
+        )
+
+
+TEMPERATURES = [2.0, 0.25, 1.0 / 64.0]
+
+
+def _soft(H: np.ndarray, E: np.ndarray, temperature: float) -> tuple[np.ndarray, np.ndarray]:
+    # the soft-to-hard quantiser's forward pass: (q, weights), the crate's exp
+    differences = H[:, np.newaxis, :] - E[np.newaxis, :, :]
+    D = _fold(differences * differences, axis=2)
+    A = _crate_exp(-(D - D.min(axis=1)[:, np.newaxis]) / temperature)
+    W = A / _fold(A, axis=1)[:, np.newaxis]
+    return _fold(W[:, :, np.newaxis] * E[np.newaxis, :, :], axis=1), W
+
+
+def _soft_backward(dQ, H, Q, W, E, grad_E, weight, commitment, temperature):
+    scale, code_scale = 2.0 / temperature, -2.0 * weight
+    C = W * (_fold(dQ[:, np.newaxis, :] * E[np.newaxis, :, :], axis=2) - _fold(dQ * Q, axis=1)[:, np.newaxis])
+    S = _fold(C[:, :, np.newaxis] * (E[np.newaxis, :, :] - Q[:, np.newaxis, :]), axis=1)
+    dH = scale * S + (2.0 * weight * commitment) * (H - Q)
+    acc = grad_E.copy()
+    for n in range(len(H)):  # row by row, each row's three terms in turn
+        pulled = H[n][np.newaxis, :] - E
+        acc = acc + W[n][:, np.newaxis] * dQ[n][np.newaxis, :]
+        acc = acc + (scale * C[n])[:, np.newaxis] * pulled
+        acc = acc + (code_scale * W[n])[:, np.newaxis] * pulled
+    return dH, acc
+
+
+@pytest.mark.parametrize("temperature", TEMPERATURES)
+@pytest.mark.parametrize("n,count,size", CODES)
+def test_soft_codes_forward_is_numpys_softmax_mix(n: int, count: int, size: int, temperature: float):
+    H, E = _codes_inputs(n, count, size)
+    Q, W, indices = soft_codes_forward(_array(H), _array(E), temperature)
+    expected_Q, expected_W = _soft(H, E, temperature)
+    assert _bits(_numpy(Q).reshape(n, size)) == _bits(expected_Q)
+    assert _bits(_numpy(W).reshape(n, count)) == _bits(expected_W)
+    assert indices == _nearest(H, E).tolist()
+
+
+def test_soft_codes_forward_nears_the_snap_as_it_cools():
+    H, E = _codes_inputs(64, 16, 16)
+    hot, _, _ = soft_codes_forward(_array(H), _array(E), 4.0)
+    cold, W, indices = soft_codes_forward(_array(H), _array(E), 1e-4)
+    snapped, _ = codes_forward(_array(H), _array(E))
+    assert np.allclose(_numpy(cold), _numpy(snapped), atol=1e-9)
+    assert not np.allclose(_numpy(hot), _numpy(snapped), atol=1e-3)
+    assert np.allclose(_numpy(W).reshape(64, 16).sum(axis=1), 1.0)
+    assert (np.argmax(_numpy(W).reshape(64, 16), axis=1) == indices).all()
+
+
+@pytest.mark.parametrize("temperature", TEMPERATURES)
+@pytest.mark.parametrize("n,count,size", CODES)
+def test_soft_codes_backward_is_numpys(n: int, count: int, size: int, temperature: float):
+    H, E = _codes_inputs(n, count, size)
+    rng = np.random.default_rng(count + 2)
+    dQ, grad_E = rng.uniform(-1, 1, (n, size)), rng.uniform(-1, 1, (count, size))
+    weight, commitment = 1.0 / 3.0, 0.25
+    Q, W = _soft(H, E, temperature)
+    dH, new_grad_E = soft_codes_backward(
+        _array(dQ), _array(H), _array(Q), _array(W), _array(E), _array(grad_E), weight, commitment, temperature
+    )
+    expected_dH, expected_grad_E = _soft_backward(dQ, H, Q, W, E, grad_E, weight, commitment, temperature)
+    assert _bits(_numpy(dH).reshape(n, size)) == _bits(expected_dH)
+    assert _bits(_numpy(new_grad_E).reshape(count, size)) == _bits(expected_grad_E)
+
+
+def test_soft_codes_backward_is_the_losss_gradient_by_central_differences():
+    # L = sum(G * q) + weight (commitment ||h - sg[q]||^2 + sum_k sg[w_k] ||sg[h] - e_k||^2)
+    n, count, size, temperature, weight, commitment = 3, 4, 5, 0.7, 0.4, 0.25
+    H, E = _codes_inputs(n, count, size)
+    G = np.random.default_rng(9).uniform(-1, 1, (n, size))
+    Q, W = _soft(H, E, temperature)
+
+    def loss(H_: np.ndarray, E_: np.ndarray) -> float:
+        Q_, _ = _soft(H_, E_, temperature)
+        committed = commitment * np.sum((H_ - Q) ** 2)  # q held fixed (sg)
+        codebook = np.sum(W[:, :, np.newaxis] * (H[:, np.newaxis, :] - E_[np.newaxis, :, :]) ** 2)  # w, h fixed
+        return float(np.sum(G * Q_) + weight * (committed + codebook))
+
+    dH, grad_E = soft_codes_backward(
+        _array(G),
+        _array(H),
+        _array(Q),
+        _array(W),
+        _array(E),
+        _array(np.zeros((count, size))),
+        weight,
+        commitment,
+        temperature,
+    )
+    step = 1e-6
+    for X, analytic, of in ((H, _numpy(dH).reshape(n, size), "h"), (E, _numpy(grad_E).reshape(count, size), "e")):
+        numeric = np.zeros_like(X)
+        for i in np.ndindex(X.shape):
+            up, down = X.copy(), X.copy()
+            up[i] += step
+            down[i] -= step
+            args = ((up, E), (down, E)) if of == "h" else ((H, up), (H, down))
+            numeric[i] = (loss(*args[0]) - loss(*args[1])) / (2 * step)
+        assert np.allclose(analytic, numeric, atol=1e-6), of
+
+
+@pytest.mark.parametrize("temperature", [0.0, -1.0, float("inf"), float("nan")])
+def test_soft_codes_refuse_a_temperature_not_above_0_and_finite(temperature: float):
+    with pytest.raises(ValueError, match="temperature"):
+        soft_codes_forward(Array.zeros((1, 2)), Array.zeros((3, 2)), temperature)
+    with pytest.raises(ValueError, match="temperature"):
+        soft_codes_backward(
+            Array.zeros((1, 2)),
+            Array.zeros((1, 2)),
+            Array.zeros((1, 2)),
+            Array.zeros((1, 3)),
+            Array.zeros((3, 2)),
+            Array.zeros((3, 2)),
+            1.0,
+            0.25,
+            temperature,
         )
 
 

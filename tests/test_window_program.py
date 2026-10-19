@@ -494,7 +494,15 @@ def _consolidated(representatives: dict[tuple[int, ...], tuple[int, ...]], indic
 
 
 def _learn_per_layer(
-    window: Window, recurrence: Recurrence, reads: Reads, X: Array, Y: Array, C0: Array, rng, consolidation=()
+    window: Window,
+    recurrence: Recurrence,
+    reads: Reads,
+    X: Array,
+    Y: Array,
+    C0: Array,
+    rng,
+    consolidation=(),
+    temperatures=None,
 ):
     k, ops, L = window.tokens, window.ops, len(window.ops)
     read_at = _each(reads, len(recurrence.sizes))
@@ -512,7 +520,16 @@ def _learn_per_layer(
         generators.append(rng.state)
         _, _, _, read = _forward_training(window, read_at, X[:, w * k : (w + 1) * k], C, rng)
         C = recurrence_step_forward(
-            read, C, recurrence.q, recurrence.W, recurrence.U, recurrence.b, recurrence.E, k, cross=recurrence.cross
+            read,
+            C,
+            recurrence.q,
+            recurrence.W,
+            recurrence.U,
+            recurrence.b,
+            recurrence.E,
+            k,
+            cross=recurrence.cross,
+            temperatures=temperatures,
         ).state
     after = rng.state
     dC = Array.zeros((X.shape[0], sum(recurrence.sizes)))
@@ -540,6 +557,7 @@ def _learn_per_layer(
             recurrence.E,
             k,
             cross=recurrence.cross,
+            temperatures=temperatures,
         )
         pooled, dC_w, gq, gW, gU, gb, gE = recurrence_step_backward(
             step,
@@ -671,6 +689,7 @@ def _check_learn(
     seed: int = 0,
     consolidation=(),
     reads: Reads | None = None,
+    temperatures=None,
 ) -> None:
     reads = len(window.ops) - 1 if reads is None else reads
     rng = np.random.default_rng(seed)
@@ -697,8 +716,11 @@ def _check_learn(
         1.0 / windows,
         commitments,
         consolidation=[(list(d), list(r)) for d, r in consolidation],
+        temperatures=temperatures,
     )
-    expected, expected_dC = _learn_per_layer(window, recurrence, reads, X, Y, C0, rng_per_layer, consolidation)
+    expected, expected_dC = _learn_per_layer(
+        window, recurrence, reads, X, Y, C0, rng_per_layer, consolidation, temperatures
+    )
     assert len(gradients) == len(expected)
     for actual, wanted in zip(gradients, expected, strict=True):
         _assert_bits(actual, wanted)
@@ -730,6 +752,17 @@ def test_a_threaded_training_step_is_the_per_layer_path():
     window.fork().layer_norm().dense(d, "relu").join()
     window.layer_norm().output(3)
     _check_learn(window, Recurrence(d, [(s, 16), (s, 16)], False, seed=12), n, 2)
+
+
+@pytest.mark.parametrize(
+    "factors, cross, temperatures",
+    [([(16, 16)], False, [0.5]), ([(3, 5), (4, None), (2, 2)], True, [0.25, None, 1.5])],
+)
+def test_a_soft_training_step_is_the_per_layer_path_with_its_temperatures(factors, cross, temperatures):
+    # the soft-to-hard quantiser (indrajala-ml's commitment-control workplan, stage 3) in every window
+    size = sum(s for s, _ in factors)
+    window = _family(3, size, seed=19, rotary=True, dropout=0.25)
+    _check_learn(window, Recurrence(16, factors, cross, seed=20), 5, 4, temperatures=temperatures)
 
 
 def _every_other(counts: list[int]) -> list[tuple[tuple[int, ...], tuple[int, ...]]]:

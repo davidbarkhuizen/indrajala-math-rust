@@ -460,12 +460,14 @@ impl WindowProgram {
     /// One window's ops from its columns `x` and its state `c`, then its recurrence step: the
     /// window's tape. In training (`rng` given) dropout draws its masks from `rng` in the ops'
     /// order, as the per-layer path's layers draw them; in inference it passes its input on.
+    /// Factor `g`'s codes are soft at `temperatures[g]` (None: hard).
     fn window(
         &self,
         x: RustArray,
         c: &RustArray,
         split: &Parameters<'_>,
         rng: Option<&Bound<'_, Generator>>,
+        temperatures: &[Option<f64>],
         context: &str,
     ) -> PyResult<WindowTape> {
         let parameters = split.ops;
@@ -599,6 +601,7 @@ impl WindowProgram {
             &split.u,
             &split.b,
             &split.codes,
+            temperatures,
             self.columns,
             self.cross,
             context,
@@ -698,11 +701,12 @@ pub fn window_program_forward(
     let split = program.split(&parameters);
     let windows = program.check_input(x, c0, context)?;
     let (k, width) = (program.columns, windows * program.columns);
+    let hard = vec![None; program.sizes.len()]; // inference reads the snapped machine
     let mut outputs = Vec::with_capacity(windows);
     let (mut kept_states, mut kept_cells, mut kept_indices) = (Vec::new(), Vec::new(), Vec::new());
     let mut c = c0.clone();
     for w in 0..windows {
-        let mut tape = program.window(columns(x, width, w * k, (w + 1) * k), &c, &split, None, context)?;
+        let mut tape = program.window(columns(x, width, w * k, (w + 1) * k), &c, &split, None, &hard, context)?;
         let last = *tape.outputs.last().expect("a program has 1 or more ops");
         outputs.push(tape.activations.swap_remove(last));
         let step = tape.step;
@@ -1058,11 +1062,12 @@ const MEMORY_BUDGET: usize = 2 << 30;
 /// a window's state snapped to a duplicate is held by the commitment to its representative's codes
 /// instead (indrajala-ml's code-consolidation workplan, D1); empty, as without it. Returns the
 /// initial state's gradient `(N, S)`, which the caller takes through the initial state's codes.
-/// Refused before the windows past the first run when what they keep would pass `memory_budget`
-/// bytes.
+/// With `temperatures`, factor `g`'s codes are soft at `temperatures[g]` in every window (None, or
+/// no `temperatures`, hard; indrajala-ml's commitment-control workplan, stage 3). Refused before
+/// the windows past the first run when what they keep would pass `memory_budget` bytes.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (program, x, y, parameters, gradients, c0, rng, weight, commitments, *, consolidation = Vec::new(), memory_budget = MEMORY_BUDGET))]
+#[pyo3(signature = (program, x, y, parameters, gradients, c0, rng, weight, commitments, *, consolidation = Vec::new(), memory_budget = MEMORY_BUDGET, temperatures = None))]
 pub fn window_program_learn(
     program: &WindowProgram,
     x: &RustArray,
@@ -1075,8 +1080,10 @@ pub fn window_program_learn(
     commitments: Vec<f64>,
     consolidation: Vec<(Vec<usize>, Vec<usize>)>,
     memory_budget: usize,
+    temperatures: Option<Vec<Option<f64>>>,
 ) -> PyResult<RustArray> {
     let context = "window_program_learn";
+    let temperatures = temperatures.unwrap_or_else(|| vec![None; program.sizes.len()]);
     let parameters: Vec<&RustArray> = parameters.iter().map(|p| &**p).collect();
     program.check_count(parameters.len(), "parameters", context)?;
     program.check_count(gradients.len(), "gradients", context)?;
@@ -1105,7 +1112,14 @@ pub fn window_program_learn(
     let mut states = Vec::with_capacity(windows);
     let mut c = c0.clone();
     for w in 0..windows {
-        let tape = program.window(columns(x, width, w * k, (w + 1) * k), &c, &split, Some(&rng), context)?;
+        let tape = program.window(
+            columns(x, width, w * k, (w + 1) * k),
+            &c,
+            &split,
+            Some(&rng),
+            &temperatures,
+            context,
+        )?;
         if w == 0 {
             let bytes = tape.floats() * std::mem::size_of::<f64>() * windows;
             if bytes > memory_budget {
