@@ -27,6 +27,8 @@ from indrajala_math_rust import (
     matmul_threads_for,
     recurrence_step_backward,
     recurrence_step_forward,
+    soft_codes_backward,
+    soft_codes_forward,
 )
 
 # each factor's (state size, codes; None for a continuous factor)
@@ -109,7 +111,9 @@ def _crate_codes(values: list[np.ndarray | None]) -> list[Array | None]:
     return [None if v is None else _array(v) for v in values]
 
 
-def _forward(X: np.ndarray, C: np.ndarray, params: Parameters, tokens: int, cross: bool) -> RecurrenceStep:
+def _forward(
+    X: np.ndarray, C: np.ndarray, params: Parameters, tokens: int, cross: bool, temperatures=None
+) -> RecurrenceStep:
     return recurrence_step_forward(
         _array(X),
         _array(C),
@@ -120,7 +124,13 @@ def _forward(X: np.ndarray, C: np.ndarray, params: Parameters, tokens: int, cros
         _crate_codes(params.E),
         tokens,
         cross=cross,
+        temperatures=temperatures,
     )
+
+
+def _temperatures(factors: Factors) -> list[float | None]:
+    # each snapped factor soft, at a temperature of its own
+    return [None if m is None else 0.5 + 0.25 * g for g, (_, m) in enumerate(factors)]
 
 
 def _gradients(params: Parameters, rng: np.random.Generator) -> Parameters:
@@ -175,7 +185,9 @@ class Composed(NamedTuple):
     saved: list[tuple]
 
 
-def _compose_forward(X: np.ndarray, C: np.ndarray, params: Parameters, factors: Factors, tokens: int, cross: bool):
+def _compose_forward(
+    X: np.ndarray, C: np.ndarray, params: Parameters, factors: Factors, tokens: int, cross: bool, temperatures=None
+):
     states, hs, indices, saved = [], [], [], []
     for g, ((s, _), start) in enumerate(zip(factors, _starts(factors), strict=True)):
         c = C[:, start : start + s]
@@ -184,14 +196,18 @@ def _compose_forward(X: np.ndarray, C: np.ndarray, params: Parameters, factors: 
         i = np.concatenate([u, _others(C, factors, g)], axis=1) if cross else u
         h, *gates = gru_forward(_array(i), _array(c), _array(params.W[g]), _array(params.U[g]), _array(params.b[g]))
         E = params.E[g]
+        temperature = None if temperatures is None else temperatures[g]
+        weights = None
         if E is None:
             q, idx = h, None
-        else:
+        elif temperature is None:
             q, idx = codes_forward(h, _array(E))
+        else:
+            q, weights, idx = soft_codes_forward(h, _array(E), temperature)
         states.append(_numpy(q).reshape(-1, s))
         hs.append(_numpy(h).reshape(-1, s))
         indices.append(idx)
-        saved.append((p, i, c, gates, h, q, idx))
+        saved.append((p, i, c, gates, h, q, idx, (temperature, weights)))
     return Composed(np.concatenate(states, axis=1), np.concatenate(hs, axis=1), indices, saved)
 
 
@@ -201,10 +217,16 @@ def _compose_backward(X, dQ, params, grads, composed, factors, tokens, cross, we
     d = X.shape[1] // tokens
     dX, dC_own, dC_cross, new = None, [], [], []
     for g, ((s, _), start) in enumerate(zip(factors, _starts(factors), strict=True)):
-        p, i, c, (r, z, h_tilde, rc), h, q, idx = composed.saved[g]
+        p, i, c, (r, z, h_tilde, rc), h, q, idx, (temperature, weights) = composed.saved[g]
         dq = dQ[:, start : start + s]
         if idx is None:
             dh, grad_e = dq, None
+        elif weights is not None:
+            E = _array(params.E[g])
+            dh, grad_e = soft_codes_backward(
+                _array(dq), h, q, weights, E, _array(grads.E[g]), weight, commitments[g], temperature
+            )
+            dh = _numpy(dh).reshape(n, s)
         else:
             target = None if targets is None or targets[g] is None else _array(targets[g])
             dh, grad_e = codes_backward(_array(dq), h, q, idx, _array(grads.E[g]), weight, commitments[g], target)
@@ -241,14 +263,16 @@ def _compose_backward(X, dQ, params, grads, composed, factors, tokens, cross, we
     return dX, dC, new
 
 
-@pytest.mark.parametrize("targeted", [False, True])
+@pytest.mark.parametrize("targeted,soft", [(False, False), (True, False), (False, True)])
 @pytest.mark.parametrize("n,tokens,d,factors,cross", STEPS_AND_CROSS)
 def test_the_step_is_its_composition_factor_by_factor(
-    n: int, tokens: int, d: int, factors: Factors, cross: bool, targeted: bool
+    n: int, tokens: int, d: int, factors: Factors, cross: bool, targeted: bool, soft: bool
 ):
+    # soft: each snapped factor's codes soft_codes_*, at its own temperature
     X, C, params = _inputs(n, tokens, d, factors, cross, n + tokens + d + len(factors))
-    step = _forward(X, C, params, tokens, cross)
-    composed = _compose_forward(X, C, params, factors, tokens, cross)
+    temperatures = _temperatures(factors) if soft else None
+    step = _forward(X, C, params, tokens, cross, temperatures)
+    composed = _compose_forward(X, C, params, factors, tokens, cross, temperatures)
     _assert_bits(step.state, composed.state)
     _assert_bits(step.h, composed.h)
     assert step.indices == composed.indices
@@ -449,3 +473,33 @@ def test_the_backward_pass_needs_a_codes_gradient_for_each_snapped_factor():
         _backward(step, np.zeros(C.shape), params, grads._replace(E=[None, None]), 1.0, [0.25, 0.25])
     with pytest.raises(ValueError, match="None as a continuous factor's"):
         _backward(step, np.zeros(C.shape), params, grads._replace(E=[grads.E[0], np.zeros((4, 2))]), 1.0, [0.25] * 2)
+
+
+def test_temperatures_of_none_are_the_hard_step_by_bits():
+    factors: Factors = [(3, 5), (5, 7), (2, None)]
+    X, C, params = _inputs(6, 2, 9, factors, False, 3)
+    hard = _forward(X, C, params, 2, False)
+    nones = _forward(X, C, params, 2, False, [None, None, None])
+    for a, b in [(hard.state, nones.state), (hard.h, nones.h)]:
+        assert _bits(_numpy(a)) == _bits(_numpy(b))
+    assert hard.indices == nones.indices
+
+
+def test_the_step_refuses_a_temperature_for_a_continuous_factor_or_not_above_0():
+    X, C, params = _inputs(2, 1, 3, [(2, 4), (2, None)], False, 1)
+    with pytest.raises(ValueError, match="continuous factor's temperature"):
+        _forward(X, C, params, 1, False, [None, 1.0])
+    with pytest.raises(ValueError, match="temperature above 0"):
+        _forward(X, C, params, 1, False, [0.0, None])
+    with pytest.raises(ValueError, match="one entry per factor"):
+        _forward(X, C, params, 1, False, [1.0])
+
+
+def test_a_soft_factor_takes_no_commitment_target():
+    factors: Factors = [(2, 4), (2, 4)]
+    X, C, params = _inputs(2, 1, 3, factors, False, 1)
+    step = _forward(X, C, params, 1, False, [1.0, None])
+    grads = _gradients(params, np.random.default_rng(0))
+    targets = _targets(params, step.indices)
+    with pytest.raises(ValueError, match="soft factor's commitment target"):
+        _backward(step, np.zeros(C.shape), params, grads, 1.0, [0.25, 0.25], targets)

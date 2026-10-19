@@ -496,6 +496,148 @@ pub fn codes_backward(
     ))
 }
 
+/// A soft factor's temperature checked: finite and above 0.
+pub(crate) fn require_temperature(temperature: f64, context: &str) -> PyResult<()> {
+    if !(temperature.is_finite() && temperature > 0.0) {
+        return Err(PyValueError::new_err(format!(
+            "{context} requires a temperature above 0 and finite, got {temperature}"
+        )));
+    }
+    Ok(())
+}
+
+/// The soft-to-hard quantiser's forward pass (indrajala-ml's commitment-control workplan, stage 3,
+/// D6): with `d_k` each row's squared distance to code `k` (`codes_forward`'s left fold), the
+/// weights `w = softmax(-d / temperature)`, `w_k = a_k / z`, `a_k = exp(-(d_k - m) / temperature)`,
+/// `m` the row's smallest distance and `z` a left fold of the `a_k` in code order; and `q = sum_k
+/// w_k e_k`, a left fold in code order. Returns `(q, weights, indices)`, `weights` `(N, count)` and
+/// `indices` the nearest codes, as `codes_forward` gives them.
+#[pyfunction]
+pub fn soft_codes_forward(
+    h: &RustArray,
+    e: &RustArray,
+    temperature: f64,
+) -> PyResult<(RustArray, RustArray, Vec<usize>)> {
+    let context = "soft_codes_forward";
+    let (rows, count, size) = codes_shape(h, e, context)?;
+    require_temperature(temperature, context)?;
+    let (_, indices) = codes_forward(h, e)?;
+    let mut weights = Vec::with_capacity(rows * count);
+    let mut q = Vec::with_capacity(h.data.len());
+    let mut distances = vec![0.0; count];
+    for row in h.data.chunks_exact(size) {
+        for (distance, code) in distances.iter_mut().zip(e.data.chunks_exact(size)) {
+            *distance = row.iter().zip(code).fold(0.0, |acc, (&hv, &ev)| {
+                let difference = hv - ev;
+                acc + difference * difference
+            });
+        }
+        let least = distances[1..]
+            .iter()
+            .fold(distances[0], |m, &d| if d < m { d } else { m });
+        let start = weights.len();
+        weights.extend(
+            distances
+                .iter()
+                .map(|&d| crate::cr_exp::exp_inline(-(d - least) / temperature)),
+        );
+        let row_weights = &mut weights[start..];
+        let total = row_weights[1..].iter().fold(row_weights[0], |acc, &a| acc + a);
+        for w in row_weights.iter_mut() {
+            *w /= total;
+        }
+        let row_weights = &weights[start..];
+        for j in 0..size {
+            let mut acc = row_weights[0] * e.data[j];
+            for (k, &w) in row_weights.iter().enumerate().skip(1) {
+                acc += w * e.data[k * size + j];
+            }
+            q.push(acc);
+        }
+    }
+    Ok((
+        RustArray::from_matrix(q, rows, size),
+        RustArray::from_matrix(weights, rows, count),
+        indices,
+    ))
+}
+
+/// `soft_codes_forward`'s backward pass, from `g = dq`: per row, `c_k = w_k (g.e_k - g.q)` (the
+/// dot products left folds over the features), `h`'s gradient `(2 / temperature) sum_k c_k (e_k -
+/// q) + (2 weight commitment) (h - q)` (the sum a left fold in code order), the commitment held to
+/// the soft `q`; and `e`'s gradient `grad_e` with, row by row in row order, code by code, `w_k g`,
+/// then `(2 / temperature) c_k (h - e_k)`, then the soft codebook loss's `(-2 weight) w_k (h -
+/// e_k)` added. Returns `(dh, grad_e)`.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+pub fn soft_codes_backward(
+    dq: &RustArray,
+    h: &RustArray,
+    q: &RustArray,
+    weights: &RustArray,
+    e: &RustArray,
+    grad_e: &RustArray,
+    weight: f64,
+    commitment: f64,
+    temperature: f64,
+) -> PyResult<(RustArray, RustArray)> {
+    let context = "soft_codes_backward";
+    let (rows, count, size) = codes_shape(h, e, context)?;
+    require_temperature(temperature, context)?;
+    require_shape(q, h.shape, "q", context)?;
+    require_shape(dq, h.shape, "dq", context)?;
+    require_shape(weights, Shape::Matrix(rows, count), "weights", context)?;
+    require_shape(grad_e, e.shape, "grad_e", context)?;
+    let scale = 2.0 / temperature;
+    let state_scale = 2.0 * weight * commitment;
+    let code_scale = -2.0 * weight;
+    let dot = |a: &[f64], b: &[f64]| {
+        a[1..]
+            .iter()
+            .zip(&b[1..])
+            .fold(a[0] * b[0], |acc, (&x, &y)| acc + x * y)
+    };
+    let mut dh = Vec::with_capacity(h.data.len());
+    let mut new_grad_e = grad_e.data.clone();
+    let mut c = vec![0.0; count];
+    for (((g, h_row), q_row), w_row) in dq
+        .data
+        .chunks_exact(size)
+        .zip(h.data.chunks_exact(size))
+        .zip(q.data.chunks_exact(size))
+        .zip(weights.data.chunks_exact(count))
+    {
+        let gq = dot(g, q_row);
+        for ((c_k, &w), code) in c.iter_mut().zip(w_row).zip(e.data.chunks_exact(size)) {
+            *c_k = w * (dot(g, code) - gq);
+        }
+        for j in 0..size {
+            let mut s = c[0] * (e.data[j] - q_row[j]);
+            for (k, &c_k) in c.iter().enumerate().skip(1) {
+                s += c_k * (e.data[k * size + j] - q_row[j]);
+            }
+            dh.push(scale * s + state_scale * (h_row[j] - q_row[j]));
+        }
+        for (k, (&w, &c_k)) in w_row.iter().zip(&c).enumerate() {
+            let (direct, soft, codebook) = (w, scale * c_k, code_scale * w);
+            for j in 0..size {
+                let at = k * size + j;
+                let pulled = h_row[j] - e.data[at];
+                new_grad_e[at] += direct * g[j];
+                new_grad_e[at] += soft * pulled;
+                new_grad_e[at] += codebook * pulled;
+            }
+        }
+    }
+    Ok((
+        RustArray::from_matrix(dh, rows, size),
+        RustArray {
+            data: new_grad_e,
+            shape: grad_e.shape,
+        },
+    ))
+}
+
 /// `np.concatenate(arrays, axis=1)`: matrices of one row count side by side, a copy.
 #[pyfunction]
 pub fn concatenate_columns(arrays: Vec<PyRef<'_, RustArray>>) -> PyResult<RustArray> {

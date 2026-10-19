@@ -32,7 +32,8 @@ use crate::array::{RustArray, Shape};
 use crate::ops::same_shape_elementwise;
 use crate::recurrent::{
     attention_pooling_backward, attention_pooling_forward, codes_backward, codes_forward, columns, features_per_token,
-    gru_backward, gru_forward, matrix_shape, require_shape,
+    gru_backward, gru_forward, matrix_shape, require_shape, require_temperature, soft_codes_backward,
+    soft_codes_forward,
 };
 
 /// Each factor's first column, from the factors' sizes, every one 1 or more; and their total.
@@ -83,32 +84,80 @@ fn factor_count(lengths: &[(usize, &str)], context: &str) -> PyResult<usize> {
     Ok(count)
 }
 
-/// Factor `g`'s state `c_g` snapped to its nearest code, or itself for a continuous factor: `(q,
-/// indices)`.
-fn snap(h: &RustArray, codes: Option<&RustArray>) -> PyResult<(RustArray, Option<Vec<usize>>)> {
-    match codes {
-        Some(e) => {
+/// A soft factor's forward pass, what its backward pass reads (indrajala-ml's commitment-control
+/// workplan, stage 3).
+struct Soft {
+    temperature: f64,
+    /// the weights, `(N, m_g)`
+    weights: RustArray,
+    /// the codes the step read, a copy, `(m_g, s_g)`
+    codes: RustArray,
+}
+
+/// Factor `g`'s state `c_g` snapped to its nearest code, or with a temperature its soft state
+/// (`soft_codes_forward`), or itself for a continuous factor: `(q, indices, soft)`, the indices
+/// the nearest codes either way.
+fn snap(
+    h: &RustArray,
+    codes: Option<&RustArray>,
+    temperature: Option<f64>,
+) -> PyResult<(RustArray, Option<Vec<usize>>, Option<Soft>)> {
+    match (codes, temperature) {
+        (Some(e), None) => {
             let (q, indices) = codes_forward(h, e)?;
-            Ok((q, Some(indices)))
+            Ok((q, Some(indices), None))
         }
-        None => Ok((h.clone(), None)),
+        (Some(e), Some(temperature)) => {
+            let (q, weights, indices) = soft_codes_forward(h, e, temperature)?;
+            let soft = Soft {
+                temperature,
+                weights,
+                codes: e.clone(),
+            };
+            Ok((q, Some(indices), Some(soft)))
+        }
+        (None, None) => Ok((h.clone(), None, None)),
+        (None, Some(_)) => Err(PyValueError::new_err(
+            "a continuous factor has no codes to soften: its temperature must be None",
+        )),
     }
 }
 
-/// `snap`'s backward pass: `codes_backward` (with the commitment's `target`, if any), or `dq`
-/// itself for a continuous factor. Returns `(dh, grad_e)`.
+/// `snap`'s backward pass: `codes_backward` (with the commitment's `target`, if any), or
+/// `soft_codes_backward` for a soft factor (no target), or `dq` itself for a continuous factor.
+/// Returns `(dh, grad_e)`.
 #[allow(clippy::too_many_arguments)]
 fn snap_backward(
     dq: RustArray,
     h: &RustArray,
     q: &RustArray,
     indices: &Option<Vec<usize>>,
+    soft: Option<&Soft>,
     grad_e: Option<&RustArray>,
     weight: f64,
     commitment: f64,
     target: Option<&RustArray>,
     context: &str,
 ) -> PyResult<(RustArray, Option<RustArray>)> {
+    if let (Some(soft), Some(grad_e)) = (soft, grad_e) {
+        if target.is_some() {
+            return Err(PyValueError::new_err(format!(
+                "{context} requires None as a soft factor's commitment target: a consolidation needs hard codes"
+            )));
+        }
+        let (dh, grad_e) = soft_codes_backward(
+            &dq,
+            h,
+            q,
+            &soft.weights,
+            &soft.codes,
+            grad_e,
+            weight,
+            commitment,
+            soft.temperature,
+        )?;
+        return Ok((dh, Some(grad_e)));
+    }
     match (indices, grad_e) {
         (Some(indices), Some(grad_e)) => {
             let (dh, grad_e) = codes_backward(&dq, h, q, indices.clone(), grad_e, weight, commitment, target)?;
@@ -146,7 +195,7 @@ pub fn factored_codes_forward(
     let mut blocks = Vec::with_capacity(sizes.len());
     let mut indices = Vec::with_capacity(sizes.len());
     for (h_g, e) in split(h, total, &starts, &sizes).iter().zip(&codes) {
-        let (q, i) = snap(h_g, e.as_deref())?;
+        let (q, i, _) = snap(h_g, e.as_deref(), None)?;
         blocks.push(q);
         indices.push(i);
     }
@@ -200,6 +249,7 @@ pub fn factored_codes_backward(
             &h_g,
             &q_g,
             &indices[g],
+            None,
             grad_codes[g].as_deref(),
             weight,
             commitments[g],
@@ -229,6 +279,8 @@ struct FactorTape {
     /// the next state's block, `(N, s_g)`
     q: RustArray,
     indices: Option<Vec<usize>>,
+    /// a soft factor's weights and codes, None if hard or continuous
+    soft: Option<Soft>,
 }
 
 /// A window's factored recurrence step, from `recurrence_step_forward`: the next state, the cells'
@@ -336,6 +388,7 @@ impl StepCore {
                     .iter()
                     .map(|a| a.data.len())
                     .sum::<usize>()
+                    + f.soft.as_ref().map_or(0, |s| s.weights.data.len() + s.codes.data.len())
             })
             .sum();
         tapes + self.state.data.len() + self.h.data.len()
@@ -451,7 +504,8 @@ impl Consolidation {
 
 /// `recurrence_step_forward`'s computation over plain references, under `context`'s name: factor
 /// `g`'s pooling reads `xs[g]` (the same tokens for every factor, or each its own: the window
-/// program's branches), every one of the same shape.
+/// program's branches), every one of the same shape; factor `g` soft with `temperatures[g]`
+/// (None: hard).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn step_forward(
     xs: &[&RustArray],
@@ -461,6 +515,7 @@ pub(crate) fn step_forward(
     u_weights: &[&RustArray],
     b: &[&RustArray],
     codes: &[Option<&RustArray>],
+    temperatures: &[Option<f64>],
     tokens: usize,
     cross: bool,
     context: &str,
@@ -473,9 +528,20 @@ pub(crate) fn step_forward(
             (u_weights.len(), "u_weights"),
             (b.len(), "b"),
             (codes.len(), "codes"),
+            (temperatures.len(), "temperatures"),
         ],
         context,
     )?;
+    for (temperature, e) in temperatures.iter().zip(codes) {
+        if let Some(t) = *temperature {
+            require_temperature(t, context)?;
+            if e.is_none() {
+                return Err(PyValueError::new_err(format!(
+                    "{context} requires None as a continuous factor's temperature"
+                )));
+            }
+        }
+    }
     let sizes = u_weights
         .iter()
         .map(|u| cell_size(u, context))
@@ -505,7 +571,7 @@ pub(crate) fn step_forward(
         };
         require_shape(w[g], Shape::Matrix(3 * sizes[g], input_size), "each w", context)?;
         let (h, r, z, h_tilde, rc) = gru_forward(&input, &c_g, w[g], u_weights[g], b[g])?;
-        let (q, indices) = snap(&h, codes[g])?;
+        let (q, indices, soft) = snap(&h, codes[g], temperatures[g])?;
         factors.push(FactorTape {
             p,
             input,
@@ -517,6 +583,7 @@ pub(crate) fn step_forward(
             h,
             q,
             indices,
+            soft,
         });
     }
     let qs: Vec<RustArray> = factors.iter().map(|f| f.q.clone()).collect();
@@ -547,10 +614,12 @@ enum StepTokens {
 /// and the state `c` `(N, S)`, each factor `g`'s pooling
 /// (`queries[g]`, `(d,)`), cell (`w[g]`, `u_weights[g]`, `b[g]`, as `gru_forward`'s, `w[g]` `(3
 /// s_g, d)`, or `(3 s_g, d + S - s_g)` with `cross`) and codes (`codes[g]`, `(m_g, s_g)`, or None
-/// for a continuous factor), in factor order. Returns the `RecurrenceStep`.
+/// for a continuous factor), in factor order; with `temperatures`, factor `g` soft at
+/// `temperatures[g]` (`soft_codes_forward`; None, or no `temperatures`, hard). Returns the
+/// `RecurrenceStep`.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (x, c, queries, w, u_weights, b, codes, tokens, *, cross))]
+#[pyo3(signature = (x, c, queries, w, u_weights, b, codes, tokens, *, cross, temperatures = None))]
 pub fn recurrence_step_forward(
     py: Python<'_>,
     x: Bound<'_, PyAny>,
@@ -562,8 +631,10 @@ pub fn recurrence_step_forward(
     codes: Vec<Option<PyRef<'_, RustArray>>>,
     tokens: usize,
     cross: bool,
+    temperatures: Option<Vec<Option<f64>>>,
 ) -> PyResult<RecurrenceStep> {
     let codes: Vec<Option<&RustArray>> = codes.iter().map(|e| e.as_deref()).collect();
+    let temperatures = temperatures.unwrap_or_else(|| vec![None; codes.len()]);
     let x = match x.cast::<RustArray>() {
         Ok(one) => StepTokens::Shared(one.clone().unbind()),
         Err(_) => StepTokens::Each(x.extract::<Vec<Py<RustArray>>>()?),
@@ -580,6 +651,7 @@ pub fn recurrence_step_forward(
         &refs(&u_weights),
         &refs(&b),
         &codes,
+        &temperatures,
         tokens,
         cross,
         "recurrence_step_forward",
@@ -746,6 +818,7 @@ impl StepCore {
                 &f.h,
                 &f.q,
                 &f.indices,
+                f.soft.as_ref(),
                 grads.codes[g],
                 weight,
                 commitments[g],
