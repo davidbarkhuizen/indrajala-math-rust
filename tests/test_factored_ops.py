@@ -112,7 +112,7 @@ def _crate_codes(values: list[np.ndarray | None]) -> list[Array | None]:
 
 
 def _forward(
-    X: np.ndarray, C: np.ndarray, params: Parameters, tokens: int, cross: bool, temperatures=None
+    X: np.ndarray, C: np.ndarray, params: Parameters, tokens: int, cross: bool, temperatures=None, couplings=None
 ) -> RecurrenceStep:
     return recurrence_step_forward(
         _array(X),
@@ -125,6 +125,7 @@ def _forward(
         tokens,
         cross=cross,
         temperatures=temperatures,
+        couplings=couplings,
     )
 
 
@@ -493,6 +494,98 @@ def test_the_step_refuses_a_temperature_for_a_continuous_factor_or_not_above_0()
         _forward(X, C, params, 1, False, [0.0, None])
     with pytest.raises(ValueError, match="one entry per factor"):
         _forward(X, C, params, 1, False, [1.0])
+
+
+@pytest.mark.parametrize("soft", [False, True])
+def test_a_coupled_step_passes_on_its_blend_and_splits_its_gradient(soft: bool):
+    # the state formation workplan's gradual handover: factor g's next state (1 - l) h + l q, its
+    # snapped path's gradient l dq (the codes' losses whole), the cell's (1 - l) dq beside it
+    factors: Factors = [(3, 5), (5, 7), (2, None)]
+    couplings = [0.25, 0.7, 1.0]
+    X, C, params = _inputs(6, 2, 9, factors, True, 41)
+    temperatures = _temperatures(factors) if soft else None
+    coupled = _forward(X, C, params, 2, True, temperatures, couplings)
+    snapped = _forward(X, C, params, 2, True, temperatures)
+    H, Q = _numpy(snapped.h), _numpy(snapped.state)
+    starts = np.cumsum([0] + [s for s, _ in factors])
+    want = Q.copy()
+    for g, l in enumerate(couplings):
+        block = slice(starts[g], starts[g + 1])
+        if l < 1.0:
+            want[:, block] = (1.0 - l) * H[:, block] + l * Q[:, block]
+    _assert_bits(coupled.state, want)
+    _assert_bits(coupled.h, H)
+    assert coupled.indices == snapped.indices
+    # the gradient: the snapped step's at l dq, plus the cell's own at (1 - l) dq (a continuous step)
+    rng = np.random.default_rng(42)
+    dQ = rng.uniform(-1, 1, C.shape)
+    scale = np.concatenate([np.full(s, l) for (s, _), l in zip(factors, couplings, strict=True)])
+    zeros = Parameters(
+        [np.zeros_like(v) for v in params.q],
+        [np.zeros_like(v) for v in params.W],
+        [np.zeros_like(v) for v in params.U],
+        [np.zeros_like(v) for v in params.b],
+        [None if v is None else np.zeros_like(v) for v in params.E],
+    )
+    got = _backward(coupled, dQ, params, zeros, 0.5, [0.25, 0.25, 0.0])
+    through = _backward(snapped, dQ * scale, params, zeros, 0.5, [0.25, 0.25, 0.0])
+    free_params = params._replace(E=[None, None, None])
+    free = _forward(X, C, free_params, 2, True)
+    beside = _backward(free, dQ * (1.0 - scale), free_params, zeros._replace(E=[None, None, None]), 0.5, [0.0] * 3)
+
+    def close(a: Array, b: Array, c: Array) -> None:
+        np.testing.assert_allclose(_numpy(a), _numpy(b) + _numpy(c), rtol=1e-12, atol=1e-12)
+
+    for part in (0, 1):  # the tokens' gradient (one array: every factor read the same) and the state's
+        a, b, c = got[part], through[part], beside[part]
+        assert isinstance(a, Array) and isinstance(b, Array) and isinstance(c, Array)
+        close(a, b, c)
+    for parts in zip(got[2], through[2], beside[2], strict=True):
+        close(*parts)
+    for parts in zip(got[3], through[3], beside[3], strict=True):
+        close(*parts)
+    for parts in zip(got[4], through[4], beside[4], strict=True):
+        close(*parts)
+    for parts in zip(got[5], through[5], beside[5], strict=True):
+        close(*parts)
+    for a, b in zip(got[6], through[6], strict=True):  # the codes' gradients: the snapped path's alone
+        assert (a is None) == (b is None)
+        if a is not None and b is not None:
+            np.testing.assert_allclose(_numpy(a), _numpy(b), rtol=1e-12, atol=1e-12)
+
+
+def test_couplings_of_1_are_the_snapped_step_by_bits():
+    factors: Factors = [(3, 5), (5, 7), (2, None)]
+    X, C, params = _inputs(6, 2, 9, factors, False, 43)
+    plain, ones = _forward(X, C, params, 2, False), _forward(X, C, params, 2, False, None, [1.0, 1.0, 1.0])
+    for a, b in [(plain.state, ones.state), (plain.h, ones.h)]:
+        assert _bits(_numpy(a)) == _bits(_numpy(b))
+    dQ = np.random.default_rng(44).uniform(-1, 1, C.shape)
+    grads = _gradients(params, np.random.default_rng(45))
+    want = _backward(plain, dQ, params, grads, 0.5, [0.25, 0.25, 0.0])
+    got = _backward(ones, dQ, params, grads, 0.5, [0.25, 0.25, 0.0])
+    _, dc, gq, gw, gu, gb, ge = got
+    _, dc_want, gq_want, gw_want, gu_want, gb_want, ge_want = want
+    arrays: list[tuple[Array | None, Array | None]] = [(dc, dc_want)]
+    for mine, theirs in [(gq, gq_want), (gw, gw_want), (gu, gu_want), (gb, gb_want)]:
+        arrays.extend(zip(mine, theirs, strict=True))
+    arrays.extend(zip(ge, ge_want, strict=True))
+    for a, b in arrays:
+        assert (a is None) == (b is None)
+        if a is not None and b is not None:
+            assert _bits(_numpy(a)) == _bits(_numpy(b))
+
+
+def test_the_step_refuses_a_coupling_out_of_range_or_below_1_for_a_continuous_factor():
+    X, C, params = _inputs(2, 1, 3, [(2, 4), (2, None)], False, 1)
+    with pytest.raises(ValueError, match="each coupling in \\[0, 1\\], factor 0's is 1.5"):
+        _forward(X, C, params, 1, False, None, [1.5, 1.0])
+    with pytest.raises(ValueError, match="each coupling in \\[0, 1\\], factor 0's is -0.1"):
+        _forward(X, C, params, 1, False, None, [-0.1, 1.0])
+    with pytest.raises(ValueError, match="couples only a factor with codes"):
+        _forward(X, C, params, 1, False, None, [1.0, 0.5])
+    with pytest.raises(ValueError, match="one entry per factor"):
+        _forward(X, C, params, 1, False, None, [1.0])
 
 
 def test_a_soft_factor_takes_no_commitment_target():

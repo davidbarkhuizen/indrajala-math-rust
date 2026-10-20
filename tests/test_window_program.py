@@ -181,7 +181,7 @@ class Recurrence:
         ]
 
 
-def _per_layer(window: Window, recurrence: Recurrence, reads: Reads, X: Array, C0: Array):
+def _per_layer(window: Window, recurrence: Recurrence, reads: Reads, X: Array, C0: Array, couplings=None):
     # the per-layer path: indrajala-ml's forward_windows, its layers' crate calls one by one
     k = window.tokens
     windows = X.shape[1] // k
@@ -252,6 +252,7 @@ def _per_layer(window: Window, recurrence: Recurrence, reads: Reads, X: Array, C
             recurrence.E,
             k,
             cross=recurrence.cross,
+            couplings=couplings,
         )
         outputs.append(a)
         states.append(step.state)
@@ -265,7 +266,9 @@ def _ids(rng: np.random.Generator, n: int, columns: int, vocabulary: int) -> Arr
     return Array(rng.integers(0, vocabulary, (n, columns)).astype(float).tolist())
 
 
-def _check(window: Window, recurrence: Recurrence, reads: Reads, n: int, windows: int, seed: int = 0) -> None:
+def _check(
+    window: Window, recurrence: Recurrence, reads: Reads, n: int, windows: int, seed: int = 0, couplings=None
+) -> None:
     rng = np.random.default_rng(seed)
     X = _ids(rng, n, windows * window.tokens, window.vocabulary)
     C0 = _random(rng, n, sum(recurrence.sizes))
@@ -274,8 +277,10 @@ def _check(window: Window, recurrence: Recurrence, reads: Reads, n: int, windows
     )
     parameters = [*window.flat(), *recurrence.flat()]
     assert program.parameter_count == len(parameters)
-    outputs, states, cells, indices = window_program_forward(program, X, parameters, C0, states=True, codes=True)
-    expected = _per_layer(window, recurrence, reads, X, C0)
+    outputs, states, cells, indices = window_program_forward(
+        program, X, parameters, C0, states=True, codes=True, couplings=couplings
+    )
+    expected = _per_layer(window, recurrence, reads, X, C0, couplings)
     _assert_bits(outputs, expected[0])
     assert len(states) == len(cells) == len(indices) == windows
     for state, cell, expected_state, expected_cell in zip(states, cells, expected[1], expected[2], strict=True):
@@ -283,7 +288,7 @@ def _check(window: Window, recurrence: Recurrence, reads: Reads, n: int, windows
         _assert_bits(cell, expected_cell)
     assert indices == expected[3]
     # only the outputs, unless asked
-    plain = window_program_forward(program, X, parameters, C0)
+    plain = window_program_forward(program, X, parameters, C0, couplings=couplings)
     _assert_bits(plain[0], expected[0])
     assert plain[1:] == ([], [], [])
 
@@ -504,6 +509,7 @@ def _learn_per_layer(
     rng,
     consolidation=(),
     temperatures=None,
+    couplings=None,
 ):
     k, ops, L = window.tokens, window.ops, len(window.ops)
     read_at = _each(reads, len(recurrence.sizes))
@@ -531,6 +537,7 @@ def _learn_per_layer(
             k,
             cross=recurrence.cross,
             temperatures=temperatures,
+            couplings=couplings,
         ).state
     after = rng.state
     dC = Array.zeros((X.shape[0], sum(recurrence.sizes)))
@@ -559,6 +566,7 @@ def _learn_per_layer(
             k,
             cross=recurrence.cross,
             temperatures=temperatures,
+            couplings=couplings,
         )
         pooled, dC_w, gq, gW, gU, gb, gE = recurrence_step_backward(
             step,
@@ -691,6 +699,7 @@ def _check_learn(
     consolidation=(),
     reads: Reads | None = None,
     temperatures=None,
+    couplings=None,
 ) -> None:
     reads = len(window.ops) - 1 if reads is None else reads
     rng = np.random.default_rng(seed)
@@ -718,9 +727,10 @@ def _check_learn(
         commitments,
         consolidation=[(list(d), list(r)) for d, r in consolidation],
         temperatures=temperatures,
+        couplings=couplings,
     )
     expected, expected_dC = _learn_per_layer(
-        window, recurrence, reads, X, Y, C0, rng_per_layer, consolidation, temperatures
+        window, recurrence, reads, X, Y, C0, rng_per_layer, consolidation, temperatures, couplings
     )
     assert len(gradients) == len(expected)
     for actual, wanted in zip(gradients, expected, strict=True):
@@ -764,6 +774,44 @@ def test_a_soft_training_step_is_the_per_layer_path_with_its_temperatures(factor
     size = sum(s for s, _ in factors)
     window = _family(3, size, seed=19, rotary=True, dropout=0.25)
     _check_learn(window, Recurrence(16, factors, cross, seed=20), 5, 4, temperatures=temperatures)
+
+
+@pytest.mark.parametrize(
+    "factors, cross, couplings",
+    [([(16, 16)], False, [0.4]), ([(3, 5), (4, None), (2, 2)], True, [0.0, 1.0, 0.75])],
+)
+def test_a_coupled_window_is_the_per_layer_path_in_inference_and_training(factors, cross, couplings):
+    # the state formation workplan's gradual handover: each factor's next state (1 - l) h + l q
+    size = sum(s for s, _ in factors)
+    _check(
+        _linear(2, size, seed=31),
+        Recurrence(16, factors, cross, seed=32),
+        len(_linear(2, size, seed=31).ops) - 1,
+        4,
+        3,
+        couplings=couplings,
+    )
+    window = _family(3, size, seed=33, rotary=True, dropout=0.25)
+    _check_learn(window, Recurrence(16, factors, cross, seed=34), 5, 4, couplings=couplings)
+    temperatures = [None if m is None else 0.5 for _, m in factors]
+    _check_learn(window, Recurrence(16, factors, cross, seed=34), 5, 4, temperatures=temperatures, couplings=couplings)
+
+
+def test_the_program_refuses_a_coupling_below_1_for_a_continuous_or_unsnapped_factor():
+    window = _linear(2, 6, seed=35)
+    recurrence = Recurrence(16, [(3, 5), (3, None)], False, seed=36)
+    program = WindowProgram(
+        window.ops, window.tokens, len(window.ops) - 1, recurrence.sizes, recurrence.snapped, cross=False
+    )
+    parameters = [*window.flat(), *recurrence.flat()]
+    rng = np.random.default_rng(0)
+    X, C0 = _ids(rng, 2, 2 * window.tokens, window.vocabulary), _random(rng, 2, 6)
+    with pytest.raises(ValueError, match="couples only a snapped factor not run continuous, factor 1"):
+        window_program_forward(program, X, parameters, C0, couplings=[1.0, 0.5])
+    with pytest.raises(ValueError, match="couples only a snapped factor not run continuous, factor 0"):
+        window_program_forward(program, X, parameters, C0, continuous=[True, False], couplings=[0.5, 1.0])
+    with pytest.raises(ValueError, match="a coupling per factor"):
+        window_program_forward(program, X, parameters, C0, couplings=[0.5])
 
 
 def _every_other(counts: list[int]) -> list[tuple[tuple[int, ...], tuple[int, ...]]]:

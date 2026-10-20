@@ -432,6 +432,7 @@ def recurrence_step_forward(
     *,
     cross: bool,
     temperatures: list[float | None] | None = None,
+    couplings: list[float] | None = None,
 ) -> RecurrenceStep: ...
 def recurrence_step_backward(
     step: RecurrenceStep,
@@ -473,6 +474,7 @@ def window_program_forward(
     states: bool = False,
     codes: bool = False,
     continuous: list[bool] | None = None,
+    couplings: list[float] | None = None,
 ) -> tuple[Array, list[Array], list[Array], list[list[list[int] | None]]]: ...
 def argmax_token_rows(matrix: Array, classes: int) -> list[tuple[int, ...]]: ...
 def window_program_learn(
@@ -490,4 +492,5 @@ def window_program_learn(
     memory_budget: int = ...,
     temperatures: list[float | None] | None = None,
     continuous: list[bool] | None = None,
+    couplings: list[float] | None = None,
 ) -> Array: ...

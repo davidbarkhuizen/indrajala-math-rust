@@ -461,7 +461,8 @@ impl WindowProgram {
     /// window's tape. In training (`rng` given) dropout draws its masks from `rng` in the ops'
     /// order, as the per-layer path's layers draw them; in inference it passes its input on.
     /// Factor `g`'s codes are soft at `temperatures[g]` (None: hard); with `continuous[g]`, the
-    /// factor passes its cell's output on unsnapped, its codes unread.
+    /// factor passes its cell's output on unsnapped, its codes unread; its next state coupled by
+    /// `couplings[g]` (1: its snapped state).
     #[allow(clippy::too_many_arguments)]
     fn window(
         &self,
@@ -471,6 +472,7 @@ impl WindowProgram {
         rng: Option<&Bound<'_, Generator>>,
         temperatures: &[Option<f64>],
         continuous: &[bool],
+        couplings: &[f64],
         context: &str,
     ) -> PyResult<WindowTape> {
         let parameters = split.ops;
@@ -611,6 +613,7 @@ impl WindowProgram {
             &split.b,
             &codes,
             temperatures,
+            couplings,
             self.columns,
             self.cross,
             context,
@@ -649,6 +652,27 @@ impl WindowProgram {
             }
         }
         Ok(continuous)
+    }
+
+    /// The factors' couplings in a call, one a factor (None: every 1, the snapped state), each below
+    /// 1 only for a snapped factor not run continuous (the range is the step's to check).
+    fn check_couplings(&self, couplings: Option<Vec<f64>>, continuous: &[bool], context: &str) -> PyResult<Vec<f64>> {
+        let couplings = couplings.unwrap_or_else(|| vec![1.0; self.sizes.len()]);
+        if couplings.len() != self.sizes.len() {
+            return Err(PyValueError::new_err(format!(
+                "{context} requires a coupling per factor, {} factors, got {}",
+                self.sizes.len(),
+                couplings.len()
+            )));
+        }
+        for (g, ((&coupling, &snapped), &free)) in couplings.iter().zip(&self.snapped).zip(continuous).enumerate() {
+            if coupling < 1.0 && (!snapped || free) {
+                return Err(PyValueError::new_err(format!(
+                    "{context} couples only a snapped factor not run continuous, factor {g} isn't"
+                )));
+            }
+        }
+        Ok(couplings)
     }
 
     fn check_input(&self, x: &RustArray, c0: &RustArray, context: &str) -> PyResult<usize> {
@@ -722,9 +746,11 @@ type ProgramForward = (RustArray, Vec<RustArray>, Vec<RustArray>, Vec<Vec<Option
 /// state and its cells' outputs `(N, S)`, W of each; with `codes`, each window's code indices per
 /// factor (None for a continuous factor). What isn't kept is an empty list. With `continuous`, a
 /// flag a factor, a flagged factor passes its cell's output on unsnapped (indrajala-ml's state
-/// formation workplan, the warm-up).
+/// formation workplan, the warm-up); with `couplings`, factor `g`'s next state `(1 - couplings[g])
+/// h + couplings[g] q` (the workplan's gradual handover; None, every 1).
+#[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (program, x, parameters, c0, *, states = false, codes = false, continuous = None))]
+#[pyo3(signature = (program, x, parameters, c0, *, states = false, codes = false, continuous = None, couplings = None))]
 pub fn window_program_forward(
     program: &WindowProgram,
     x: &RustArray,
@@ -733,6 +759,7 @@ pub fn window_program_forward(
     states: bool,
     codes: bool,
     continuous: Option<Vec<bool>>,
+    couplings: Option<Vec<f64>>,
 ) -> PyResult<ProgramForward> {
     let context = "window_program_forward";
     let parameters: Vec<&RustArray> = parameters.iter().map(|p| &**p).collect();
@@ -742,6 +769,7 @@ pub fn window_program_forward(
     let (k, width) = (program.columns, windows * program.columns);
     let hard = vec![None; program.sizes.len()]; // inference reads the snapped machine
     let continuous = program.check_continuous(continuous, &hard, context)?;
+    let couplings = program.check_couplings(couplings, &continuous, context)?;
     let mut outputs = Vec::with_capacity(windows);
     let (mut kept_states, mut kept_cells, mut kept_indices) = (Vec::new(), Vec::new(), Vec::new());
     let mut c = c0.clone();
@@ -753,6 +781,7 @@ pub fn window_program_forward(
             None,
             &hard,
             &continuous,
+            &couplings,
             context,
         )?;
         let last = *tape.outputs.last().expect("a program has 1 or more ops");
@@ -1119,11 +1148,13 @@ const MEMORY_BUDGET: usize = 2 << 30;
 /// no `temperatures`, hard; indrajala-ml's commitment-control workplan, stage 3). With
 /// `continuous`, a flag a factor, a flagged factor passes its cell's output on unsnapped and its
 /// codes' gradients are left as they are (indrajala-ml's state formation workplan, the warm-up).
-/// Refused before the windows past the first run when what they keep would pass `memory_budget`
+/// With `couplings`, factor `g`'s next state `(1 - couplings[g]) h + couplings[g] q`, its snapped
+/// path's gradient `couplings[g] dq` (its codes' losses whole), the cell's `(1 - couplings[g]) dq`
+/// (the workplan's gradual handover; None, every 1). Refused before the windows past the first run when what they keep would pass `memory_budget`
 /// bytes.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (program, x, y, parameters, gradients, c0, rng, weight, commitments, *, consolidation = Vec::new(), memory_budget = MEMORY_BUDGET, temperatures = None, continuous = None))]
+#[pyo3(signature = (program, x, y, parameters, gradients, c0, rng, weight, commitments, *, consolidation = Vec::new(), memory_budget = MEMORY_BUDGET, temperatures = None, continuous = None, couplings = None))]
 pub fn window_program_learn(
     program: &WindowProgram,
     x: &RustArray,
@@ -1138,6 +1169,7 @@ pub fn window_program_learn(
     memory_budget: usize,
     temperatures: Option<Vec<Option<f64>>>,
     continuous: Option<Vec<bool>>,
+    couplings: Option<Vec<f64>>,
 ) -> PyResult<RustArray> {
     let context = "window_program_learn";
     let temperatures = temperatures.unwrap_or_else(|| vec![None; program.sizes.len()]);
@@ -1152,6 +1184,12 @@ pub fn window_program_learn(
     if continuous.contains(&true) && !consolidation.is_empty() {
         return Err(PyValueError::new_err(format!(
             "{context} takes no consolidation with a continuous factor"
+        )));
+    }
+    let couplings = program.check_couplings(couplings, &continuous, context)?;
+    if couplings.iter().any(|&l| l < 1.0) && !consolidation.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "{context} takes no consolidation with a coupled factor"
         )));
     }
     let parameters: Vec<&RustArray> = parameters.iter().map(|p| &**p).collect();
@@ -1189,6 +1227,7 @@ pub fn window_program_learn(
             Some(&rng),
             &temperatures,
             &continuous,
+            &couplings,
             context,
         )?;
         if w == 0 {
