@@ -363,6 +363,15 @@ pub(crate) struct StepCore {
 }
 
 impl StepCore {
+    /// Whether each factor's state was snapped to its codes (hard or soft) in this step: false for
+    /// a continuous factor, whose codes take no gradient.
+    pub(crate) fn snapped(&self) -> Vec<bool> {
+        self.factors
+            .iter()
+            .map(|f| f.indices.is_some() || f.soft.is_some())
+            .collect()
+    }
+
     /// A step of no factors, a placeholder until `step_forward` gives one.
     pub(crate) fn empty() -> StepCore {
         StepCore {

@@ -472,6 +472,7 @@ def window_program_forward(
     *,
     states: bool = False,
     codes: bool = False,
+    continuous: list[bool] | None = None,
 ) -> tuple[Array, list[Array], list[Array], list[list[list[int] | None]]]: ...
 def argmax_token_rows(matrix: Array, classes: int) -> list[tuple[int, ...]]: ...
 def window_program_learn(
@@ -488,4 +489,5 @@ def window_program_learn(
     consolidation: list[tuple[list[int], list[int]]] = ...,
     memory_budget: int = ...,
     temperatures: list[float | None] | None = None,
+    continuous: list[bool] | None = None,
 ) -> Array: ...

@@ -9,6 +9,7 @@ windows (a branch a factor and one for the answers, each factor reading its own:
 window branches workplan). The kept states, cells and code indices are each window's step's.
 """
 
+import copy
 import math
 from typing import Any
 
@@ -947,4 +948,86 @@ def test_a_training_step_refuses_a_branch_no_factor_reads():
     with pytest.raises(ValueError, match="ends unread"):
         window_program_learn(
             program, X, Y, parameters, [_zeros(p) for p in parameters], C0, default_rng(0), 0.5, [0.25]
+        )
+
+
+def _without_codes(recurrence: Recurrence, free: list[bool]) -> Recurrence:
+    # the same recurrence with the flagged factors' codes dropped: a program of continuous factors
+    other = copy.copy(recurrence)
+    other.E = [None if f else e for e, f in zip(recurrence.E, free, strict=True)]
+    other.snapped = [s and not f for s, f in zip(recurrence.snapped, free, strict=True)]
+    return other
+
+
+@pytest.mark.parametrize("factors, cross, free", [([(4, 6)], False, [True]), ([(3, 5), (4, 7)], True, [False, True])])
+def test_a_continuous_call_is_the_program_without_the_flagged_factors_codes(factors: Factors, cross: bool, free):
+    # the state formation workplan's warm-up: a snapped factor run continuous in one call is, by
+    # bits, the program in which it has no codes; its codes' gradient is left as it was
+    size, n, windows = sum(s for s, _ in factors), 4, 3
+    window, recurrence = _linear(2, size, seed=21), Recurrence(16, factors, cross, seed=22)
+    plain = _without_codes(recurrence, free)
+    reads = len(window.ops) - 1
+    rng = np.random.default_rng(23)
+    X = _ids(rng, n, windows * window.tokens, window.vocabulary)
+    classes = window.parameters[-1][0].shape[0]
+    labels = rng.integers(0, classes, (n, windows * window.tokens))
+    Y = Array(np.eye(classes)[labels].reshape(n, -1).tolist())
+    C0 = _random(rng, n, size)
+    snapped = WindowProgram(window.ops, window.tokens, reads, recurrence.sizes, recurrence.snapped, cross=cross)
+    continuous = WindowProgram(window.ops, window.tokens, reads, plain.sizes, plain.snapped, cross=cross)
+    a, b = [*window.flat(), *recurrence.flat()], [*window.flat(), *plain.flat()]
+    got = window_program_forward(snapped, X, a, C0, states=True, codes=True, continuous=free)
+    want = window_program_forward(continuous, X, b, C0, states=True, codes=True)
+    for x, y in zip([got[0], *got[1], *got[2]], [want[0], *want[1], *want[2]], strict=True):
+        _assert_bits(x, y)
+    assert got[3] == want[3]
+    ga, gb = [_zeros(p) for p in a], [_zeros(p) for p in b]
+    dropped = {id(e) for e, f in zip(recurrence.E, free, strict=True) if f and e is not None}
+    marked = [Array(np.full(p.shape, 7.0).tolist()) if id(p) in dropped else g for p, g in zip(a, ga, strict=True)]
+    commitments = [0.25 if e is not None else 0.0 for e in recurrence.E]
+    plain_commitments = [0.25 if e is not None else 0.0 for e in plain.E]
+    dc_a = window_program_learn(
+        snapped, X, Y, a, marked, C0, default_rng(24), 1.0 / windows, commitments, continuous=free
+    )
+    dc_b = window_program_learn(continuous, X, Y, b, gb, C0, default_rng(24), 1.0 / windows, plain_commitments)
+    _assert_bits(dc_a, dc_b)
+    kept = iter(gb)
+    for p, g in zip(a, marked, strict=True):
+        if id(p) in dropped:
+            _assert_bits(g, Array(np.full(p.shape, 7.0).tolist()))
+        else:
+            _assert_bits(g, next(kept))
+
+
+@pytest.mark.parametrize(
+    "free, temperatures, message",
+    [
+        ([True, True], None, "only a snapped factor"),
+        ([True], None, "a continuous flag per factor"),
+        ([True, False], [0.5, None], "only a snapped factor"),
+    ],
+)
+def test_a_continuous_call_refuses_a_malformed_flag(free, temperatures, message: str):
+    window, recurrence = _linear(2, 7, seed=25), Recurrence(16, [(3, 5), (4, None)], False, seed=26)
+    program = WindowProgram(
+        window.ops, window.tokens, len(window.ops) - 1, recurrence.sizes, recurrence.snapped, cross=False
+    )
+    parameters = [*window.flat(), *recurrence.flat()]
+    rng = np.random.default_rng(27)
+    X, C0 = _ids(rng, 2, window.tokens, window.vocabulary), _random(rng, 2, 7)
+    classes = window.parameters[-1][0].shape[0]
+    Y = Array(np.eye(classes)[rng.integers(0, classes, (2, window.tokens))].reshape(2, -1).tolist())
+    with pytest.raises(ValueError, match=message):
+        window_program_learn(
+            program,
+            X,
+            Y,
+            parameters,
+            [_zeros(p) for p in parameters],
+            C0,
+            default_rng(28),
+            1.0,
+            [0.25, 0.0],
+            temperatures=temperatures,
+            continuous=free,
         )

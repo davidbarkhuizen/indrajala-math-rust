@@ -460,7 +460,9 @@ impl WindowProgram {
     /// One window's ops from its columns `x` and its state `c`, then its recurrence step: the
     /// window's tape. In training (`rng` given) dropout draws its masks from `rng` in the ops'
     /// order, as the per-layer path's layers draw them; in inference it passes its input on.
-    /// Factor `g`'s codes are soft at `temperatures[g]` (None: hard).
+    /// Factor `g`'s codes are soft at `temperatures[g]` (None: hard); with `continuous[g]`, the
+    /// factor passes its cell's output on unsnapped, its codes unread.
+    #[allow(clippy::too_many_arguments)]
     fn window(
         &self,
         x: RustArray,
@@ -468,6 +470,7 @@ impl WindowProgram {
         split: &Parameters<'_>,
         rng: Option<&Bound<'_, Generator>>,
         temperatures: &[Option<f64>],
+        continuous: &[bool],
         context: &str,
     ) -> PyResult<WindowTape> {
         let parameters = split.ops;
@@ -593,6 +596,12 @@ impl WindowProgram {
             tape.caches.push(cache);
         }
         let read: Vec<&RustArray> = tape.read.iter().map(|&r| &tape.activations[r]).collect();
+        let codes: Vec<Option<&RustArray>> = split
+            .codes
+            .iter()
+            .zip(continuous)
+            .map(|(&e, &free)| if free { None } else { e })
+            .collect();
         tape.step = step_forward(
             &read,
             c,
@@ -600,7 +609,7 @@ impl WindowProgram {
             &split.w,
             &split.u,
             &split.b,
-            &split.codes,
+            &codes,
             temperatures,
             self.columns,
             self.cross,
@@ -613,6 +622,33 @@ impl WindowProgram {
             )));
         }
         Ok(tape)
+    }
+
+    /// The factors run continuous in a call, one flag a factor (None: none), each a snapped
+    /// factor at no temperature.
+    fn check_continuous(
+        &self,
+        continuous: Option<Vec<bool>>,
+        temperatures: &[Option<f64>],
+        context: &str,
+    ) -> PyResult<Vec<bool>> {
+        let continuous = continuous.unwrap_or_else(|| vec![false; self.sizes.len()]);
+        if continuous.len() != self.sizes.len() {
+            return Err(PyValueError::new_err(format!(
+                "{context} requires a continuous flag per factor, {} factors, got {}",
+                self.sizes.len(),
+                continuous.len()
+            )));
+        }
+        for (g, ((&free, &snapped), temperature)) in continuous.iter().zip(&self.snapped).zip(temperatures).enumerate()
+        {
+            if free && (!snapped || temperature.is_some()) {
+                return Err(PyValueError::new_err(format!(
+                    "{context} runs only a snapped factor at no temperature continuous, factor {g} isn't"
+                )));
+            }
+        }
+        Ok(continuous)
     }
 
     fn check_input(&self, x: &RustArray, c0: &RustArray, context: &str) -> PyResult<usize> {
@@ -684,9 +720,11 @@ type ProgramForward = (RustArray, Vec<RustArray>, Vec<RustArray>, Vec<Vec<Option
 /// indrajala-ml's `WindowRecurrentRustArrayNetwork.forward_windows` runs them. Returns `(outputs,
 /// states, cells, indices)`: the outputs `(N, W * k * classes)`; with `states`, each window's next
 /// state and its cells' outputs `(N, S)`, W of each; with `codes`, each window's code indices per
-/// factor (None for a continuous factor). What isn't kept is an empty list.
+/// factor (None for a continuous factor). What isn't kept is an empty list. With `continuous`, a
+/// flag a factor, a flagged factor passes its cell's output on unsnapped (indrajala-ml's state
+/// formation workplan, the warm-up).
 #[pyfunction]
-#[pyo3(signature = (program, x, parameters, c0, *, states = false, codes = false))]
+#[pyo3(signature = (program, x, parameters, c0, *, states = false, codes = false, continuous = None))]
 pub fn window_program_forward(
     program: &WindowProgram,
     x: &RustArray,
@@ -694,6 +732,7 @@ pub fn window_program_forward(
     c0: &RustArray,
     states: bool,
     codes: bool,
+    continuous: Option<Vec<bool>>,
 ) -> PyResult<ProgramForward> {
     let context = "window_program_forward";
     let parameters: Vec<&RustArray> = parameters.iter().map(|p| &**p).collect();
@@ -702,11 +741,20 @@ pub fn window_program_forward(
     let windows = program.check_input(x, c0, context)?;
     let (k, width) = (program.columns, windows * program.columns);
     let hard = vec![None; program.sizes.len()]; // inference reads the snapped machine
+    let continuous = program.check_continuous(continuous, &hard, context)?;
     let mut outputs = Vec::with_capacity(windows);
     let (mut kept_states, mut kept_cells, mut kept_indices) = (Vec::new(), Vec::new(), Vec::new());
     let mut c = c0.clone();
     for w in 0..windows {
-        let mut tape = program.window(columns(x, width, w * k, (w + 1) * k), &c, &split, None, &hard, context)?;
+        let mut tape = program.window(
+            columns(x, width, w * k, (w + 1) * k),
+            &c,
+            &split,
+            None,
+            &hard,
+            &continuous,
+            context,
+        )?;
         let last = *tape.outputs.last().expect("a program has 1 or more ops");
         outputs.push(tape.activations.swap_remove(last));
         let step = tape.step;
@@ -836,7 +884,12 @@ impl WindowProgram {
         let (pooled, dc_step, gq, gw, gu, gb, gcodes) = {
             let refs: Vec<&RustArray> = gradients.iter().collect();
             let [queries, w, u, b] = step_gradients(&refs, &factors);
-            let codes: Vec<Option<&RustArray>> = factors.iter().map(|f| f.codes.map(|e| refs[e])).collect();
+            let snapped = tape.step.snapped();
+            let codes: Vec<Option<&RustArray>> = factors
+                .iter()
+                .zip(snapped)
+                .map(|(f, s)| if s { f.codes.map(|e| refs[e]) } else { None })
+                .collect();
             let grads = StepGradients {
                 queries: &queries,
                 w: &w,
@@ -1063,11 +1116,14 @@ const MEMORY_BUDGET: usize = 2 << 30;
 /// instead (indrajala-ml's code-consolidation workplan, D1); empty, as without it. Returns the
 /// initial state's gradient `(N, S)`, which the caller takes through the initial state's codes.
 /// With `temperatures`, factor `g`'s codes are soft at `temperatures[g]` in every window (None, or
-/// no `temperatures`, hard; indrajala-ml's commitment-control workplan, stage 3). Refused before
-/// the windows past the first run when what they keep would pass `memory_budget` bytes.
+/// no `temperatures`, hard; indrajala-ml's commitment-control workplan, stage 3). With
+/// `continuous`, a flag a factor, a flagged factor passes its cell's output on unsnapped and its
+/// codes' gradients are left as they are (indrajala-ml's state formation workplan, the warm-up).
+/// Refused before the windows past the first run when what they keep would pass `memory_budget`
+/// bytes.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (program, x, y, parameters, gradients, c0, rng, weight, commitments, *, consolidation = Vec::new(), memory_budget = MEMORY_BUDGET, temperatures = None))]
+#[pyo3(signature = (program, x, y, parameters, gradients, c0, rng, weight, commitments, *, consolidation = Vec::new(), memory_budget = MEMORY_BUDGET, temperatures = None, continuous = None))]
 pub fn window_program_learn(
     program: &WindowProgram,
     x: &RustArray,
@@ -1081,9 +1137,23 @@ pub fn window_program_learn(
     consolidation: Vec<(Vec<usize>, Vec<usize>)>,
     memory_budget: usize,
     temperatures: Option<Vec<Option<f64>>>,
+    continuous: Option<Vec<bool>>,
 ) -> PyResult<RustArray> {
     let context = "window_program_learn";
     let temperatures = temperatures.unwrap_or_else(|| vec![None; program.sizes.len()]);
+    if temperatures.len() != program.sizes.len() {
+        return Err(PyValueError::new_err(format!(
+            "{context} requires a temperature per factor, {} factors, got {}",
+            program.sizes.len(),
+            temperatures.len()
+        )));
+    }
+    let continuous = program.check_continuous(continuous, &temperatures, context)?;
+    if continuous.contains(&true) && !consolidation.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "{context} takes no consolidation with a continuous factor"
+        )));
+    }
     let parameters: Vec<&RustArray> = parameters.iter().map(|p| &**p).collect();
     program.check_count(parameters.len(), "parameters", context)?;
     program.check_count(gradients.len(), "gradients", context)?;
@@ -1118,6 +1188,7 @@ pub fn window_program_learn(
             &split,
             Some(&rng),
             &temperatures,
+            &continuous,
             context,
         )?;
         if w == 0 {
