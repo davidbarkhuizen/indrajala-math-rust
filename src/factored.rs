@@ -6,7 +6,8 @@
 //! pooling g     u_g = pool(x; q_g)                       (attention_pooling_forward)
 //! cell g        h_g = GRU_g(c_g, i_g),  i_g = u_g, or [u_g, c_(-g)] with the cross-term on
 //! codes g       q_g = e_(g, k), k = argmin ||h_g - e_g,k||^2   (codes_forward); q_g = h_g if continuous
-//! next state    [q_1, ..., q_G]
+//! coupling g    q'_g = (1 - l_g) h_g + l_g q_g, l_g in [0, 1]  (1: q_g itself, today's by bits)
+//! next state    [q'_1, ..., q'_G]
 //! ```
 //!
 //! `c_(-g)` is the other factors' states in factor order, the state's columns without factor
@@ -281,6 +282,36 @@ struct FactorTape {
     indices: Option<Vec<usize>>,
     /// a soft factor's weights and codes, None if hard or continuous
     soft: Option<Soft>,
+    /// the coupling `l_g`: the next state's share of the snapped `q`, the rest the cell's `h`
+    coupling: f64,
+    /// the coupled next state `(1 - l_g) h + l_g q`, None at coupling 1 (the next state is `q`)
+    coupled: Option<RustArray>,
+}
+
+/// A factor's coupled next state, `(1 - coupling) h + coupling q`, element by element.
+fn couple(h: &RustArray, q: &RustArray, coupling: f64) -> RustArray {
+    let rest = 1.0 - coupling;
+    RustArray {
+        data: same_shape_elementwise(&h.data, &q.data, |h, q| rest * h + coupling * q),
+        shape: h.shape,
+    }
+}
+
+/// Each factor's coupling checked: one a factor, in `[0, 1]`, below 1 only for a factor with codes.
+fn check_couplings(couplings: &[f64], codes: &[Option<&RustArray>], context: &str) -> PyResult<()> {
+    for (g, (&coupling, e)) in couplings.iter().zip(codes).enumerate() {
+        if !(0.0..=1.0).contains(&coupling) {
+            return Err(PyValueError::new_err(format!(
+                "{context} requires each coupling in [0, 1], factor {g}'s is {coupling}"
+            )));
+        }
+        if coupling < 1.0 && e.is_none() {
+            return Err(PyValueError::new_err(format!(
+                "{context} couples only a factor with codes (not a continuous one) below 1, factor {g}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// A window's factored recurrence step, from `recurrence_step_forward`: the next state, the cells'
@@ -398,6 +429,7 @@ impl StepCore {
                     .map(|a| a.data.len())
                     .sum::<usize>()
                     + f.soft.as_ref().map_or(0, |s| s.weights.data.len() + s.codes.data.len())
+                    + f.coupled.as_ref().map_or(0, |a| a.data.len())
             })
             .sum();
         tapes + self.state.data.len() + self.h.data.len()
@@ -514,7 +546,7 @@ impl Consolidation {
 /// `recurrence_step_forward`'s computation over plain references, under `context`'s name: factor
 /// `g`'s pooling reads `xs[g]` (the same tokens for every factor, or each its own: the window
 /// program's branches), every one of the same shape; factor `g` soft with `temperatures[g]`
-/// (None: hard).
+/// (None: hard), its next state coupled by `couplings[g]` (1: its `q`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn step_forward(
     xs: &[&RustArray],
@@ -525,6 +557,7 @@ pub(crate) fn step_forward(
     b: &[&RustArray],
     codes: &[Option<&RustArray>],
     temperatures: &[Option<f64>],
+    couplings: &[f64],
     tokens: usize,
     cross: bool,
     context: &str,
@@ -538,9 +571,11 @@ pub(crate) fn step_forward(
             (b.len(), "b"),
             (codes.len(), "codes"),
             (temperatures.len(), "temperatures"),
+            (couplings.len(), "couplings"),
         ],
         context,
     )?;
+    check_couplings(couplings, codes, context)?;
     for (temperature, e) in temperatures.iter().zip(codes) {
         if let Some(t) = *temperature {
             require_temperature(t, context)?;
@@ -581,6 +616,8 @@ pub(crate) fn step_forward(
         require_shape(w[g], Shape::Matrix(3 * sizes[g], input_size), "each w", context)?;
         let (h, r, z, h_tilde, rc) = gru_forward(&input, &c_g, w[g], u_weights[g], b[g])?;
         let (q, indices, soft) = snap(&h, codes[g], temperatures[g])?;
+        let coupling = couplings[g];
+        let coupled = (coupling < 1.0).then(|| couple(&h, &q, coupling));
         factors.push(FactorTape {
             p,
             input,
@@ -593,9 +630,14 @@ pub(crate) fn step_forward(
             q,
             indices,
             soft,
+            coupling,
+            coupled,
         });
     }
-    let qs: Vec<RustArray> = factors.iter().map(|f| f.q.clone()).collect();
+    let qs: Vec<RustArray> = factors
+        .iter()
+        .map(|f| f.coupled.as_ref().unwrap_or(&f.q).clone())
+        .collect();
     let hs: Vec<RustArray> = factors.iter().map(|f| f.h.clone()).collect();
     Ok(StepCore {
         state: join(&qs, rows, total),
@@ -624,11 +666,12 @@ enum StepTokens {
 /// (`queries[g]`, `(d,)`), cell (`w[g]`, `u_weights[g]`, `b[g]`, as `gru_forward`'s, `w[g]` `(3
 /// s_g, d)`, or `(3 s_g, d + S - s_g)` with `cross`) and codes (`codes[g]`, `(m_g, s_g)`, or None
 /// for a continuous factor), in factor order; with `temperatures`, factor `g` soft at
-/// `temperatures[g]` (`soft_codes_forward`; None, or no `temperatures`, hard). Returns the
-/// `RecurrenceStep`.
+/// `temperatures[g]` (`soft_codes_forward`; None, or no `temperatures`, hard); with `couplings`,
+/// factor `g`'s next state `(1 - couplings[g]) h_g + couplings[g] q_g` (no `couplings`, every 1: its
+/// `q_g`). Returns the `RecurrenceStep`.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (x, c, queries, w, u_weights, b, codes, tokens, *, cross, temperatures = None))]
+#[pyo3(signature = (x, c, queries, w, u_weights, b, codes, tokens, *, cross, temperatures = None, couplings = None))]
 pub fn recurrence_step_forward(
     py: Python<'_>,
     x: Bound<'_, PyAny>,
@@ -641,9 +684,11 @@ pub fn recurrence_step_forward(
     tokens: usize,
     cross: bool,
     temperatures: Option<Vec<Option<f64>>>,
+    couplings: Option<Vec<f64>>,
 ) -> PyResult<RecurrenceStep> {
     let codes: Vec<Option<&RustArray>> = codes.iter().map(|e| e.as_deref()).collect();
     let temperatures = temperatures.unwrap_or_else(|| vec![None; codes.len()]);
+    let couplings = couplings.unwrap_or_else(|| vec![1.0; codes.len()]);
     let x = match x.cast::<RustArray>() {
         Ok(one) => StepTokens::Shared(one.clone().unbind()),
         Err(_) => StepTokens::Each(x.extract::<Vec<Py<RustArray>>>()?),
@@ -661,6 +706,7 @@ pub fn recurrence_step_forward(
         &refs(&b),
         &codes,
         &temperatures,
+        &couplings,
         tokens,
         cross,
         "recurrence_step_forward",
@@ -822,8 +868,18 @@ impl StepCore {
         let mut new_grad_codes = Vec::with_capacity(count);
         for (g, dq_g) in split(dq, total, &self.starts, &self.sizes).into_iter().enumerate() {
             let f = &self.factors[g];
+            // coupled: the snapped path takes l_g dq (its codebook and commitment terms whole), the
+            // cell's output (1 - l_g) dq beside it
+            let rest = (f.coupled.is_some()).then(|| (1.0 - f.coupling, dq_g.clone()));
+            let through = match rest {
+                Some(_) => RustArray {
+                    data: dq_g.data.iter().map(|d| f.coupling * d).collect(),
+                    shape: dq_g.shape,
+                },
+                None => dq_g,
+            };
             let (dh, grad_e) = snap_backward(
-                dq_g,
+                through,
                 &f.h,
                 &f.q,
                 &f.indices,
@@ -834,6 +890,13 @@ impl StepCore {
                 targets[g],
                 context,
             )?;
+            let dh = match rest {
+                Some((share, dq_g)) => RustArray {
+                    data: same_shape_elementwise(&dh.data, &dq_g.data, |a, d| a + share * d),
+                    shape: dh.shape,
+                },
+                None => dh,
+            };
             let (d_input, dc, gw, gu, gb) = gru_backward(
                 &dh,
                 &f.input,
