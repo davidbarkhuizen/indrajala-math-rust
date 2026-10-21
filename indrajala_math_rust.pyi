@@ -392,6 +392,7 @@ def soft_codes_backward(
     weight: float,
     commitment: float,
     temperature: float,
+    straight: bool = False,
 ) -> tuple[Array, Array]: ...
 def concatenate_columns(arrays: list[Array]) -> Array: ...
 def factored_codes_forward(
@@ -448,6 +449,7 @@ def recurrence_step_backward(
     weight: float,
     commitments: list[float],
     targets: list[Array | None] | None = None,
+    straight: bool = False,
 ) -> tuple[Array | list[Array], Array, list[Array], list[Array], list[Array], list[Array], list[Array | None]]: ...
 
 @final
@@ -493,4 +495,5 @@ def window_program_learn(
     temperatures: list[float | None] | None = None,
     continuous: list[bool] | None = None,
     couplings: list[float] | None = None,
+    straight: bool = False,
 ) -> Array: ...

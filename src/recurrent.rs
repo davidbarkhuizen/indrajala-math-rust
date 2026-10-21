@@ -567,9 +567,13 @@ pub fn soft_codes_forward(
 /// q) + (2 weight commitment) (h - q)` (the sum a left fold in code order), the commitment held to
 /// the soft `q`; and `e`'s gradient `grad_e` with, row by row in row order, code by code, `w_k g`,
 /// then `(2 / temperature) c_k (h - e_k)`, then the soft codebook loss's `(-2 weight) w_k (h -
-/// e_k)` added. Returns `(dh, grad_e)`.
+/// e_k)` added. With `straight`, `h`'s gradient is straight through, `g + (2 weight commitment) (h -
+/// q)`, the softmax's term dropped (indrajala-ml's state formation workplan, D51: as the
+/// temperature falls the soft path's gradient becomes the hard snap's); `e`'s as without it.
+/// Returns `(dh, grad_e)`.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
+#[pyo3(signature = (dq, h, q, weights, e, grad_e, weight, commitment, temperature, straight = false))]
 pub fn soft_codes_backward(
     dq: &RustArray,
     h: &RustArray,
@@ -580,6 +584,7 @@ pub fn soft_codes_backward(
     weight: f64,
     commitment: f64,
     temperature: f64,
+    straight: bool,
 ) -> PyResult<(RustArray, RustArray)> {
     let context = "soft_codes_backward";
     let (rows, count, size) = codes_shape(h, e, context)?;
@@ -612,11 +617,16 @@ pub fn soft_codes_backward(
             *c_k = w * (dot(g, code) - gq);
         }
         for j in 0..size {
-            let mut s = c[0] * (e.data[j] - q_row[j]);
-            for (k, &c_k) in c.iter().enumerate().skip(1) {
-                s += c_k * (e.data[k * size + j] - q_row[j]);
-            }
-            dh.push(scale * s + state_scale * (h_row[j] - q_row[j]));
+            let through = if straight {
+                g[j]
+            } else {
+                let mut s = c[0] * (e.data[j] - q_row[j]);
+                for (k, &c_k) in c.iter().enumerate().skip(1) {
+                    s += c_k * (e.data[k * size + j] - q_row[j]);
+                }
+                scale * s
+            };
+            dh.push(through + state_scale * (h_row[j] - q_row[j]));
         }
         for (k, (&w, &c_k)) in w_row.iter().zip(&c).enumerate() {
             let (direct, soft, codebook) = (w, scale * c_k, code_scale * w);
