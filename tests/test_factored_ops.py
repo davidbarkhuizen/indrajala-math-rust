@@ -159,6 +159,7 @@ def _backward(
     weight: float,
     commitments,
     targets=None,
+    straight=False,
 ):
     return recurrence_step_backward(
         step,
@@ -174,6 +175,7 @@ def _backward(
         weight,
         commitments,
         None if targets is None else _crate_codes(targets),
+        straight=straight,
     )
 
 
@@ -552,6 +554,44 @@ def test_a_coupled_step_passes_on_its_blend_and_splits_its_gradient(soft: bool):
         assert (a is None) == (b is None)
         if a is not None and b is not None:
             np.testing.assert_allclose(_numpy(a), _numpy(b), rtol=1e-12, atol=1e-12)
+
+
+def test_a_straight_soft_step_passes_dq_whole_to_its_cell_at_any_coupling():
+    # the state formation workplan's D51: with no commitment, every part but the codes takes the
+    # continuous step's gradient, dq whole; the codes take the soft step's as without straight
+    factors: Factors = [(3, 5), (5, 7), (2, None)]
+    couplings = [0.25, 0.9, 1.0]
+    X, C, params = _inputs(6, 2, 9, factors, True, 44)
+    temperatures = _temperatures(factors)
+    coupled = _forward(X, C, params, 2, True, temperatures, couplings)
+    dQ = np.random.default_rng(45).uniform(-1, 1, C.shape)
+    zeros = Parameters(
+        [np.zeros_like(v) for v in params.q],
+        [np.zeros_like(v) for v in params.W],
+        [np.zeros_like(v) for v in params.U],
+        [np.zeros_like(v) for v in params.b],
+        [None if v is None else np.zeros_like(v) for v in params.E],
+    )
+    got = _backward(coupled, dQ, params, zeros, 0.5, [0.0] * 3, straight=True)
+    soft = _backward(coupled, dQ, params, zeros, 0.5, [0.0] * 3)
+    free_params = params._replace(E=[None, None, None])
+    free = _forward(X, C, free_params, 2, True)
+    whole = _backward(free, dQ, free_params, zeros._replace(E=[None, None, None]), 0.5, [0.0] * 3)
+    for part in (0, 1):
+        a, b = got[part], whole[part]
+        assert isinstance(a, Array) and isinstance(b, Array)
+        np.testing.assert_allclose(_numpy(a), _numpy(b), rtol=1e-12, atol=1e-12)
+    for a, b in [
+        *zip(got[2], whole[2], strict=True),
+        *zip(got[3], whole[3], strict=True),
+        *zip(got[4], whole[4], strict=True),
+        *zip(got[5], whole[5], strict=True),
+    ]:
+        np.testing.assert_allclose(_numpy(a), _numpy(b), rtol=1e-12, atol=1e-12)
+    for a, b in zip(got[6], soft[6], strict=True):
+        assert (a is None) == (b is None)
+        if a is not None and b is not None:
+            assert _numpy(a).tolist() == _numpy(b).tolist()
 
 
 def test_couplings_of_1_are_the_snapped_step_by_bits():

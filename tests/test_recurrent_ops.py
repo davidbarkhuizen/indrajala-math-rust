@@ -325,11 +325,11 @@ def _soft(H: np.ndarray, E: np.ndarray, temperature: float) -> tuple[np.ndarray,
     return _fold(W[:, :, np.newaxis] * E[np.newaxis, :, :], axis=1), W
 
 
-def _soft_backward(dQ, H, Q, W, E, grad_E, weight, commitment, temperature):
+def _soft_backward(dQ, H, Q, W, E, grad_E, weight, commitment, temperature, straight=False):
     scale, code_scale = 2.0 / temperature, -2.0 * weight
     C = W * (_fold(dQ[:, np.newaxis, :] * E[np.newaxis, :, :], axis=2) - _fold(dQ * Q, axis=1)[:, np.newaxis])
     S = _fold(C[:, :, np.newaxis] * (E[np.newaxis, :, :] - Q[:, np.newaxis, :]), axis=1)
-    dH = scale * S + (2.0 * weight * commitment) * (H - Q)
+    dH = (dQ if straight else scale * S) + (2.0 * weight * commitment) * (H - Q)
     acc = grad_E.copy()
     for n in range(len(H)):  # row by row, each row's three terms in turn
         pulled = H[n][np.newaxis, :] - E
@@ -375,6 +375,40 @@ def test_soft_codes_backward_is_numpys(n: int, count: int, size: int, temperatur
     expected_dH, expected_grad_E = _soft_backward(dQ, H, Q, W, E, grad_E, weight, commitment, temperature)
     assert _bits(_numpy(dH).reshape(n, size)) == _bits(expected_dH)
     assert _bits(_numpy(new_grad_E).reshape(count, size)) == _bits(expected_grad_E)
+
+
+@pytest.mark.parametrize("temperature", TEMPERATURES)
+@pytest.mark.parametrize("n,count,size", CODES)
+def test_soft_codes_backward_straight_through_is_numpys(n: int, count: int, size: int, temperature: float):
+    # the state formation workplan's D51: h's gradient dq plus the commitment's; e's as without it
+    H, E = _codes_inputs(n, count, size)
+    rng = np.random.default_rng(count + 3)
+    dQ, grad_E = rng.uniform(-1, 1, (n, size)), rng.uniform(-1, 1, (count, size))
+    weight, commitment = 1.0 / 3.0, 0.25
+    Q, W = _soft(H, E, temperature)
+    arrays = (_array(dQ), _array(H), _array(Q), _array(W), _array(E), _array(grad_E))
+    dH, new_grad_E = soft_codes_backward(*arrays, weight, commitment, temperature, straight=True)
+    expected_dH, expected_grad_E = _soft_backward(dQ, H, Q, W, E, grad_E, weight, commitment, temperature, True)
+    assert _bits(_numpy(dH).reshape(n, size)) == _bits(expected_dH)
+    assert _bits(_numpy(new_grad_E).reshape(count, size)) == _bits(expected_grad_E)
+    _, soft_grad_E = soft_codes_backward(*arrays, weight, commitment, temperature)
+    assert _bits(_numpy(new_grad_E)) == _bits(_numpy(soft_grad_E))
+
+
+def test_soft_codes_backward_straight_through_nears_the_hard_snaps_as_it_cools():
+    # cold, the soft step's straight-through gradient of h is the hard snap's (codes_backward); e's keeps
+    # the soft step's task term w_k dq, which the hard snap's codes never take
+    H, E = _codes_inputs(64, 16, 16)
+    rng = np.random.default_rng(11)
+    dQ, grad_E = rng.uniform(-1, 1, (64, 16)), np.zeros((16, 16))
+    Q, W, _ = soft_codes_forward(_array(H), _array(E), 1e-4)
+    dH, soft_grad_E = soft_codes_backward(
+        _array(dQ), _array(H), Q, W, _array(E), _array(grad_E), 0.5, 0.25, 1e-4, straight=True
+    )
+    snapped, indices = codes_forward(_array(H), _array(E))
+    hard_dH, hard_grad_E = codes_backward(_array(dQ), _array(H), snapped, indices, _array(grad_E), 0.5, 0.25)
+    np.testing.assert_allclose(_numpy(dH), _numpy(hard_dH), atol=1e-9)
+    assert soft_grad_E.shape == hard_grad_E.shape
 
 
 def test_soft_codes_backward_is_the_losss_gradient_by_central_differences():

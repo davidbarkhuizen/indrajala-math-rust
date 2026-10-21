@@ -125,8 +125,8 @@ fn snap(
 }
 
 /// `snap`'s backward pass: `codes_backward` (with the commitment's `target`, if any), or
-/// `soft_codes_backward` for a soft factor (no target), or `dq` itself for a continuous factor.
-/// Returns `(dh, grad_e)`.
+/// `soft_codes_backward` for a soft factor (no target; `straight`, its gradient straight through),
+/// or `dq` itself for a continuous factor. Returns `(dh, grad_e)`.
 #[allow(clippy::too_many_arguments)]
 fn snap_backward(
     dq: RustArray,
@@ -138,6 +138,7 @@ fn snap_backward(
     weight: f64,
     commitment: f64,
     target: Option<&RustArray>,
+    straight: bool,
     context: &str,
 ) -> PyResult<(RustArray, Option<RustArray>)> {
     if let (Some(soft), Some(grad_e)) = (soft, grad_e) {
@@ -156,6 +157,7 @@ fn snap_backward(
             weight,
             commitment,
             soft.temperature,
+            straight,
         )?;
         return Ok((dh, Some(grad_e)));
     }
@@ -255,6 +257,7 @@ pub fn factored_codes_backward(
             weight,
             commitments[g],
             targets[g],
+            false,
             context,
         )?;
         dh.push(dh_g);
@@ -729,10 +732,11 @@ pub fn recurrence_step_forward(
 /// parameter's gradient accumulated onto the one given. Returns `(dx, dc, grad_queries, grad_w,
 /// grad_u, grad_b, grad_codes)`: the tokens' gradient (one array, the factors' poolings' summed in
 /// factor order, if the step read one; a list, each factor's, if it read one a factor), the
-/// state's, and each factor's parameters'.
+/// state's, and each factor's parameters'. With `straight`, a soft factor's gradient is straight
+/// through (`soft_codes_backward`'s).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (step, dq, queries, w, u_weights, grad_queries, grad_w, grad_u, grad_b, grad_codes, weight, commitments, targets = None))]
+#[pyo3(signature = (step, dq, queries, w, u_weights, grad_queries, grad_w, grad_u, grad_b, grad_codes, weight, commitments, targets = None, straight = false))]
 pub fn recurrence_step_backward(
     py: Python<'_>,
     step: PyRef<'_, RecurrenceStep>,
@@ -748,6 +752,7 @@ pub fn recurrence_step_backward(
     weight: f64,
     commitments: Vec<f64>,
     targets: Option<Vec<Option<PyRef<'_, RustArray>>>>,
+    straight: bool,
 ) -> PyResult<(
     Py<PyAny>,
     RustArray,
@@ -778,6 +783,7 @@ pub fn recurrence_step_backward(
         weight,
         &commitments,
         &target_refs(targets.as_deref(), commitments.len()),
+        straight,
         "recurrence_step_backward",
     )?;
     let dx = match &step.x {
@@ -821,7 +827,8 @@ impl StepCore {
     /// `recurrence_step_backward`'s computation, from the tokens `xs` the step read (one a factor),
     /// under `context`'s name; each factor's commitment target `targets[g]` (None: its `q`). Its
     /// tokens' gradient is each factor's pooling's, apart (`sum_in_order` sums those that read the
-    /// same tokens).
+    /// same tokens). With `straight`, a soft factor's gradient is straight through
+    /// (`soft_codes_backward`'s).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn backward(
         &self,
@@ -834,6 +841,7 @@ impl StepCore {
         weight: f64,
         commitments: &[f64],
         targets: &[Option<&RustArray>],
+        straight: bool,
         context: &str,
     ) -> PyResult<StepBackward> {
         let count = factor_count(
@@ -888,6 +896,7 @@ impl StepCore {
                 weight,
                 commitments[g],
                 targets[g],
+                straight,
                 context,
             )?;
             let dh = match rest {

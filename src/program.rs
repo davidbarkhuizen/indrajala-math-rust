@@ -903,6 +903,7 @@ impl WindowProgram {
         weight: f64,
         commitments: &[f64],
         consolidation: &Consolidation,
+        straight: bool,
         context: &str,
     ) -> PyResult<RustArray> {
         let split = self.split(parameters);
@@ -937,6 +938,7 @@ impl WindowProgram {
                 weight,
                 commitments,
                 &targets,
+                straight,
                 context,
             )?
         };
@@ -1150,11 +1152,12 @@ const MEMORY_BUDGET: usize = 2 << 30;
 /// codes' gradients are left as they are (indrajala-ml's state formation workplan, the warm-up).
 /// With `couplings`, factor `g`'s next state `(1 - couplings[g]) h + couplings[g] q`, its snapped
 /// path's gradient `couplings[g] dq` (its codes' losses whole), the cell's `(1 - couplings[g]) dq`
-/// (the workplan's gradual handover; None, every 1). Refused before the windows past the first run when what they keep would pass `memory_budget`
+/// (the workplan's gradual handover; None, every 1). With `straight`, a soft factor's gradient is
+/// straight through (`soft_codes_backward`'s; the workplan's D51). Refused before the windows past the first run when what they keep would pass `memory_budget`
 /// bytes.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (program, x, y, parameters, gradients, c0, rng, weight, commitments, *, consolidation = Vec::new(), memory_budget = MEMORY_BUDGET, temperatures = None, continuous = None, couplings = None))]
+#[pyo3(signature = (program, x, y, parameters, gradients, c0, rng, weight, commitments, *, consolidation = Vec::new(), memory_budget = MEMORY_BUDGET, temperatures = None, continuous = None, couplings = None, straight = false))]
 pub fn window_program_learn(
     program: &WindowProgram,
     x: &RustArray,
@@ -1170,6 +1173,7 @@ pub fn window_program_learn(
     temperatures: Option<Vec<Option<f64>>>,
     continuous: Option<Vec<bool>>,
     couplings: Option<Vec<f64>>,
+    straight: bool,
 ) -> PyResult<RustArray> {
     let context = "window_program_learn";
     let temperatures = temperatures.unwrap_or_else(|| vec![None; program.sizes.len()]);
@@ -1264,6 +1268,7 @@ pub fn window_program_learn(
             weight,
             &commitments,
             &consolidation,
+            straight,
             context,
         ) {
             Ok(next) => dc = next,

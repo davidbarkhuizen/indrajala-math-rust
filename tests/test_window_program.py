@@ -510,6 +510,7 @@ def _learn_per_layer(
     consolidation=(),
     temperatures=None,
     couplings=None,
+    straight=False,
 ):
     k, ops, L = window.tokens, window.ops, len(window.ops)
     read_at = _each(reads, len(recurrence.sizes))
@@ -582,6 +583,7 @@ def _learn_per_layer(
             weight,
             commitments,
             _consolidated(representatives, step.indices, recurrence.E),
+            straight=straight,
         )
         g_parts.update(q=gq, W=gW, U=gU, b=gb)
         g_codes = gE
@@ -700,6 +702,7 @@ def _check_learn(
     reads: Reads | None = None,
     temperatures=None,
     couplings=None,
+    straight=False,
 ) -> None:
     reads = len(window.ops) - 1 if reads is None else reads
     rng = np.random.default_rng(seed)
@@ -728,9 +731,10 @@ def _check_learn(
         consolidation=[(list(d), list(r)) for d, r in consolidation],
         temperatures=temperatures,
         couplings=couplings,
+        straight=straight,
     )
     expected, expected_dC = _learn_per_layer(
-        window, recurrence, reads, X, Y, C0, rng_per_layer, consolidation, temperatures, couplings
+        window, recurrence, reads, X, Y, C0, rng_per_layer, consolidation, temperatures, couplings, straight
     )
     assert len(gradients) == len(expected)
     for actual, wanted in zip(gradients, expected, strict=True):
@@ -795,6 +799,50 @@ def test_a_coupled_window_is_the_per_layer_path_in_inference_and_training(factor
     _check_learn(window, Recurrence(16, factors, cross, seed=34), 5, 4, couplings=couplings)
     temperatures = [None if m is None else 0.5 for _, m in factors]
     _check_learn(window, Recurrence(16, factors, cross, seed=34), 5, 4, temperatures=temperatures, couplings=couplings)
+
+
+@pytest.mark.parametrize(
+    "factors, cross, couplings",
+    [([(16, 16)], False, [0.4]), ([(3, 5), (4, None), (2, 2)], True, [0.0, 1.0, 0.75])],
+)
+def test_a_straight_soft_training_step_is_the_per_layer_path(factors, cross, couplings):
+    # the state formation workplan's D51: a soft factor's gradient straight through, coupled or not
+    size = sum(s for s, _ in factors)
+    window = _family(3, size, seed=35, rotary=True, dropout=0.25)
+    temperatures = [None if m is None else 0.5 for _, m in factors]
+    _check_learn(window, Recurrence(16, factors, cross, seed=36), 5, 4, temperatures=temperatures, straight=True)
+    _check_learn(
+        window,
+        Recurrence(16, factors, cross, seed=36),
+        5,
+        4,
+        temperatures=temperatures,
+        couplings=couplings,
+        straight=True,
+    )
+
+
+def test_straight_leaves_a_hard_training_step_as_it_was_by_bits():
+    window = _family(3, 16, seed=37, rotary=True, dropout=0.25)
+    recurrence = Recurrence(16, [(8, 6), (8, 6)], False, seed=38)
+    program = WindowProgram(
+        window.ops, window.tokens, len(window.ops) - 1, recurrence.sizes, recurrence.snapped, cross=recurrence.cross
+    )
+    rng = np.random.default_rng(39)
+    X = _ids(rng, 4, 3 * window.tokens, window.vocabulary)
+    classes = window.parameters[-1][0].shape[0]
+    Y = Array(np.eye(classes)[rng.integers(0, classes, (4, 3 * window.tokens))].reshape(4, -1).tolist())
+    C0 = _random(rng, 4, 16)
+    parameters = [*window.flat(), *recurrence.flat()]
+    results = []
+    for straight in (False, True):
+        gradients = [_zeros(p) for p in parameters]
+        dC = window_program_learn(
+            program, X, Y, parameters, gradients, C0, default_rng(40), 1.0 / 3, [0.25, 0.25], straight=straight
+        )
+        results.append([dC, *gradients])
+    for a, b in zip(*results, strict=True):
+        _assert_bits(a, b)
 
 
 def test_the_program_refuses_a_coupling_below_1_for_a_continuous_or_unsnapped_factor():
