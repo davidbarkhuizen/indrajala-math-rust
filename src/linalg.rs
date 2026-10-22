@@ -1049,14 +1049,17 @@ unsafe fn store_lanes<const MODE: u8>(out: *mut f64, acc: std::arch::x86_64::__m
     }
 }
 
-/// Rows per 16-column register tile in `tiled_row_range_neon`, as `TILE_ROWS` for AVX2: two rows'
-/// 16 accumulators and the tile's 8 loads of `b` fit NEON's 32 registers. Untuned: the aarch64
-/// workplan's stage 7 times it on the Pi.
+/// `tiled_row_range_neon`'s register tile: `NEON_TILE_ROWS` rows by `NEON_TILE_REGS` 2-lane registers
+/// (`2 * NEON_TILE_REGS` columns). Its `NEON_TILE_ROWS * NEON_TILE_REGS` accumulators, the tile's
+/// `NEON_TILE_REGS` loads of `b` and a broadcast of `a` fit NEON's 32 registers; each step of `k`
+/// loads `b` once for every row, so taller tiles load less per FMA, which matters most where `k` is
+/// short and a tile's setup and stores weigh most (the aarch64 workplan's stage 7).
 #[cfg(target_arch = "aarch64")]
 const NEON_TILE_ROWS: usize = 2;
+#[cfg(target_arch = "aarch64")]
+const NEON_TILE_REGS: usize = 8;
 
-/// NEON path: output columns in tiles of 16 (eight 2-lane accumulators), then 2, then the odd
-/// column, each tile running the panel's `k` before it is stored, its rows blocked as the AVX2
+/// NEON path: output columns in tiles of `2 * NEON_TILE_REGS`, then 2, then the odd column, each tile running the panel's `k` before it is stored, its rows blocked as the AVX2
 /// path's. `vfmaq_f64` is the IEEE fused multiply-add `f64::mul_add` is, so lane `j`'s accumulator
 /// is exactly `tiled_row_range_scalar`'s `sum` for that column, whichever tile computes it (the
 /// aarch64 workplan's D5: no order the hardware chooses). Safety: every pointer offset stays inside
@@ -1091,10 +1094,10 @@ unsafe fn tiled_row_range_neon<const MODE: u8>(a_data: &[f64], b_data: &[f64], o
     while block_start < row_end {
         let block_end = (block_start + rows_per_block).min(row_end);
         let mut col = col_start;
-        while col + 16 <= col_end {
+        while col + 2 * NEON_TILE_REGS <= col_end {
             let mut row = block_start;
             while row + NEON_TILE_ROWS <= block_end {
-                let mut acc = [[vdupq_n_f64(0.0); 8]; NEON_TILE_ROWS];
+                let mut acc = [[vdupq_n_f64(0.0); NEON_TILE_REGS]; NEON_TILE_ROWS];
                 for (r, acc_row) in acc.iter_mut().enumerate() {
                     for (j, acc_lanes) in acc_row.iter_mut().enumerate() {
                         *acc_lanes = chain_start_neon::<MODE>(out_at(row + r, col + 2 * j));
@@ -1102,10 +1105,10 @@ unsafe fn tiled_row_range_neon<const MODE: u8>(a_data: &[f64], b_data: &[f64], o
                 }
                 for kk in k_start..k_end {
                     let b_row = b_ptr.add(kk * n + col);
-                    let b_tile: [_; 8] = std::array::from_fn(|j| vld1q_f64(b_row.add(2 * j)));
+                    let b_tile: [_; NEON_TILE_REGS] = std::array::from_fn(|j| vld1q_f64(b_row.add(2 * j)));
                     for r in 0..NEON_TILE_ROWS {
                         let a_vec = vdupq_n_f64(*a_ptr.add((row + r) * k + kk));
-                        for j in 0..8 {
+                        for j in 0..NEON_TILE_REGS {
                             acc[r][j] = vfmaq_f64(acc[r][j], a_vec, b_tile[j]);
                         }
                     }
@@ -1118,7 +1121,8 @@ unsafe fn tiled_row_range_neon<const MODE: u8>(a_data: &[f64], b_data: &[f64], o
                 row += NEON_TILE_ROWS;
             }
             for row in row..block_end {
-                let mut acc: [_; 8] = std::array::from_fn(|j| chain_start_neon::<MODE>(out_at(row, col + 2 * j)));
+                let mut acc: [_; NEON_TILE_REGS] =
+                    std::array::from_fn(|j| chain_start_neon::<MODE>(out_at(row, col + 2 * j)));
                 for (i, &a_value) in a_data[row * k + k_start..row * k + k_end].iter().enumerate() {
                     let a_vec = vdupq_n_f64(a_value);
                     let b_row = b_ptr.add((k_start + i) * n + col);
@@ -1130,7 +1134,7 @@ unsafe fn tiled_row_range_neon<const MODE: u8>(a_data: &[f64], b_data: &[f64], o
                     store_lanes_neon::<MODE>(out_at(row, col + 2 * j), acc_lanes);
                 }
             }
-            col += 16;
+            col += 2 * NEON_TILE_REGS;
         }
         while col + 2 <= col_end {
             for row in block_start..block_end {
