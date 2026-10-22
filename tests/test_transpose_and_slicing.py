@@ -39,7 +39,22 @@ def test_transpose_of_transpose_round_trips():
     # whole 8 x 8 blocks, partial blocks on either axis, fewer than a block, a single row or
     # column, odd and even rows and columns within a block (aarch64's 2 x 2 NEON pairs), and the dense
     # accumulate's (512, 30) delta_batch at batch 512
-    [(1, 1), (1, 13), (13, 1), (2, 2), (2, 3), (3, 2), (3, 5), (7, 9), (8, 8), (9, 7), (16, 24), (17, 23), (512, 30), (30, 512)],
+    [
+        (1, 1),
+        (1, 13),
+        (13, 1),
+        (2, 2),
+        (2, 3),
+        (3, 2),
+        (3, 5),
+        (7, 9),
+        (8, 8),
+        (9, 7),
+        (16, 24),
+        (17, 23),
+        (512, 30),
+        (30, 512),
+    ],
 )
 def test_transpose_matches_numpy_at_block_edges(rows, cols):
     values = np.arange(rows * cols, dtype=float).reshape(rows, cols) + 0.5
