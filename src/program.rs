@@ -7,6 +7,7 @@
 //! step w        c_(w+1) = step(a_reads, c_w)                          (factored.rs's step_forward)
 //!                (factor g's pooling reads the input of op reads[g]: one op for every factor, or
 //!                each its own, the end of its branch)
+//! merge         a_(i+1) = e_1 + ... + e_B                              (the ends of the branches it closes)
 //! outputs       [a_L for each window], side by side
 //! ```
 //!
@@ -56,6 +57,9 @@ enum Op {
     /// a branch ends (its result kept for the poolings that read it) and the next starts from the
     /// innermost open split's input
     Branch,
+    /// the innermost open split closes (indrajala-ml's post-paper workplan, D7): its branches' ends
+    /// summed in order, the last branch's end its input
+    Merge,
     /// `layer_norm_forward_batch`; parameters `gamma`, `beta`
     LayerNorm { epsilon: f64 },
     /// a dense layer on each token's row, ReLU or affine; parameters `W`, `b`
@@ -78,7 +82,7 @@ impl Op {
     fn parameter_count(&self) -> usize {
         match self {
             Op::Embedding | Op::Position | Op::StateInput { .. } => 1,
-            Op::Fork | Op::Add | Op::Split | Op::Branch | Op::Dropout { .. } => 0,
+            Op::Fork | Op::Add | Op::Split | Op::Branch | Op::Merge | Op::Dropout { .. } => 0,
             Op::LayerNorm { .. } | Op::TokenDense { .. } | Op::TokenOutput { .. } => 2,
             Op::Attention { .. } => 8,
         }
@@ -129,6 +133,10 @@ impl Op {
             "branch" => {
                 expect(0)?;
                 Op::Branch
+            }
+            "merge" => {
+                expect(0)?;
+                Op::Merge
             }
             "layer_norm" => {
                 expect(1)?;
@@ -185,8 +193,8 @@ impl Op {
             }
             _ => {
                 return Err(PyValueError::new_err(format!(
-                    "{context} has no op {kind:?}: embedding, position, state_input, fork, add, layer_norm, \
-                     token_dense, token_output, attention, dropout"
+                    "{context} has no op {kind:?}: embedding, position, state_input, fork, add, split, branch, \
+                     merge, layer_norm, token_dense, token_output, attention, dropout"
                 )))
             }
         })
@@ -200,15 +208,18 @@ impl Op {
 /// `("state_input", tokens)`, `("fork",)`, `("add",)`, `("layer_norm", epsilon)`,
 /// `("token_dense", tokens, "relu" | "linear")`, `("token_output", tokens)`,
 /// `("attention", heads, causal, dropout, cos, sin)` (`cos`, `sin` the rotary table's arrays, or
-/// None for both), `("dropout", p)`, `("split",)`, `("branch",)`. `columns` is a window's width `k`
+/// None for both), `("dropout", p)`, `("split",)`, `("branch",)`, `("merge",)`. `columns` is a window's width `k`
 /// (its tokens), `reads` the op whose input the poolings read (one for every factor, or a list,
 /// each factor's), `sizes` the factors' state sizes, `snapped` whether each has codes, `cross` the
 /// cross-term.
 ///
 /// Branches: `split` keeps its input; the ops after it are its first branch; each `branch` ends a
 /// branch and starts the next from the split's input, the last branch running to the program's
-/// end (the answers'). A factor reads its branch's result as the input of the `branch` op that ends
-/// it. A residual block closes within its branch; a split stays open to the end.
+/// end (the answers'), or to a `merge`. A factor reads its branch's result as the input of the
+/// `branch` op that ends it (the last branch's, the `merge`'s input). A `merge` closes the innermost
+/// open split, its result the sum of its branches' ends in order, and the ops after it read that
+/// sum (indrajala-ml's post-paper workplan, D7: the recombining window). A residual block closes
+/// within its branch; a split stays open to the end unless merged.
 #[pyclass(module = "indrajala_math_rust", frozen, skip_from_py_object)]
 pub struct WindowProgram {
     ops: Vec<Op>,
@@ -222,6 +233,10 @@ pub struct WindowProgram {
     adds: Vec<usize>,
     /// each split's branch ops, in order; empty for any other op
     branches: Vec<Vec<usize>>,
+    /// each merge's split (the op it closes); 0 for any other op
+    closes: Vec<usize>,
+    /// each branch op's merge, if its split is merged; None for any other op
+    merged: Vec<Option<usize>>,
 }
 
 /// `WindowProgram`'s `reads`: one op for every factor, or each factor's.
@@ -271,6 +286,8 @@ impl WindowProgram {
         }
         let mut adds = vec![0; ops.len()];
         let mut branches = vec![Vec::new(); ops.len()];
+        let mut closes = vec![0; ops.len()];
+        let mut merged = vec![None; ops.len()];
         let mut open = Vec::new();
         for (i, op) in ops.iter().enumerate() {
             match op {
@@ -291,6 +308,22 @@ impl WindowProgram {
                         )));
                     };
                     branches[*split].push(i);
+                }
+                Op::Merge => {
+                    let Some(Open::Split(split)) = open.pop() else {
+                        return Err(PyValueError::new_err(format!(
+                            "{context}: a merge at op {i} without its split, or inside an open residual block"
+                        )));
+                    };
+                    if branches[split].is_empty() {
+                        return Err(PyValueError::new_err(format!(
+                            "{context}: a merge at op {i} closes the split at op {split}, which has no branch"
+                        )));
+                    }
+                    closes[i] = split;
+                    for &branch in &branches[split] {
+                        merged[branch] = Some(i);
+                    }
                 }
                 _ => {}
             }
@@ -313,6 +346,8 @@ impl WindowProgram {
             cross,
             adds,
             branches,
+            closes,
+            merged,
         })
     }
 
@@ -517,6 +552,15 @@ impl WindowProgram {
                 Op::Branch => {
                     restart = splits.last().copied();
                     None
+                }
+                Op::Merge => {
+                    splits.pop();
+                    let ends = &self.branches[self.closes[i]];
+                    let mut sum = tape.activations[tape.inputs[ends[0]]].clone();
+                    for &branch in &ends[1..] {
+                        sum = sum.combine_with_array(&tape.activations[tape.inputs[branch]], |x, y| x + y, "add")?;
+                    }
+                    Some(sum.combine_with_array(a, |x, y| x + y, "add")?)
                 }
                 Op::Add => {
                     let Some(skip) = forks.pop() else {
@@ -822,8 +866,9 @@ impl Backward<'_> {
 
     /// Op `j`'s downstream, what the op before it reads (each indrajala-ml layer's
     /// `downstream_batch`); a fork's, its body's first op's plus its add's delta; a split's, its
-    /// first branch's first op's plus each later branch's, in order. A branch's is never asked: what
-    /// reads the result it ends is the poolings alone (the backward pass's loop).
+    /// first branch's first op's plus each later branch's, in order; a merge's, its delta. A branch's
+    /// is never asked: what reads the result it ends is its poolings and, if merged, its merge (the
+    /// backward pass's loop).
     fn downstream(&self, j: usize) -> PyResult<RustArray> {
         let p = &self.parameters[self.offsets[j]..];
         let delta = || self.delta(j).clone();
@@ -833,7 +878,7 @@ impl Backward<'_> {
                     "window program: an embedding is the first op, nothing reads its downstream",
                 ))
             }
-            Op::Position | Op::Add | Op::StateInput { .. } => delta(),
+            Op::Position | Op::Add | Op::Merge | Op::StateInput { .. } => delta(),
             Op::Fork => {
                 let add = self.program.adds[j];
                 self.downstream(j + 1)?
@@ -846,7 +891,7 @@ impl Backward<'_> {
                 }
                 sum
             }
-            Op::Branch => unreachable!("a branch's downstream: its result is read by the poolings alone"),
+            Op::Branch => unreachable!("a branch's downstream: its result is read by its poolings and its merge"),
             Op::LayerNorm { .. } => {
                 let Cache::LayerNorm { xhat, std } = &self.tape.caches[j] else {
                     unreachable!("a layer norm's cache")
@@ -978,7 +1023,7 @@ impl WindowProgram {
         back.deltas[last] = Some(delta);
         // the hidden ops' deltas, last first; each factor's pooling's gradient joins the downstream
         // the op before the one it reads reads (those reading one op summed in factor order first);
-        // a branch's end is read by its poolings alone
+        // a branch's end is read by its poolings and, if merged, its merge (the merge's delta first)
         for i in (0..last).rev() {
             if matches!(self.ops[i], Op::Fork | Op::Split | Op::Branch) {
                 // its delta is never read: a fork's downstream is its body's and its add's, a
@@ -987,7 +1032,13 @@ impl WindowProgram {
             }
             let readers: Vec<usize> = (0..self.reads.len()).filter(|&g| self.reads[g] == i + 1).collect();
             let pooling = sum_in_order(&pooled, &readers);
-            let mut d = if matches!(self.ops[i + 1], Op::Branch) {
+            let mut d = if let Some(merge) = self.merged[i + 1] {
+                let d = back.delta(merge).clone();
+                match pooling {
+                    Some(pooling) => d.combine_with_array(&pooling, |x, y| x + y, "add")?,
+                    None => d,
+                }
+            } else if matches!(self.ops[i + 1], Op::Branch) {
                 pooling.ok_or_else(|| {
                     PyValueError::new_err(format!("{context}: the branch at op {} ends unread", i + 1))
                 })?
@@ -1112,7 +1163,7 @@ impl WindowProgram {
                         *slot = value;
                     }
                 }
-                Op::Fork | Op::Add | Op::Split | Op::Branch | Op::Dropout { .. } => {}
+                Op::Fork | Op::Add | Op::Split | Op::Branch | Op::Merge | Op::Dropout { .. } => {}
             }
         }
         // the state's gradient: the step's, then each StateInput's, in the ops' order
