@@ -6,7 +6,9 @@ per-layer path, the crate's functions called layer by layer as indrajala-ml's la
 windows (the linear window, the attention window of the division family), a rotary attention, two
 factors, a continuous factor, the cross-term, a batch over the threading threshold, and branched
 windows (a branch a factor and one for the answers, each factor reading its own: indrajala-ml's
-window branches workplan). The kept states, cells and code indices are each window's step's.
+window branches workplan), and recombined windows (the branches' ends merged into one more block
+before the output: indrajala-ml's post-paper workplan, D7). The kept states, cells and code indices
+are each window's step's.
 """
 
 import copy
@@ -143,6 +145,11 @@ class Window:
         self.features = self.split_features
         return self.add(("branch",))
 
+    def merge(self) -> Window:
+        # ends the last branch, its end the last factor's read, and sums every branch's end
+        self.ends.append(len(self.ops))
+        return self.add(("merge",))
+
     def dropout(self, p: float) -> Window:
         return self.add(("dropout", p))
 
@@ -192,6 +199,7 @@ def _per_layer(window: Window, recurrence: Recurrence, reads: Reads, X: Array, C
         a = X[:, w * k : (w + 1) * k]
         forks: list[Array] = []
         splits: list[Array] = []
+        ends: list[list[Array]] = []  # each open split's branches' ends
         read: list[Array | None] = [None] * len(each)
         for i, (op, parameters) in enumerate(zip(window.ops, window.parameters, strict=True)):
             read = [a if r == i else old for r, old in zip(each, read, strict=True)]
@@ -209,8 +217,13 @@ def _per_layer(window: Window, recurrence: Recurrence, reads: Reads, X: Array, C
                 a = a + forks.pop()
             elif kind == "split":
                 splits.append(a)
+                ends.append([])
             elif kind == "branch":
+                ends[-1].append(a)
                 a = splits[-1]
+            elif kind == "merge":
+                a = _merged(ends.pop(), a)
+                splits.pop()
             elif kind == "layer_norm":
                 gamma, beta = parameters
                 a = layer_norm_forward_batch(a, gamma, beta, op[1])[0]
@@ -260,6 +273,14 @@ def _per_layer(window: Window, recurrence: Recurrence, reads: Reads, X: Array, C
         indices.append(step.indices)
         C = step.state
     return concatenate_columns(outputs), states, cells, indices
+
+
+def _merged(ends: list[Array], last: Array) -> Array:
+    # a merge: the closed branches' ends summed in order, the last branch's end (its input) last
+    total = ends[0]
+    for end in ends[1:]:
+        total = total + end
+    return total + last
 
 
 def _ids(rng: np.random.Generator, n: int, columns: int, vocabulary: int) -> Array:
@@ -440,6 +461,7 @@ def _forward_training(window: Window, read_at: list[int], a: Array, C: Array, rn
     inputs, results, caches = [], [], []
     forks: list[Array] = []
     splits: list[Array] = []
+    ends: list[list[Array]] = []  # each open split's branches' ends
     read: list[Array | None] = [None] * len(read_at)
     for i, (op, parameters) in enumerate(zip(window.ops, window.parameters, strict=True)):
         read = [a if r == i else old for r, old in zip(read_at, read, strict=True)]
@@ -458,8 +480,13 @@ def _forward_training(window: Window, read_at: list[int], a: Array, C: Array, rn
             a = a + forks.pop()
         elif kind == "split":
             splits.append(a)
+            ends.append([])
         elif kind == "branch":
+            ends[-1].append(a)
             a = splits[-1]
+        elif kind == "merge":
+            a = _merged(ends.pop(), a)
+            splits.pop()
         elif kind == "layer_norm":
             gamma, beta = parameters
             a, xhat, std = layer_norm_forward_batch(a, gamma, beta, op[1])
@@ -544,6 +571,7 @@ def _learn_per_layer(
     dC = Array.zeros((X.shape[0], sum(recurrence.sizes)))
     adds: dict[int, int] = {}
     branches: dict[int, list[int]] = {}
+    merged: dict[int, int] = {}  # each merged branch op's merge
     open_blocks: list[int] = []
     for i, op in enumerate(ops):
         if op[0] in ("fork", "split"):
@@ -553,6 +581,9 @@ def _learn_per_layer(
             adds[open_blocks.pop()] = i
         elif op[0] == "branch":
             branches[open_blocks[-1]].append(i)
+        elif op[0] == "merge":
+            for b in branches[open_blocks.pop()]:
+                merged[b] = i
     for w in reversed(range(windows)):
         rng.state = generators[w]
         inputs, results, caches, read = _forward_training(window, read_at, X[:, w * k : (w + 1) * k], states[w], rng)
@@ -601,9 +632,9 @@ def _learn_per_layer(
                 for b in branches[j]:
                     total = total + downstream(b + 1, deltas, caches, attention_back)
                 return total
-            assert kind != "branch", "a branch's result is read by the poolings alone"
+            assert kind != "branch", "a branch's result is read by its poolings and its merge"
             assert delta is not None
-            if kind in ("position", "add", "state_input"):
+            if kind in ("position", "add", "merge", "state_input"):
                 return delta
             if kind == "layer_norm":
                 return layer_norm_downstream_batch(delta, ps[0], *caches[j])
@@ -630,7 +661,12 @@ def _learn_per_layer(
                     pooling = pooled[readers[0]]
                     for g in readers[1:]:
                         pooling = pooling + pooled[g]
-            if ops[i + 1][0] == "branch":
+            if i + 1 in merged:
+                d = deltas[merged[i + 1]]
+                assert d is not None
+                if pooling is not None:
+                    d = d + pooling
+            elif ops[i + 1][0] == "branch":
                 assert pooling is not None
                 d = pooling
             else:
@@ -1045,6 +1081,101 @@ def test_a_training_step_refuses_a_branch_no_factor_reads():
         window_program_learn(
             program, X, Y, parameters, [_zeros(p) for p in parameters], C0, default_rng(0), 0.5, [0.25]
         )
+
+
+def _recombined(
+    tokens: int,
+    factors: int,
+    state_size: int,
+    seed: int,
+    features: int = 16,
+    rotary: bool = False,
+    dropout: float = 0.0,
+) -> Window:
+    # the post-paper workplan's recombining window (D7, D8): one shared block, a two-head block a
+    # factor ending in its layer norm, the branches' ends merged, one more block, the output
+    w = Window(tokens, 12, features, seed).position()
+
+    def block() -> None:
+        w.state_input(state_size)
+        w.fork().layer_norm().attention(2, True, rotary).join()
+        w.fork().layer_norm().dense(2 * features, "relu")
+        if dropout:
+            w.dropout(dropout)
+        w.dense(features, "linear").join()
+
+    block()
+    w.split()
+    for g in range(factors):
+        block()
+        w.layer_norm()
+        if g < factors - 1:
+            w.branch()
+    w.merge()
+    block()
+    return w.layer_norm().output(5)
+
+
+@pytest.mark.parametrize(
+    "factors, cross, features",
+    [
+        ([(8, 6), (8, 6)], False, 16),
+        ([(8, 6), (8, 6)], False, 32),
+        ([(3, 5), (5, None)], False, 16),
+        ([(2, 3), (4, None), (2, 2)], True, 32),
+    ],
+)
+def test_a_recombined_window_is_the_per_layer_path(factors: Factors, cross: bool, features: int):
+    size = sum(s for s, _ in factors)
+    window = _recombined(3, len(factors), size, seed=41, features=features)
+    assert len(window.ends) == len(factors)
+    _check(window, Recurrence(features, factors, cross, seed=42), window.ends, 4, 5)
+
+
+def test_a_recombined_window_over_the_threading_threshold_is_the_per_layer_path():
+    n, d, s = 2048, 64, 32
+    assert matmul_threads_for(n, d, 3 * s) > 1 and matmul_threads_for(n, d, d) > 1
+    window = _recombined(1, 2, 2 * s, seed=43, features=d)
+    _check(window, Recurrence(d, [(s, 16), (s, 16)], False, seed=44), window.ends, n, 2)
+
+
+@pytest.mark.parametrize("features", [16, 32])
+def test_a_recombined_windows_training_step_with_rotary_attention_and_dropout_is_the_per_layer_path(features: int):
+    window = _recombined(3, 2, 16, seed=45, features=features, rotary=True, dropout=0.25)
+    _check_learn(window, Recurrence(features, [(8, 6), (8, 6)], False, seed=46), 5, 4, reads=window.ends)
+
+
+@pytest.mark.parametrize("factors, cross", [([(3, 5), (5, None)], False), ([(2, 3), (4, None), (2, 2)], True)])
+def test_recombined_continuous_and_crossed_training_steps_are_the_per_layer_path(factors: Factors, cross: bool):
+    size = sum(s for s, _ in factors)
+    window = _recombined(2, len(factors), size, seed=47, features=32)
+    _check_learn(window, Recurrence(32, factors, cross, seed=48), 3, 3, reads=window.ends)
+
+
+def test_a_merged_branch_no_factor_reads_learns_from_its_merge_alone():
+    # unmerged, a branch no pooling reads is refused (ends unread); merged, the merge's delta reaches it
+    window = _recombined(2, 2, 16, seed=49)
+    last = window.ends[-1]
+    recurrence = Recurrence(16, [(8, 6), (8, 6)], False, seed=50)
+    _check(window, recurrence, [last, last], 3, 3)
+    _check_learn(window, recurrence, 3, 3, reads=[last, last])
+
+
+@pytest.mark.parametrize(
+    "ops, reads, message",
+    [
+        ([("embedding",), ("merge",), ("token_output", 1)], 1, "a merge at op 1 without its split"),
+        (
+            [("embedding",), ("split",), ("branch",), ("fork",), ("merge",), ("add",), ("token_output", 1)],
+            2,
+            "inside an open residual",
+        ),
+        ([("embedding",), ("split",), ("merge",), ("token_output", 1)], 2, "which has no branch"),
+    ],
+)
+def test_the_program_refuses_malformed_merges(ops, reads, message):
+    with pytest.raises(ValueError, match=message):
+        WindowProgram(ops, 1, reads, [4], [True], cross=False)
 
 
 def _without_codes(recurrence: Recurrence, free: list[bool]) -> Recurrence:
