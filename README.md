@@ -84,7 +84,7 @@ and must stay numerically identical to it. Likewise each `conv_*`/`max_pool_*` f
 ## Same bits on every machine
 
 A network on this backend trains to the same bits on x86_64 and aarch64 (indrajala-ml's
-`docs/aarch64-workplan.md`). Products follow one order on every path: four `mul_add` lanes
+retired aarch64 workplan: `git show 6b9c6fe:docs/workplans/infrastructure/aarch64-workplan.md`). Products follow one order on every path: four `mul_add` lanes
 combined `(l0 + l1) + (l2 + l3)`, tails in order, reductions as left folds (`src/linalg.rs`);
 threading splits rows or column chunks, never one sum. `exp` is correctly rounded
 (`src/cr_exp.rs`), so it is mathematics' value, not a C library's. A C library's `exp` need not

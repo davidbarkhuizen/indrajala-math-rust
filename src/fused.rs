@@ -34,10 +34,9 @@ fn require_batch_size(batch_size: usize, context: &str) -> PyResult<()> {
 }
 
 fn sigmoid(z: &RustArray) -> RustArray {
-    RustArray {
-        data: crate::cr_exp::map(&z.data, |v| 1.0 / (1.0 + crate::cr_exp::exp_inline(-v))),
-        shape: z.shape,
-    }
+    let mut data = z.data.clone();
+    crate::cr_exp::sigmoid_in_place(&mut data);
+    RustArray { data, shape: z.shape }
 }
 
 /// `self.W @ x + self.b`, `x`/`b` both 1D - the pre-activation shared by every `layer_*forward`

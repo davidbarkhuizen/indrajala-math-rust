@@ -14,10 +14,29 @@ use crate::scalar::{max, relu};
 /// itself is ever built on top of it.
 #[pyfunction]
 pub fn exp(arr: &RustArray) -> RustArray {
+    let mut data = vec![0.0; arr.data.len()];
+    crate::cr_exp::exp_into(&arr.data, &mut data);
+    RustArray { data, shape: arr.shape }
+}
+
+/// `exp` one value at a time (`cr_exp::exp`, no vector lanes): the vector kernel's reference in
+/// the tests, which check the two agree bit for bit.
+#[pyfunction]
+pub fn exp_scalar(arr: &RustArray) -> RustArray {
     RustArray {
-        data: crate::cr_exp::map(&arr.data, crate::cr_exp::exp_inline),
+        data: arr.data.iter().map(|&v| crate::cr_exp::exp(v)).collect(),
         shape: arr.shape,
     }
+}
+
+/// `exp` in place on a copy of `arr` (`cr_exp::exp_in_place`, where `exp` writes a new buffer), and
+/// how many values it redid one at a time: lanes whose rounding test failed or whose input is
+/// outside the fast path's ordinary range, and the tail short of a vector. For the tests.
+#[pyfunction]
+pub fn exp_lanes(arr: &RustArray) -> (RustArray, usize) {
+    let mut data = arr.data.clone();
+    let redone = crate::cr_exp::exp_in_place(&mut data);
+    (RustArray { data, shape: arr.shape }, redone)
 }
 
 /// Sums a 2D array's rows into a 1D vector - the one fixed-axis (`axis=0`) reduction this core
@@ -129,7 +148,8 @@ pub fn array_dropout_mask(
 pub fn array_softmax(arr: &RustArray) -> RustArray {
     fn normalize_row(row: &[f64]) -> Vec<f64> {
         let max_value = row.iter().fold(f64::NEG_INFINITY, |running, &v| max(running, v));
-        let exp_values = crate::cr_exp::map(row, |v| crate::cr_exp::exp_inline(v - max_value));
+        let mut exp_values: Vec<f64> = row.iter().map(|&v| v - max_value).collect();
+        crate::cr_exp::exp_in_place(&mut exp_values);
         let total = exp_values.iter().fold(0.0, |acc, &e| acc + e);
         exp_values.iter().map(|&e| e / total).collect()
     }
