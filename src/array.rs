@@ -384,9 +384,7 @@ unsafe fn transpose_block_avx2(
     block_rows: std::ops::Range<usize>,
     block_cols: std::ops::Range<usize>,
 ) {
-    use std::arch::x86_64::{
-        _mm256_loadu_pd, _mm256_permute2f128_pd, _mm256_storeu_pd, _mm256_unpackhi_pd, _mm256_unpacklo_pd,
-    };
+    use std::arch::x86_64::_mm256_storeu_pd;
 
     let (src, dst) = (data.as_ptr(), out.as_mut_ptr());
     let quad_rows = block_rows.start + (block_rows.len() & !3);
@@ -395,22 +393,22 @@ unsafe fn transpose_block_avx2(
     // matrix with 512 rows lie 4 KB apart, in one L1 set, so each quad's four are finished before
     // the next four are touched (source quads outermost took dense (512, 10).T 52% slower on jebel)
     for col in (block_cols.start..quad_cols).step_by(4) {
-        for row in (block_rows.start..quad_rows).step_by(4) {
-            let r0 = _mm256_loadu_pd(src.add(row * cols + col));
-            let r1 = _mm256_loadu_pd(src.add((row + 1) * cols + col));
-            let r2 = _mm256_loadu_pd(src.add((row + 2) * cols + col));
-            let r3 = _mm256_loadu_pd(src.add((row + 3) * cols + col));
-            // [r0[0], r1[0], r0[2], r1[2]], [r0[1], r1[1], r0[3], r1[3]], and likewise rows 2 and 3
-            let (even01, odd01) = (_mm256_unpacklo_pd(r0, r1), _mm256_unpackhi_pd(r0, r1));
-            let (even23, odd23) = (_mm256_unpacklo_pd(r2, r3), _mm256_unpackhi_pd(r2, r3));
-            // 0x20 takes both low halves (columns 0 and 1), 0x31 both high halves (columns 2 and 3)
-            let quads = [
-                _mm256_permute2f128_pd(even01, even23, 0x20),
-                _mm256_permute2f128_pd(odd01, odd23, 0x20),
-                _mm256_permute2f128_pd(even01, even23, 0x31),
-                _mm256_permute2f128_pd(odd01, odd23, 0x31),
-            ];
-            for (offset, quad) in quads.into_iter().enumerate() {
+        // both of a block's row quads loaded before either is stored, then each output row's eight
+        // values stored together
+        let mut row = block_rows.start;
+        while row + 8 <= quad_rows {
+            let (upper, lower) = (
+                transpose_quad(src, cols, row, col),
+                transpose_quad(src, cols, row + 4, col),
+            );
+            for offset in 0..4 {
+                _mm256_storeu_pd(dst.add((col + offset) * rows + row), upper[offset]);
+                _mm256_storeu_pd(dst.add((col + offset) * rows + row + 4), lower[offset]);
+            }
+            row += 8;
+        }
+        if row < quad_rows {
+            for (offset, quad) in transpose_quad(src, cols, row, col).into_iter().enumerate() {
                 _mm256_storeu_pd(dst.add((col + offset) * rows + row), quad);
             }
         }
@@ -425,6 +423,30 @@ unsafe fn transpose_block_avx2(
             *dst.add(col * rows + row) = *src.add(row * cols + col);
         }
     }
+}
+
+/// Rows `row..row + 4` and columns `col..col + 4` of `src` (`cols` wide), transposed: the four
+/// output rows' quads, column by column. Safety: AVX2 is available, and the quad lies within `src`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn transpose_quad(src: *const f64, cols: usize, row: usize, col: usize) -> [std::arch::x86_64::__m256d; 4] {
+    use std::arch::x86_64::{_mm256_loadu_pd, _mm256_permute2f128_pd, _mm256_unpackhi_pd, _mm256_unpacklo_pd};
+
+    let r0 = _mm256_loadu_pd(src.add(row * cols + col));
+    let r1 = _mm256_loadu_pd(src.add((row + 1) * cols + col));
+    let r2 = _mm256_loadu_pd(src.add((row + 2) * cols + col));
+    let r3 = _mm256_loadu_pd(src.add((row + 3) * cols + col));
+    // [r0[0], r1[0], r0[2], r1[2]], [r0[1], r1[1], r0[3], r1[3]], and likewise rows 2 and 3
+    let (even01, odd01) = (_mm256_unpacklo_pd(r0, r1), _mm256_unpackhi_pd(r0, r1));
+    let (even23, odd23) = (_mm256_unpacklo_pd(r2, r3), _mm256_unpackhi_pd(r2, r3));
+    // 0x20 takes both low halves (columns 0 and 1), 0x31 both high halves (columns 2 and 3)
+    [
+        _mm256_permute2f128_pd(even01, even23, 0x20),
+        _mm256_permute2f128_pd(odd01, odd23, 0x20),
+        _mm256_permute2f128_pd(even01, even23, 0x31),
+        _mm256_permute2f128_pd(odd01, odd23, 0x31),
+    ]
 }
 
 /// `transpose_block` in NEON (the aarch64 workplan's stage 7): 2 x 2 sub-blocks, two source rows'
