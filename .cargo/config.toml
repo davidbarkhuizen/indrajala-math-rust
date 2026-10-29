@@ -1,0 +1,12 @@
+# Where the linker places a kernel must not change its speed, or an A/B can't tell one change's
+# effect from the shuffle it causes everywhere else (indrajala-ml's crate kernels workplan, D7).
+# Layout only: no operation changes, so no bit moves.
+
+# x86_64: no branch crosses or ends on a 32-byte boundary, so the Skylake-derived cores' JCC erratum
+# mitigation (which drops such branches from the micro-op cache) can't tax a kernel by its
+# placement; on jebel (i7-9700K) unchanged kernels moved 10-90% with placement alone, and with the
+# padding an A/B moves only the rows whose code changed. aarch64 isn't pinned: aligning its loops
+# and functions held litshe's kernels still but cost short loops 7-16% (transpose, sum_axis0), so
+# litshe's A/Bs are read with scripts/measurement/kernel_code_diff.py instead.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "llvm-args=-x86-branches-within-32B-boundaries"]

@@ -18,3 +18,11 @@ pyo3 = { version = "0.29", features = ["extension-module", "multiple-pymethods"]
 # The kernels index several fixed-size accumulators and tiles in lockstep with one loop
 # variable (acc[r][j], b_tile[j]), mirroring the math; iterator chains would obscure it.
 needless_range_loop = "allow"
+
+[profile.release]
+# One codegen unit: what LLVM inlines no longer depends on how rustc splits the crate. With the
+# default 16, a change in one file moved others' inlining: crate #65 left `matmul_long_k`'s kernel a
+# call (conv `accumulate_gradient` +4-11% on `litshe`), and a wrapper added to fix it took a `Zip`
+# out of `max_pool_downstream_batch` (+54% at 6x6 b32) (indrajala-ml's crate kernels workplan,
+# stage 2). Only how the code is compiled changes, never an operation, so no bit moves.
+codegen-units = 1
