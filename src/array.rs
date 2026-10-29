@@ -236,6 +236,8 @@ impl RustArray {
                 // 8-12. A copy, so bit-identical in any order.
                 const BLOCK: usize = 8;
                 let mut out = vec![0.0; rows * cols];
+                #[cfg(target_arch = "x86_64")]
+                let avx2 = std::is_x86_feature_detected!("avx2");
                 for row_start in (0..rows).step_by(BLOCK) {
                     let row_end = (row_start + BLOCK).min(rows);
                     for col_start in (0..cols).step_by(BLOCK) {
@@ -252,7 +254,23 @@ impl RustArray {
                                 col_start..col_end,
                             );
                         }
-                        #[cfg(not(target_arch = "aarch64"))]
+                        #[cfg(target_arch = "x86_64")]
+                        if avx2 {
+                            // Safety: AVX2 detected above; the block lies within both `self.data` and `out`.
+                            unsafe {
+                                transpose_block_avx2(
+                                    &self.data,
+                                    &mut out,
+                                    rows,
+                                    cols,
+                                    row_start..row_end,
+                                    col_start..col_end,
+                                );
+                            }
+                        } else {
+                            transpose_block(&self.data, &mut out, rows, cols, row_start..row_end, col_start..col_end);
+                        }
+                        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                         transpose_block(&self.data, &mut out, rows, cols, row_start..row_end, col_start..col_end);
                     }
                 }
@@ -346,6 +364,62 @@ fn transpose_block(
     for col in block_cols {
         for row in block_rows.clone() {
             out[col * rows + row] = data[row * cols + col];
+        }
+    }
+}
+
+/// `transpose_block` in AVX2 (the crate kernels workplan's D4): 4 x 4 sub-blocks, four source rows'
+/// quads loaded, interleaved in pairs (`_mm256_unpacklo_pd`, `_mm256_unpackhi_pd`) and their 128-bit
+/// halves recombined (`_mm256_permute2f128_pd`) into four output rows' quads, so each load and store
+/// moves four values; the last rows and columns short of a quad copied one value at a time. A copy,
+/// so bit-identical to the scalar block. Safety: AVX2 is available, and the block lies within `data`
+/// (`rows x cols`) and `out`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn transpose_block_avx2(
+    data: &[f64],
+    out: &mut [f64],
+    rows: usize,
+    cols: usize,
+    block_rows: std::ops::Range<usize>,
+    block_cols: std::ops::Range<usize>,
+) {
+    use std::arch::x86_64::{
+        _mm256_loadu_pd, _mm256_permute2f128_pd, _mm256_storeu_pd, _mm256_unpackhi_pd, _mm256_unpacklo_pd,
+    };
+
+    let (src, dst) = (data.as_ptr(), out.as_mut_ptr());
+    let quad_rows = block_rows.start + (block_rows.len() & !3);
+    let quad_cols = block_cols.start + (block_cols.len() & !3);
+    for row in (block_rows.start..quad_rows).step_by(4) {
+        for col in (block_cols.start..quad_cols).step_by(4) {
+            let r0 = _mm256_loadu_pd(src.add(row * cols + col));
+            let r1 = _mm256_loadu_pd(src.add((row + 1) * cols + col));
+            let r2 = _mm256_loadu_pd(src.add((row + 2) * cols + col));
+            let r3 = _mm256_loadu_pd(src.add((row + 3) * cols + col));
+            // [r0[0], r1[0], r0[2], r1[2]], [r0[1], r1[1], r0[3], r1[3]], and likewise rows 2 and 3
+            let (even01, odd01) = (_mm256_unpacklo_pd(r0, r1), _mm256_unpackhi_pd(r0, r1));
+            let (even23, odd23) = (_mm256_unpacklo_pd(r2, r3), _mm256_unpackhi_pd(r2, r3));
+            // 0x20 takes both low halves (columns 0 and 1), 0x31 both high halves (columns 2 and 3)
+            let quads = [
+                _mm256_permute2f128_pd(even01, even23, 0x20),
+                _mm256_permute2f128_pd(odd01, odd23, 0x20),
+                _mm256_permute2f128_pd(even01, even23, 0x31),
+                _mm256_permute2f128_pd(odd01, odd23, 0x31),
+            ];
+            for (offset, quad) in quads.into_iter().enumerate() {
+                _mm256_storeu_pd(dst.add((col + offset) * rows + row), quad);
+            }
+        }
+        for col in quad_cols..block_cols.end {
+            for r in row..row + 4 {
+                *dst.add(col * rows + r) = *src.add(r * cols + col);
+            }
+        }
+    }
+    for row in quad_rows..block_rows.end {
+        for col in block_cols.clone() {
+            *dst.add(col * rows + row) = *src.add(row * cols + col);
         }
     }
 }

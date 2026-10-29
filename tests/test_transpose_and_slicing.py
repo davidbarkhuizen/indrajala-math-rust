@@ -37,12 +37,22 @@ def test_transpose_of_transpose_round_trips():
 @pytest.mark.parametrize(
     "rows, cols",
     # whole 8 x 8 blocks, partial blocks on either axis, fewer than a block, a single row or
-    # column, odd and even rows and columns within a block (aarch64's 2 x 2 NEON pairs), and the dense
-    # accumulate's (512, 30) delta_batch at batch 512
+    # column, odd and even rows and columns within a block (aarch64's 2 x 2 NEON pairs), every
+    # remainder of 4 on either axis (x86's 4 x 4 AVX2 quads), and the dense accumulate's (512, 30)
+    # delta_batch at batch 512
     [
         (1, 1),
+        (1, 8),
+        (8, 1),
         (1, 13),
         (13, 1),
+        (4, 4),
+        (4, 7),
+        (7, 4),
+        (5, 6),
+        (6, 5),
+        (12, 13),
+        (14, 15),
         (2, 2),
         (2, 3),
         (3, 2),
