@@ -15,8 +15,7 @@ from decimal import Decimal, localcontext
 import numpy as np
 import pytest
 
-from indrajala_math_rust import Array, exp, exp_redone_count, exp_scalar
-
+from indrajala_math_rust import Array, exp, exp_lanes, exp_scalar
 
 # the inputs CORE-MATH's accurate path alone doesn't round (its database)
 HARD_CASES = [
@@ -69,7 +68,9 @@ def test_exp_is_correctly_rounded_at_tiny_arguments_and_across_binades():
 def test_exp_is_correctly_rounded_at_cr_exps_hard_cases():
     # the inputs CORE-MATH's accurate path alone doesn't round (its database), and their neighbours
     database = [float.fromhex(h) for h in HARD_CASES]
-    _check(database + [math.nextafter(x, math.inf) for x in database] + [math.nextafter(x, -math.inf) for x in database])
+    _check(
+        database + [math.nextafter(x, math.inf) for x in database] + [math.nextafter(x, -math.inf) for x in database]
+    )
 
 
 def test_exp_at_the_overflow_and_underflow_edges_and_special_values():
@@ -89,9 +90,10 @@ LANE_SAMPLE = 2 ** int(os.environ.get("EXP_LANES_LOG2", "20"))  # 24 for the per
 
 
 def _same_bits(values: list[float]) -> None:
-    vector, scalar = exp(Array(values)).tolist(), exp_scalar(Array(values)).tolist()
-    wrong = [(x, v, s) for x, v, s in zip(values, vector, scalar) if _bits(v) != _bits(s)]
-    assert wrong == [], [(x.hex(), v.hex(), s.hex()) for x, v, s in wrong[:5]]
+    scalar = exp_scalar(Array(values)).tolist()
+    for vector in (exp(Array(values)).tolist(), exp_lanes(Array(values))[0].tolist()):  # into, in place
+        wrong = [(x, v, s) for x, v, s in zip(values, vector, scalar) if _bits(v) != _bits(s)]
+        assert wrong == [], [(x.hex(), v.hex(), s.hex()) for x, v, s in wrong[:5]]
 
 
 def _every_offset(values: list[float]) -> list[list[float]]:
@@ -129,21 +131,22 @@ def test_the_vector_lanes_match_the_scalar_exp_on_random_bits_and_the_range():
     every_double = rng.integers(0, 2**64, size=LANE_SAMPLE // 2, dtype=np.uint64).view(np.float64)
     in_range = rng.uniform(-746.0, 710.0, size=LANE_SAMPLE // 2)
     values = np.concatenate([every_double, in_range])
-    vector = np.array(exp(Array(values.tolist())).tolist()).view(np.uint64)
     scalar = np.array(exp_scalar(Array(values.tolist())).tolist()).view(np.uint64)
     nan = np.isnan(values)  # a NaN's payload isn't claimed (the README): only that it is NaN
-    assert np.isnan(vector.view(np.float64)[nan]).all()
-    wrong = np.flatnonzero((vector != scalar) & ~nan)
-    assert wrong.size == 0, [values[i].hex() for i in wrong[:5]]
+    for result in (exp(Array(values.tolist())), exp_lanes(Array(values.tolist()))[0]):  # into, in place
+        vector = np.array(result.tolist()).view(np.uint64)
+        assert np.isnan(vector.view(np.float64)[nan]).all()
+        wrong = np.flatnonzero((vector != scalar) & ~nan)
+        assert wrong.size == 0, [values[i].hex() for i in wrong[:5]]
 
 
 def test_the_vector_lanes_redo_only_the_rare_values():
     rng = random.Random("cr_exp redone")
     ordinary = [rng.uniform(-20.0, 20.0) for _ in range(400_000)]
-    redone = exp_redone_count(Array(ordinary))
+    redone = exp_lanes(Array(ordinary))[1]
     # the fast path rounds about 689 in 690 values (CORE-MATH's figure for cr_exp)
     assert 0 < redone < len(ordinary) / 200
     # the hard cases' accurate path is reached through the lanes, and its results are right
     database = [float.fromhex(h) for h in HARD_CASES]
-    assert exp_redone_count(Array(database * 4)) > 0
+    assert exp_lanes(Array(database * 4))[1] > 0
     _check(database * 4)

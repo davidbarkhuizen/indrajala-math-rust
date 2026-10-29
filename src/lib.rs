@@ -62,7 +62,7 @@ use tokens::{
     token_dropout_forward, token_mean_downstream, token_mean_forward,
 };
 use ufuncs::{
-    argmax, array_dropout_mask, array_relu, array_relu_mask, array_sigmoid_mask, array_softmax, exp, exp_redone_count,
+    argmax, array_dropout_mask, array_relu, array_relu_mask, array_sigmoid_mask, array_softmax, exp, exp_lanes,
     exp_scalar, sum_axis0,
 };
 
@@ -84,7 +84,7 @@ fn indrajala_math_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(set_kernel_overrides, m)?)?;
     m.add_function(wrap_pyfunction!(exp, m)?)?;
     m.add_function(wrap_pyfunction!(exp_scalar, m)?)?;
-    m.add_function(wrap_pyfunction!(exp_redone_count, m)?)?;
+    m.add_function(wrap_pyfunction!(exp_lanes, m)?)?;
     m.add_function(wrap_pyfunction!(outer, m)?)?;
     m.add_function(wrap_pyfunction!(sum_axis0, m)?)?;
     m.add_function(wrap_pyfunction!(argmax, m)?)?;

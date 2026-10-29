@@ -87,24 +87,39 @@ unsafe fn map_fma<F: Fn(f64) -> f64>(values: &[f64], f: F) -> Vec<f64> {
 /// by `exp` itself. Returns how many values were redone.
 pub fn exp_into(values: &[f64], out: &mut [f64]) -> usize {
     assert_eq!(values.len(), out.len(), "exp_into: values and out differ in length");
+    // SAFETY: both hold values.len() values, and a borrow and a mutable borrow can't overlap.
+    unsafe { exp_lanes(values.as_ptr(), out.as_mut_ptr(), values.len()) }
+}
+
+/// [`exp_into`] with `values` as its own `out`: each vector is loaded before its results are
+/// stored, and a redone lane reads its input from the loaded vector.
+pub fn exp_in_place(values: &mut [f64]) -> usize {
+    let data = values.as_mut_ptr();
+    // SAFETY: `data` holds values.len() values; the kernels read each vector before writing it.
+    unsafe { exp_lanes(data, data, values.len()) }
+}
+
+// The kernels read `len` values at `src` and write `len` at `dst`, which is `src` itself or doesn't
+// overlap it. Safety: both hold `len` values.
+unsafe fn exp_lanes(src: *const f64, dst: *mut f64, len: usize) -> usize {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-            // SAFETY: the CPU has AVX2 and FMA, checked just above; the lengths match.
-            return unsafe { exp_into_avx2(values, out) };
+            // SAFETY: the CPU has AVX2 and FMA, checked just above.
+            return unsafe { exp_lanes_avx2(src, dst, len) };
         }
     }
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: NEON is part of aarch64; the lengths match.
-        return unsafe { exp_into_neon(values, out) };
+        // SAFETY: NEON is part of aarch64.
+        return unsafe { exp_lanes_neon(src, dst, len) };
     }
     #[allow(unreachable_code, reason = "aarch64 returns above")]
     {
-        for (o, &v) in out.iter_mut().zip(values) {
-            *o = exp(v);
+        for i in 0..len {
+            *dst.add(i) = exp(*src.add(i));
         }
-        values.len()
+        len
     }
 }
 
@@ -117,19 +132,19 @@ const ORDINARY_BELOW: u64 = SUBNORMAL_BELOW & (u64::MAX >> 1);
 const ROUND_MAGIC: f64 = 6755399441055744.0;
 
 // `exp_body`'s fast path in AVX2, four lanes at a time; the tables' pairs `[low, high]` gathered by
-// index. Safety: the CPU has AVX2 and FMA; `values` and `out` have the same length.
+// index. Safety: the CPU has AVX2 and FMA; as `exp_lanes`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn exp_into_avx2(values: &[f64], out: &mut [f64]) -> usize {
+unsafe fn exp_lanes_avx2(src: *const f64, dst: *mut f64, len: usize) -> usize {
     use std::arch::x86_64::*;
 
     let pd = _mm256_set1_pd;
     let epi = |bits: u64| _mm256_set1_epi64x(bits as i64);
     let (t0, t1) = (T0.as_ptr().cast::<f64>(), T1.as_ptr().cast::<f64>());
-    let quads = values.len() & !3;
+    let quads = len & !3;
     let mut redone = 0;
     for i in (0..quads).step_by(4) {
-        let x = _mm256_loadu_pd(values.as_ptr().add(i));
+        let x = _mm256_loadu_pd(src.add(i));
         let abs_bits = _mm256_and_si256(_mm256_castpd_si256(x), epi(u64::MAX >> 1));
         // signed compares, exact here: |x|'s bits have the sign bit clear
         let ordinary = _mm256_and_si256(
@@ -173,35 +188,37 @@ unsafe fn exp_into_avx2(values: &[f64], out: &mut [f64]) -> usize {
         // ldexp_bits(lb, ie): ie << 52 is (jt >> 12) << 52, the same bits as (jt & !0xfff) << 40
         let scale = _mm256_slli_epi64::<40>(_mm256_and_si256(jt, epi(!0xfff)));
         let result = _mm256_castsi256_pd(_mm256_add_epi64(_mm256_castpd_si256(lb), scale));
-        _mm256_storeu_pd(out.as_mut_ptr().add(i), result);
+        _mm256_storeu_pd(dst.add(i), result);
         let rounded = _mm256_and_pd(_mm256_cmp_pd::<_CMP_EQ_OQ>(ub, lb), _mm256_castsi256_pd(ordinary));
         let mask = _mm256_movemask_pd(rounded);
         if mask != 0b1111 {
-            for lane in 0..4 {
+            let mut xs = [0.0; 4];
+            _mm256_storeu_pd(xs.as_mut_ptr(), x);
+            for (lane, &v) in xs.iter().enumerate() {
                 if mask & (1 << lane) == 0 {
-                    out[i + lane] = exp_body(values[i + lane]);
+                    *dst.add(i + lane) = exp_body(v);
                     redone += 1;
                 }
             }
         }
     }
-    for i in quads..values.len() {
-        out[i] = exp_body(values[i]);
+    for i in quads..len {
+        *dst.add(i) = exp_body(*src.add(i));
     }
-    redone + (values.len() - quads)
+    redone + (len - quads)
 }
 
-// `exp_body`'s fast path in NEON, two lanes at a time; the table rows loaded per lane. Safety:
-// `values` and `out` have the same length.
+// `exp_body`'s fast path in NEON, two lanes at a time; the table rows loaded per lane. Safety: as
+// `exp_lanes`.
 #[cfg(target_arch = "aarch64")]
-unsafe fn exp_into_neon(values: &[f64], out: &mut [f64]) -> usize {
+unsafe fn exp_lanes_neon(src: *const f64, dst: *mut f64, len: usize) -> usize {
     use std::arch::aarch64::*;
 
     let pd = vdupq_n_f64;
-    let pairs = values.len() & !1;
+    let pairs = len & !1;
     let mut redone = 0;
     for i in (0..pairs).step_by(2) {
-        let x = vld1q_f64(values.as_ptr().add(i));
+        let x = vld1q_f64(src.add(i));
         let abs_bits = vandq_u64(vreinterpretq_u64_f64(x), vdupq_n_u64(u64::MAX >> 1));
         let ordinary = vandq_u64(
             vcgtq_u64(abs_bits, vdupq_n_u64(ORDINARY_ABOVE)),
@@ -238,22 +255,23 @@ unsafe fn exp_into_neon(values: &[f64], out: &mut [f64]) -> usize {
         // ldexp_bits(lb, ie), ie = jt >> 12
         let scale = vshlq_n_u64::<52>(vreinterpretq_u64_s64(vshrq_n_s64::<12>(jt)));
         let result = vreinterpretq_f64_u64(vaddq_u64(vreinterpretq_u64_f64(lb), scale));
-        vst1q_f64(out.as_mut_ptr().add(i), result);
+        vst1q_f64(dst.add(i), result);
         let rounded = vandq_u64(vceqq_f64(ub, lb), ordinary);
-        for (lane, ok) in [vgetq_lane_u64::<0>(rounded), vgetq_lane_u64::<1>(rounded)]
-            .into_iter()
-            .enumerate()
-        {
+        let lanes = [
+            (vgetq_lane_u64::<0>(rounded), vgetq_lane_f64::<0>(x)),
+            (vgetq_lane_u64::<1>(rounded), vgetq_lane_f64::<1>(x)),
+        ];
+        for (lane, (ok, v)) in lanes.into_iter().enumerate() {
             if ok == 0 {
-                out[i + lane] = exp_body(values[i + lane]);
+                *dst.add(i + lane) = exp_body(v);
                 redone += 1;
             }
         }
     }
-    for i in pairs..values.len() {
-        out[i] = exp_body(values[i]);
+    for i in pairs..len {
+        *dst.add(i) = exp_body(*src.add(i));
     }
-    redone + (values.len() - pairs)
+    redone + (len - pairs)
 }
 
 /// `exp` without the feature check, inlined into its caller: for [`map`]'s `f`.

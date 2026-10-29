@@ -29,11 +29,14 @@ pub fn exp_scalar(arr: &RustArray) -> RustArray {
     }
 }
 
-/// How many of `arr`'s values `exp` redoes one at a time: lanes whose rounding test failed or
-/// whose input is outside the fast path's ordinary range, and the tail short of a vector.
+/// `exp` in place on a copy of `arr` (`cr_exp::exp_in_place`, where `exp` writes a new buffer), and
+/// how many values it redid one at a time: lanes whose rounding test failed or whose input is
+/// outside the fast path's ordinary range, and the tail short of a vector. For the tests.
 #[pyfunction]
-pub fn exp_redone_count(arr: &RustArray) -> usize {
-    crate::cr_exp::exp_into(&arr.data, &mut vec![0.0; arr.data.len()])
+pub fn exp_lanes(arr: &RustArray) -> (RustArray, usize) {
+    let mut data = arr.data.clone();
+    let redone = crate::cr_exp::exp_in_place(&mut data);
+    (RustArray { data, shape: arr.shape }, redone)
 }
 
 /// Sums a 2D array's rows into a 1D vector - the one fixed-axis (`axis=0`) reduction this core
