@@ -1,0 +1,7 @@
+# x86_64: no branch crosses or ends on a 32-byte boundary, so the Skylake-derived cores' JCC
+# erratum mitigation (a microcode update that drops such branches from the micro-op cache) can't
+# tax a kernel by where the linker happened to place it. On jebel (i7-9700K) unchanged kernels moved
+# 10-90% with placement alone (indrajala-ml's crate kernels workplan, D7). Padding only: no
+# operation changes, so no bit moves.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "llvm-args=-x86-branches-within-32B-boundaries"]
