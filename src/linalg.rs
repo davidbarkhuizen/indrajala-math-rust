@@ -767,8 +767,10 @@ pub(crate) fn matmul_long_k(a: &RustArray, b: &RustArray) -> PyResult<RustArray>
 /// One column range of `matmul_long_k`'s product, `k` in slabs of `k_block` rows. Never inlined:
 /// inlined into `matmul_long_k` (once crate #65 removed `matmul_narrow`, another caller of the
 /// kernel), it left the kernel a call, and conv `accumulate_gradient` ran 4-11% slower on `litshe`
-/// with every function aligned (indrajala-ml's crate kernels workplan, stage 2).
-#[inline(never)]
+/// with every function aligned (indrajala-ml's crate kernels workplan, stage 2). On aarch64 only:
+/// x86 compiles it as before, since there any change in what is inlined moved unrelated
+/// microsecond ops (pool, conv forward) by 10-30% on jebel.
+#[cfg_attr(target_arch = "aarch64", inline(never))]
 fn long_k_columns(
     a_data: &[f64],
     b_data: &[f64],
