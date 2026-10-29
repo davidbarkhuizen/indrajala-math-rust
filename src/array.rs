@@ -391,8 +391,11 @@ unsafe fn transpose_block_avx2(
     let (src, dst) = (data.as_ptr(), out.as_mut_ptr());
     let quad_rows = block_rows.start + (block_rows.len() & !3);
     let quad_cols = block_cols.start + (block_cols.len() & !3);
-    for row in (block_rows.start..quad_rows).step_by(4) {
-        for col in (block_cols.start..quad_cols).step_by(4) {
+    // column quads outermost, as the scalar block goes column by column: the output rows of a
+    // matrix with 512 rows lie 4 KB apart, in one L1 set, so each quad's four are finished before
+    // the next four are touched (source quads outermost took dense (512, 10).T 52% slower on jebel)
+    for col in (block_cols.start..quad_cols).step_by(4) {
+        for row in (block_rows.start..quad_rows).step_by(4) {
             let r0 = _mm256_loadu_pd(src.add(row * cols + col));
             let r1 = _mm256_loadu_pd(src.add((row + 1) * cols + col));
             let r2 = _mm256_loadu_pd(src.add((row + 2) * cols + col));
@@ -411,14 +414,14 @@ unsafe fn transpose_block_avx2(
                 _mm256_storeu_pd(dst.add((col + offset) * rows + row), quad);
             }
         }
-        for col in quad_cols..block_cols.end {
-            for r in row..row + 4 {
-                *dst.add(col * rows + r) = *src.add(r * cols + col);
+        for c in col..col + 4 {
+            for row in quad_rows..block_rows.end {
+                *dst.add(c * rows + row) = *src.add(row * cols + c);
             }
         }
     }
-    for row in quad_rows..block_rows.end {
-        for col in block_cols.clone() {
+    for col in quad_cols..block_cols.end {
+        for row in block_rows.clone() {
             *dst.add(col * rows + row) = *src.add(row * cols + col);
         }
     }
