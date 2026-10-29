@@ -79,6 +79,183 @@ unsafe fn map_fma<F: Fn(f64) -> f64>(values: &[f64], f: F) -> Vec<f64> {
     out
 }
 
+/// `exp` of each of `values` into `out` (the same length), in vector lanes where the CPU has them:
+/// AVX2 and FMA's 4 on x86_64 (checked once per call), NEON's 2 on aarch64 (indrajala-ml's crate
+/// kernels workplan, D1 and D2). Each lane runs [`exp`]'s fast path, operation for operation, so a
+/// lane that rounds gives `exp`'s bits; a lane whose rounding test fails, or whose input is outside
+/// the fast path's ordinary range (`|x| <= 2^-54`, a subnormal or infinite result, NaN), is redone
+/// by `exp` itself. Returns how many values were redone.
+pub fn exp_into(values: &[f64], out: &mut [f64]) -> usize {
+    assert_eq!(values.len(), out.len(), "exp_into: values and out differ in length");
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: the CPU has AVX2 and FMA, checked just above; the lengths match.
+            return unsafe { exp_into_avx2(values, out) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is part of aarch64; the lengths match.
+        return unsafe { exp_into_neon(values, out) };
+    }
+    #[allow(unreachable_code, reason = "aarch64 returns above")]
+    {
+        for (o, &v) in out.iter_mut().zip(values) {
+            *o = exp(v);
+        }
+        values.len()
+    }
+}
+
+// The vector lanes' ordinary inputs, as `|x|`'s bits: above 2^-54 (smaller rounds to 1 + x) and
+// below the subnormal results' edge, which also keeps out the overflows, the infinities and NaN.
+const ORDINARY_ABOVE: u64 = 0x3c90000000000000;
+const ORDINARY_BELOW: u64 = SUBNORMAL_BELOW & (u64::MAX >> 1);
+// 0x1.8p+52: an integer `t` with `|t| < 2^51` added to it lands in the mantissa, `t + 2^51`.
+#[cfg(target_arch = "x86_64")]
+const ROUND_MAGIC: f64 = 6755399441055744.0;
+
+// `exp_body`'s fast path in AVX2, four lanes at a time; the tables' pairs `[low, high]` gathered by
+// index. Safety: the CPU has AVX2 and FMA; `values` and `out` have the same length.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn exp_into_avx2(values: &[f64], out: &mut [f64]) -> usize {
+    use std::arch::x86_64::*;
+
+    let pd = _mm256_set1_pd;
+    let epi = |bits: u64| _mm256_set1_epi64x(bits as i64);
+    let (t0, t1) = (T0.as_ptr().cast::<f64>(), T1.as_ptr().cast::<f64>());
+    let quads = values.len() & !3;
+    let mut redone = 0;
+    for i in (0..quads).step_by(4) {
+        let x = _mm256_loadu_pd(values.as_ptr().add(i));
+        let abs_bits = _mm256_and_si256(_mm256_castpd_si256(x), epi(u64::MAX >> 1));
+        // signed compares, exact here: |x|'s bits have the sign bit clear
+        let ordinary = _mm256_and_si256(
+            _mm256_cmpgt_epi64(abs_bits, epi(ORDINARY_ABOVE)),
+            _mm256_cmpgt_epi64(epi(ORDINARY_BELOW), abs_bits),
+        );
+        // reduce: t, jt and the table product (th, tl); an extraordinary lane's indices are
+        // garbage but masked to the tables' 64 rows, and its result is replaced
+        let t = _mm256_round_pd::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(_mm256_mul_pd(x, pd(S)));
+        let jt = _mm256_sub_epi64(
+            _mm256_castpd_si256(_mm256_add_pd(t, pd(ROUND_MAGIC))),
+            _mm256_castpd_si256(pd(ROUND_MAGIC)),
+        );
+        let i1 = _mm256_slli_epi64::<1>(_mm256_and_si256(jt, epi(0x3f)));
+        let i0 = _mm256_slli_epi64::<1>(_mm256_and_si256(_mm256_srli_epi64::<6>(jt), epi(0x3f)));
+        let one = epi(1);
+        let (xl, xh) = (
+            _mm256_i64gather_pd::<8>(t0, i0),
+            _mm256_i64gather_pd::<8>(t0, _mm256_add_epi64(i0, one)),
+        );
+        let (cl, ch) = (
+            _mm256_i64gather_pd::<8>(t1, i1),
+            _mm256_i64gather_pd::<8>(t1, _mm256_add_epi64(i1, one)),
+        );
+        let th = _mm256_mul_pd(ch, xh);
+        let tl = _mm256_add_pd(
+            _mm256_add_pd(_mm256_mul_pd(ch, xl), _mm256_mul_pd(cl, xh)),
+            _mm256_fmsub_pd(ch, xh, th),
+        );
+        // the fast path, as exp_body has it
+        let dx = _mm256_add_pd(_mm256_sub_pd(x, _mm256_mul_pd(pd(L2H), t)), _mm256_mul_pd(pd(L2L), t));
+        let dx2 = _mm256_mul_pd(dx, dx);
+        let p = _mm256_add_pd(
+            _mm256_add_pd(pd(FAST_C[0]), _mm256_mul_pd(dx, pd(FAST_C[1]))),
+            _mm256_mul_pd(dx2, _mm256_add_pd(pd(FAST_C[2]), _mm256_mul_pd(dx, pd(FAST_C[3])))),
+        );
+        let tx = _mm256_mul_pd(th, dx);
+        let fl = _mm256_add_pd(tl, _mm256_mul_pd(tx, p));
+        let ub = _mm256_add_pd(th, _mm256_add_pd(fl, pd(EPS)));
+        let lb = _mm256_add_pd(th, _mm256_sub_pd(fl, pd(EPS)));
+        // ldexp_bits(lb, ie): ie << 52 is (jt >> 12) << 52, the same bits as (jt & !0xfff) << 40
+        let scale = _mm256_slli_epi64::<40>(_mm256_and_si256(jt, epi(!0xfff)));
+        let result = _mm256_castsi256_pd(_mm256_add_epi64(_mm256_castpd_si256(lb), scale));
+        _mm256_storeu_pd(out.as_mut_ptr().add(i), result);
+        let rounded = _mm256_and_pd(_mm256_cmp_pd::<_CMP_EQ_OQ>(ub, lb), _mm256_castsi256_pd(ordinary));
+        let mask = _mm256_movemask_pd(rounded);
+        if mask != 0b1111 {
+            for lane in 0..4 {
+                if mask & (1 << lane) == 0 {
+                    out[i + lane] = exp_body(values[i + lane]);
+                    redone += 1;
+                }
+            }
+        }
+    }
+    for i in quads..values.len() {
+        out[i] = exp_body(values[i]);
+    }
+    redone + (values.len() - quads)
+}
+
+// `exp_body`'s fast path in NEON, two lanes at a time; the table rows loaded per lane. Safety:
+// `values` and `out` have the same length.
+#[cfg(target_arch = "aarch64")]
+unsafe fn exp_into_neon(values: &[f64], out: &mut [f64]) -> usize {
+    use std::arch::aarch64::*;
+
+    let pd = vdupq_n_f64;
+    let pairs = values.len() & !1;
+    let mut redone = 0;
+    for i in (0..pairs).step_by(2) {
+        let x = vld1q_f64(values.as_ptr().add(i));
+        let abs_bits = vandq_u64(vreinterpretq_u64_f64(x), vdupq_n_u64(u64::MAX >> 1));
+        let ordinary = vandq_u64(
+            vcgtq_u64(abs_bits, vdupq_n_u64(ORDINARY_ABOVE)),
+            vcltq_u64(abs_bits, vdupq_n_u64(ORDINARY_BELOW)),
+        );
+        // reduce: t, jt and the table product (th, tl); an extraordinary lane's jt saturates or is
+        // garbage, its indices masked to the tables' 64 rows, and its result is replaced
+        let t = vrndnq_f64(vmulq_f64(x, pd(S)));
+        let jt = vcvtq_s64_f64(t);
+        let (j0, j1) = (vgetq_lane_s64::<0>(jt), vgetq_lane_s64::<1>(jt));
+        let (a0, a1) = (((j0 >> 6) & 0x3f) as usize, ((j1 >> 6) & 0x3f) as usize);
+        let (b0, b1) = ((j0 & 0x3f) as usize, (j1 & 0x3f) as usize);
+        let xl = vld1q_f64([T0[a0][0], T0[a1][0]].as_ptr());
+        let xh = vld1q_f64([T0[a0][1], T0[a1][1]].as_ptr());
+        let cl = vld1q_f64([T1[b0][0], T1[b1][0]].as_ptr());
+        let ch = vld1q_f64([T1[b0][1], T1[b1][1]].as_ptr());
+        let th = vmulq_f64(ch, xh);
+        // vfmaq_f64(a, b, c) is a + b * c, rounded once: mul_add(ch, xh, -th)
+        let tl = vaddq_f64(
+            vaddq_f64(vmulq_f64(ch, xl), vmulq_f64(cl, xh)),
+            vfmaq_f64(vnegq_f64(th), ch, xh),
+        );
+        // the fast path, as exp_body has it
+        let dx = vaddq_f64(vsubq_f64(x, vmulq_f64(pd(L2H), t)), vmulq_f64(pd(L2L), t));
+        let dx2 = vmulq_f64(dx, dx);
+        let p = vaddq_f64(
+            vaddq_f64(pd(FAST_C[0]), vmulq_f64(dx, pd(FAST_C[1]))),
+            vmulq_f64(dx2, vaddq_f64(pd(FAST_C[2]), vmulq_f64(dx, pd(FAST_C[3])))),
+        );
+        let tx = vmulq_f64(th, dx);
+        let fl = vaddq_f64(tl, vmulq_f64(tx, p));
+        let ub = vaddq_f64(th, vaddq_f64(fl, pd(EPS)));
+        let lb = vaddq_f64(th, vsubq_f64(fl, pd(EPS)));
+        // ldexp_bits(lb, ie), ie = jt >> 12
+        let scale = vshlq_n_u64::<52>(vreinterpretq_u64_s64(vshrq_n_s64::<12>(jt)));
+        let result = vreinterpretq_f64_u64(vaddq_u64(vreinterpretq_u64_f64(lb), scale));
+        vst1q_f64(out.as_mut_ptr().add(i), result);
+        let rounded = vandq_u64(vceqq_f64(ub, lb), ordinary);
+        for (lane, ok) in [vgetq_lane_u64::<0>(rounded), vgetq_lane_u64::<1>(rounded)]
+            .into_iter()
+            .enumerate()
+        {
+            if ok == 0 {
+                out[i + lane] = exp_body(values[i + lane]);
+                redone += 1;
+            }
+        }
+    }
+    for i in pairs..values.len() {
+        out[i] = exp_body(values[i]);
+    }
+    redone + (values.len() - pairs)
+}
+
 /// `exp` without the feature check, inlined into its caller: for [`map`]'s `f`.
 #[inline(always)]
 pub fn exp_inline(x: f64) -> f64 {
@@ -148,6 +325,14 @@ const EPS: f64 = 1.64e-19;
 // x < -0x1.6232bdd7abcd2p+9: the result is subnormal
 const SUBNORMAL_BELOW: u64 = 0xc086232bdd7abcd2;
 
+// 1 + dx (c0 + c1 dx + c2 dx^2 + c3 dx^3) approximates exp(dx) to 2^-76.173 (Sollya)
+const FAST_C: [f64; 4] = [
+    1.0,
+    0.5,
+    f64::from_bits(0x3fc55555557e54ff), // 0x1.55555557e54ffp-3
+    f64::from_bits(0x3fa55555553a12f4), // 0x1.55555553a12f4p-5
+];
+
 #[inline(always)]
 fn reduce(x: f64) -> (f64, i64, f64, f64) {
     let t = (x * S).round_ties_even();
@@ -184,14 +369,7 @@ fn exp_body(x: f64) -> f64 {
     // Cody-Waite: |t| < 2^23 and L2H has 29 bits, so L2H * t is exact
     let dx = (x - L2H * t) + L2L * t;
     let dx2 = dx * dx;
-    // 1 + dx (c0 + c1 dx + c2 dx^2 + c3 dx^3) approximates exp(dx) to 2^-76.173 (Sollya)
-    const C: [f64; 4] = [
-        1.0,
-        0.5,
-        f64::from_bits(0x3fc55555557e54ff), // 0x1.55555557e54ffp-3
-        f64::from_bits(0x3fa55555553a12f4), // 0x1.55555553a12f4p-5
-    ];
-    let p = (C[0] + dx * C[1]) + dx2 * (C[2] + dx * C[3]);
+    let p = (FAST_C[0] + dx * FAST_C[1]) + dx2 * (FAST_C[2] + dx * FAST_C[3]);
     let mut fh = th;
     let tx = th * dx;
     let mut fl = tl + tx * p;

@@ -14,10 +14,26 @@ use crate::scalar::{max, relu};
 /// itself is ever built on top of it.
 #[pyfunction]
 pub fn exp(arr: &RustArray) -> RustArray {
+    let mut data = vec![0.0; arr.data.len()];
+    crate::cr_exp::exp_into(&arr.data, &mut data);
+    RustArray { data, shape: arr.shape }
+}
+
+/// `exp` one value at a time (`cr_exp::exp`, no vector lanes): the vector kernel's reference in
+/// the tests, which check the two agree bit for bit.
+#[pyfunction]
+pub fn exp_scalar(arr: &RustArray) -> RustArray {
     RustArray {
-        data: crate::cr_exp::map(&arr.data, crate::cr_exp::exp_inline),
+        data: arr.data.iter().map(|&v| crate::cr_exp::exp(v)).collect(),
         shape: arr.shape,
     }
+}
+
+/// How many of `arr`'s values `exp` redoes one at a time: lanes whose rounding test failed or
+/// whose input is outside the fast path's ordinary range, and the tail short of a vector.
+#[pyfunction]
+pub fn exp_redone_count(arr: &RustArray) -> usize {
+    crate::cr_exp::exp_into(&arr.data, &mut vec![0.0; arr.data.len()])
 }
 
 /// Sums a 2D array's rows into a 1D vector - the one fixed-axis (`axis=0`) reduction this core
