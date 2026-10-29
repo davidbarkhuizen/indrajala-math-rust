@@ -738,7 +738,36 @@ pub(crate) fn matmul_long_k(a: &RustArray, b: &RustArray) -> PyResult<RustArray>
         .step_by(chunks_per_thread)
         .map(|chunk| (chunk * 16, ((chunk + chunks_per_thread) * 16).min(n)))
         .collect();
-    let columns = |range: (usize, usize)| long_k_columns(&a.data, &b.data, (m, k, n), k_block, range);
+    let columns = |(col_start, col_end): (usize, usize)| -> Vec<f64> {
+        let width = col_end - col_start;
+        let mut part = vec![0.0; m * width];
+        let mut k_start = 0;
+        while k_start < k {
+            let k_end = k_start.saturating_add(k_block).min(k);
+            let panel = Panel {
+                row_start: 0,
+                row_end: m,
+                rows_per_block: m,
+                col_start,
+                col_end,
+                k_start,
+                k_end,
+                k,
+                n,
+                out_stride: width,
+            };
+            tiled_row_range::<RESUME>(&a.data, &b.data, &mut part, panel);
+            k_start = k_end;
+        }
+        part
+    };
+    // Through a function never inlined, on aarch64: inlined into `matmul_long_k` (once crate #65
+    // removed `matmul_narrow`, another caller of the kernel), the column range left the kernel a
+    // call, and conv `accumulate_gradient` ran 4-11% slower on `litshe` with every function aligned
+    // (indrajala-ml's crate kernels workplan, stage 2). x86 compiles as before: there any change in
+    // the binary's layout moved unrelated microsecond ops by 10-90% on jebel.
+    #[cfg(target_arch = "aarch64")]
+    let columns = |range: (usize, usize)| never_inlined(&columns, range);
     let parts: Vec<Vec<f64>> = if column_ranges.len() == 1 {
         vec![columns(column_ranges[0])]
     } else {
@@ -764,41 +793,11 @@ pub(crate) fn matmul_long_k(a: &RustArray, b: &RustArray) -> PyResult<RustArray>
     Ok(RustArray::from_matrix(out, m, n))
 }
 
-/// One column range of `matmul_long_k`'s product, `k` in slabs of `k_block` rows. Never inlined:
-/// inlined into `matmul_long_k` (once crate #65 removed `matmul_narrow`, another caller of the
-/// kernel), it left the kernel a call, and conv `accumulate_gradient` ran 4-11% slower on `litshe`
-/// with every function aligned (indrajala-ml's crate kernels workplan, stage 2). On aarch64 only:
-/// x86 compiles it as before, since there any change in what is inlined moved unrelated
-/// microsecond ops (pool, conv forward) by 10-30% on jebel.
-#[cfg_attr(target_arch = "aarch64", inline(never))]
-fn long_k_columns(
-    a_data: &[f64],
-    b_data: &[f64],
-    (m, k, n): (usize, usize, usize),
-    k_block: usize,
-    (col_start, col_end): (usize, usize),
-) -> Vec<f64> {
-    let width = col_end - col_start;
-    let mut part = vec![0.0; m * width];
-    let mut k_start = 0;
-    while k_start < k {
-        let k_end = k_start.saturating_add(k_block).min(k);
-        let panel = Panel {
-            row_start: 0,
-            row_end: m,
-            rows_per_block: m,
-            col_start,
-            col_end,
-            k_start,
-            k_end,
-            k,
-            n,
-            out_stride: width,
-        };
-        tiled_row_range::<RESUME>(a_data, b_data, &mut part, panel);
-        k_start = k_end;
-    }
-    part
+/// `f(x)` in a function of its own, so `f`'s body is compiled into it, not into the caller.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn never_inlined<X, Y>(f: &impl Fn(X) -> Y, x: X) -> Y {
+    f(x)
 }
 
 fn product_shape(a: &RustArray, b: &RustArray) -> PyResult<(usize, usize, usize)> {
