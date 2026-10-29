@@ -53,32 +53,6 @@ unsafe fn exp_fma(x: f64) -> f64 {
     exp_body(x)
 }
 
-/// `f` over `values`, with the CPU's FMA when it has one, checked once for the slice: for `f`s
-/// built on [`exp_inline`], which inlines into the FMA copy (`exp` itself checks per call).
-#[inline]
-pub fn map<F: Fn(f64) -> f64>(values: &[f64], f: F) -> Vec<f64> {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::is_x86_feature_detected!("fma") {
-            // SAFETY: the CPU has FMA, checked just above.
-            return unsafe { map_fma(values, f) };
-        }
-    }
-    values.iter().map(|&v| f(v)).collect()
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "fma")]
-unsafe fn map_fma<F: Fn(f64) -> f64>(values: &[f64], f: F) -> Vec<f64> {
-    // a plain loop here, not an iterator's collect: std's code isn't compiled with the feature,
-    // and `f` (with `exp_inline`'s `mul_add`) has to inline into this function to get it
-    let mut out = Vec::with_capacity(values.len());
-    for &v in values {
-        out.push(f(v));
-    }
-    out
-}
-
 /// `exp` of each of `values` into `out` (the same length), in vector lanes where the CPU has them:
 /// AVX2 and FMA's 4 on x86_64 (checked once per call), NEON's 2 on aarch64 (indrajala-ml's crate
 /// kernels workplan, D1 and D2). Each lane runs [`exp`]'s fast path, operation for operation, so a
@@ -274,10 +248,17 @@ unsafe fn exp_lanes_neon(src: *const f64, dst: *mut f64, len: usize) -> usize {
     redone + (len - pairs)
 }
 
-/// `exp` without the feature check, inlined into its caller: for [`map`]'s `f`.
-#[inline(always)]
-pub fn exp_inline(x: f64) -> f64 {
-    exp_body(x)
+/// `1 / (1 + exp(-v))` for each of `values`, in place: a negation pass, [`exp_in_place`], then the
+/// division pass. Each step is correctly rounded value by value, so the bits are the expression's
+/// as one value at a time computes it.
+pub fn sigmoid_in_place(values: &mut [f64]) {
+    for v in values.iter_mut() {
+        *v = -*v;
+    }
+    exp_in_place(values);
+    for v in values.iter_mut() {
+        *v = 1.0 / (1.0 + *v);
+    }
 }
 
 // x + y and its rounding error, for |x| >= |y| (or x = 0)

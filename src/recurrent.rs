@@ -37,7 +37,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::array::{RustArray, Shape};
-use crate::cr_exp::exp;
+use crate::cr_exp::{exp_in_place, sigmoid_in_place};
 use crate::fused::{affine_forward_batch, layer_accumulate_gradient_batch};
 use crate::linalg::{matmul, matmul_add, matmul_nt};
 use crate::ops::same_shape_elementwise;
@@ -74,14 +74,18 @@ pub(crate) fn features_per_token(tokens: usize, width: usize, context: &str) -> 
     Ok(width / tokens)
 }
 
-fn sigmoid(x: f64) -> f64 {
-    1.0 / (1.0 + exp(-x))
-}
-
-/// The workplan's W15: through `exp`, as `sigmoid`, so it agrees where `exp` does. A large `x`
-/// overflows `exp(2x)` to infinity and gives exactly 1; a large negative `x` exactly -1.
-fn tanh(x: f64) -> f64 {
-    1.0 - 2.0 / (exp(2.0 * x) + 1.0)
+/// `1 - 2 / (exp(2x) + 1)` for each of `values`, in place. The workplan's W15: through `exp`, as
+/// `sigmoid`, so it agrees where `exp` does. A large `x` overflows `exp(2x)` to infinity and gives
+/// exactly 1; a large negative `x` exactly -1. Doubling is exact, and each pass rounds value by
+/// value, so the bits are the expression's.
+fn tanh_in_place(values: &mut [f64]) {
+    for v in values.iter_mut() {
+        *v *= 2.0;
+    }
+    exp_in_place(values);
+    for v in values.iter_mut() {
+        *v = 1.0 - 2.0 / (*v + 1.0);
+    }
 }
 
 /// Columns `start..end` of a `cols`-wide matrix, a copy.
@@ -278,14 +282,15 @@ pub fn gru_forward(
     let mut r = Vec::with_capacity(rows * s);
     let mut z = Vec::with_capacity(rows * s);
     for gates in rz.chunks_exact(2 * s) {
-        r.extend(gates[..s].iter().map(|&v| sigmoid(v)));
-        z.extend(gates[s..].iter().map(|&v| sigmoid(v)));
+        r.extend_from_slice(&gates[..s]);
+        z.extend_from_slice(&gates[s..]);
     }
+    sigmoid_in_place(&mut r);
+    sigmoid_in_place(&mut z);
     let rc = RustArray::from_matrix(same_shape_elementwise(&r, &c.data, |x, y| x * y), rows, s);
     let h_state = matmul_nt(&rc, &row_block(u_weights, s, 2 * s, 3 * s))?;
-    let h_tilde = same_shape_elementwise(&columns(&a, 3 * s, 2 * s, 3 * s).data, &h_state.data, |x, y| {
-        tanh(x + y)
-    });
+    let mut h_tilde = same_shape_elementwise(&columns(&a, 3 * s, 2 * s, 3 * s).data, &h_state.data, |x, y| x + y);
+    tanh_in_place(&mut h_tilde);
     let h = z
         .iter()
         .zip(&c.data)
@@ -536,12 +541,9 @@ pub fn soft_codes_forward(
             .iter()
             .fold(distances[0], |m, &d| if d < m { d } else { m });
         let start = weights.len();
-        weights.extend(
-            distances
-                .iter()
-                .map(|&d| crate::cr_exp::exp_inline(-(d - least) / temperature)),
-        );
+        weights.extend(distances.iter().map(|&d| -(d - least) / temperature));
         let row_weights = &mut weights[start..];
+        exp_in_place(row_weights);
         let total = row_weights[1..].iter().fold(row_weights[0], |acc, &a| acc + a);
         for w in row_weights.iter_mut() {
             *w /= total;

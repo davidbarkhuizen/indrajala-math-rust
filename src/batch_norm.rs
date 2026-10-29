@@ -21,7 +21,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::array::{RustArray, Shape};
-use crate::cr_exp::exp;
+use crate::cr_exp::sigmoid_in_place;
 use crate::linalg::{matmul, matmul_add, matmul_nt};
 use crate::scalar::relu;
 
@@ -43,11 +43,11 @@ impl Activation {
         }
     }
 
-    /// `fused.rs`'s sigmoid and ReLU, per value.
-    fn apply(self, y: f64) -> f64 {
+    /// `fused.rs`'s sigmoid and ReLU, in place.
+    fn apply(self, values: &mut [f64]) {
         match self {
-            Activation::Sigmoid => 1.0 / (1.0 + exp(-y)),
-            Activation::Relu => relu(y),
+            Activation::Sigmoid => sigmoid_in_place(values),
+            Activation::Relu => values.iter_mut().for_each(|v| *v = relu(*v)),
         }
     }
 }
@@ -229,10 +229,11 @@ pub fn batch_norm_forward(
         context,
     )?;
     let std: Vec<f64> = running_var.data.iter().map(|&v| (v + epsilon).sqrt()).collect();
-    let data = map_channels(&x.data, channels, positions, |v, j| {
+    let mut data = map_channels(&x.data, channels, positions, |v, j| {
         let xhat = (v - running_mean.data[j]) / std[j];
-        activation.apply(gamma.data[j] * xhat + beta.data[j])
+        gamma.data[j] * xhat + beta.data[j]
     });
+    activation.apply(&mut data);
     Ok(RustArray { data, shape: x.shape })
 }
 
@@ -311,9 +312,9 @@ pub fn batch_norm_forward_batch(
         let group_var: Vec<f64> = ss.iter().map(|&s| s / m).collect();
         let group_std: Vec<f64> = group_var.iter().map(|&v| (v + epsilon).sqrt()).collect();
         let group_xhat = map_channels(&group_d, c, p, |v, j| v / group_std[j]);
-        a.extend(map_channels(&group_xhat, c, p, |v, j| {
-            activation.apply(gamma.data[j] * v + beta.data[j])
-        }));
+        let mut group_a = map_channels(&group_xhat, c, p, |v, j| gamma.data[j] * v + beta.data[j]);
+        activation.apply(&mut group_a);
+        a.extend(group_a);
 
         for j in 0..c {
             new_running_mean[j] = (1.0 - running_rate) * new_running_mean[j] + running_rate * mu[j];

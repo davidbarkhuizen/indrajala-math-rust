@@ -148,7 +148,8 @@ pub fn array_dropout_mask(
 pub fn array_softmax(arr: &RustArray) -> RustArray {
     fn normalize_row(row: &[f64]) -> Vec<f64> {
         let max_value = row.iter().fold(f64::NEG_INFINITY, |running, &v| max(running, v));
-        let exp_values = crate::cr_exp::map(row, |v| crate::cr_exp::exp_inline(v - max_value));
+        let mut exp_values: Vec<f64> = row.iter().map(|&v| v - max_value).collect();
+        crate::cr_exp::exp_in_place(&mut exp_values);
         let total = exp_values.iter().fold(0.0, |acc, &e| acc + e);
         exp_values.iter().map(|&e| e / total).collect()
     }
