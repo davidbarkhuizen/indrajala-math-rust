@@ -1,0 +1,14 @@
+# Where the linker places a kernel must not change its speed, or an A/B can't tell one change's
+# effect from the shuffle it causes everywhere else (indrajala-ml's crate kernels workplan, D7).
+# Layout only: no operation changes, so no bit moves.
+
+# x86_64: no branch crosses or ends on a 32-byte boundary, so the Skylake-derived cores' JCC erratum
+# mitigation (which drops such branches from the micro-op cache) can't tax a kernel by its
+# placement; on jebel (i7-9700K) unchanged kernels moved 10-90% with placement alone.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "llvm-args=-x86-branches-within-32B-boundaries"]
+
+# aarch64: loops and functions aligned to 64 bytes; on litshe (Cortex-A76) unchanged kernels moved
+# 10-28% with placement alone.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "llvm-args=-align-loops=64", "-C", "llvm-args=-align-all-functions=6"]
