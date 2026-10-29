@@ -137,7 +137,7 @@ def test_the_vector_lanes_match_the_scalar_exp_on_random_bits_and_the_range():
         vector = np.array(result.tolist()).view(np.uint64)
         assert np.isnan(vector.view(np.float64)[nan]).all()
         wrong = np.flatnonzero((vector != scalar) & ~nan)
-        assert wrong.size == 0, [values[i].hex() for i in wrong[:5]]
+        assert wrong.size == 0, [float(values[i]).hex() for i in wrong[:5]]
 
 
 def test_the_vector_lanes_redo_only_the_rare_values():
