@@ -164,6 +164,7 @@ fn deltas_by_channel(delta: &Array, n: usize, o: usize, p: usize) -> Array {
 /// only `cols` and `A` are batch-sized, and each is written once, in order; the example's slab
 /// of `cols` and its 43 KB product are still in cache when they are read. The product runs on
 /// one thread: threading the whole batch's product over its rows made no difference at N = 512.
+#[inline]
 pub fn conv_forward_batch(w: &Array, x: &Array, b: &Array, geometry: &ConvGeometry) -> Result<(Array, Array), Error> {
     let o = channel_count(w, geometry, "conv_forward_batch")?;
     if b.shape != Shape::Vector(o) {
@@ -212,6 +213,7 @@ pub fn conv_forward_batch(w: &Array, x: &Array, b: &Array, geometry: &ConvGeomet
 ///
 /// Its own copy of `conv_forward_batch`'s body, not a shared helper: with the body shared, the
 /// conv mini-batch op profile put `conv_forward_batch` 8-17% above its unshared form.
+#[inline]
 pub fn conv_linear_forward_batch(w: &Array, x: &Array, geometry: &ConvGeometry) -> Result<(Array, Array), Error> {
     let o = channel_count(w, geometry, "conv_linear_forward_batch")?;
     let (n, is_vector) = require_batch(x, geometry.input_size, "conv_linear_forward_batch X")?;
