@@ -1,7 +1,9 @@
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 
-use crate::array::{RustArray, Shape};
+use crate::array::RustArray;
+use crate::linalg::py_err;
+use indrajala_math::Array;
 
 /// Accepts a Python int or float as a scalar operand (`grad_W / batch_size` passes a Python
 /// int) - numpy itself accepts either for a scalar operation, so this core does too.
@@ -15,58 +17,20 @@ fn extract_scalar(value: &Bound<'_, PyAny>) -> PyResult<f64> {
     Err(PyTypeError::new_err("expected a numeric scalar"))
 }
 
-// pub(crate): fused.rs's layer_apply_accumulated_gradient reuses this directly rather than
-// hand-writing the same zip/map loop for its own W/grad_W and b/grad_b scaled-subtract pairs.
-pub(crate) fn same_shape_elementwise(a: &[f64], b: &[f64], op: impl Fn(f64, f64) -> f64) -> Vec<f64> {
-    a.iter().zip(b.iter()).map(|(&x, &y)| op(x, y)).collect()
-}
-
-fn scalar_elementwise(a: &[f64], scalar: f64, op: impl Fn(f64, f64) -> f64) -> Vec<f64> {
-    a.iter().map(|&x| op(x, scalar)).collect()
-}
-
-/// Broadcasts `vector` (length `cols`) across every row of a `rows x cols` matrix - the one
-/// broadcasting case this core needs, alongside plain same-shape elementwise addition
-/// (`X @ self.W.T + self.b`).
-fn broadcast_row(matrix: &[f64], rows: usize, cols: usize, vector: &[f64], op: impl Fn(f64, f64) -> f64) -> Vec<f64> {
-    let mut out = Vec::with_capacity(rows * cols);
-    for row in 0..rows {
-        for col in 0..cols {
-            out.push(op(matrix[row * cols + col], vector[col]));
-        }
-    }
-    out
-}
+pub(crate) use indrajala_math::ops::scalar_elementwise;
 
 impl RustArray {
+    /// The core's `combine_with_array`, raised as `ValueError`; for the bindings' own modules.
     pub(crate) fn combine_with_array(
         &self,
         other: &RustArray,
         op: impl Fn(f64, f64) -> f64,
         op_name: &str,
     ) -> PyResult<RustArray> {
-        match (self.shape, other.shape) {
-            (Shape::Matrix(rows, cols), Shape::Vector(n)) if n == cols => Ok(RustArray::from_matrix(
-                broadcast_row(&self.data, rows, cols, &other.data, &op),
-                rows,
-                cols,
-            )),
-            (Shape::Vector(n), Shape::Matrix(rows, cols)) if n == cols => Ok(RustArray::from_matrix(
-                broadcast_row(&other.data, rows, cols, &self.data, |matrix_value, vector_value| {
-                    op(vector_value, matrix_value)
-                }),
-                rows,
-                cols,
-            )),
-            (a_shape, b_shape) if a_shape == b_shape => Ok(RustArray {
-                data: same_shape_elementwise(&self.data, &other.data, op),
-                shape: self.shape,
-            }),
-            (a_shape, b_shape) => Err(PyValueError::new_err(format!(
-                "cannot {op_name} arrays of shape {:?} and {:?}",
-                a_shape, b_shape
-            ))),
-        }
+        self.0
+            .combine_with_array(other, op, op_name)
+            .map(RustArray::from)
+            .map_err(py_err)
     }
 }
 
@@ -77,10 +41,9 @@ impl RustArray {
             self.combine_with_array(&other_ref, |a, b| a + b, "add")
         } else {
             let scalar = extract_scalar(other)?;
-            Ok(RustArray {
-                data: scalar_elementwise(&self.data, scalar, |a, b| a + b),
-                shape: self.shape,
-            })
+            Ok(RustArray(
+                Array::new(scalar_elementwise(self.0.data(), scalar, |a, b| a + b), self.0.shape()).map_err(py_err)?,
+            ))
         }
     }
 
@@ -89,10 +52,9 @@ impl RustArray {
             self.combine_with_array(&other_ref, |a, b| a - b, "subtract")
         } else {
             let scalar = extract_scalar(other)?;
-            Ok(RustArray {
-                data: scalar_elementwise(&self.data, scalar, |a, b| a - b),
-                shape: self.shape,
-            })
+            Ok(RustArray(
+                Array::new(scalar_elementwise(self.0.data(), scalar, |a, b| a - b), self.0.shape()).map_err(py_err)?,
+            ))
         }
     }
 
@@ -101,10 +63,9 @@ impl RustArray {
     /// array-minus-array.
     fn __rsub__(&self, other: &Bound<'_, PyAny>) -> PyResult<RustArray> {
         let scalar = extract_scalar(other)?;
-        Ok(RustArray {
-            data: scalar_elementwise(&self.data, scalar, |a, b| b - a),
-            shape: self.shape,
-        })
+        Ok(RustArray(
+            Array::new(scalar_elementwise(self.0.data(), scalar, |a, b| b - a), self.0.shape()).map_err(py_err)?,
+        ))
     }
 
     fn __mul__(&self, other: &Bound<'_, PyAny>) -> PyResult<RustArray> {
@@ -112,10 +73,9 @@ impl RustArray {
             self.combine_with_array(&other_ref, |a, b| a * b, "multiply")
         } else {
             let scalar = extract_scalar(other)?;
-            Ok(RustArray {
-                data: scalar_elementwise(&self.data, scalar, |a, b| a * b),
-                shape: self.shape,
-            })
+            Ok(RustArray(
+                Array::new(scalar_elementwise(self.0.data(), scalar, |a, b| a * b), self.0.shape()).map_err(py_err)?,
+            ))
         }
     }
 
@@ -131,20 +91,18 @@ impl RustArray {
             self.combine_with_array(&other_ref, |a, b| a / b, "divide")
         } else {
             let scalar = extract_scalar(other)?;
-            Ok(RustArray {
-                data: scalar_elementwise(&self.data, scalar, |a, b| a / b),
-                shape: self.shape,
-            })
+            Ok(RustArray(
+                Array::new(scalar_elementwise(self.0.data(), scalar, |a, b| a / b), self.0.shape()).map_err(py_err)?,
+            ))
         }
     }
 
-    /// A true in-place op (mutates `self.data` directly, `&mut self` with a `()` return) -
+    /// A true in-place op (replaces the array's values, `&mut self` with a `()` return) -
     /// `self._grad_W += ...` every training step should not allocate a fresh Python object on
     /// every call.
     fn __iadd__(&mut self, other: &Bound<'_, PyAny>) -> PyResult<()> {
         let result = self.__add__(other)?;
-        self.data = result.data;
-        self.shape = result.shape;
+        self.0 = result.0;
         Ok(())
     }
 
@@ -153,8 +111,7 @@ impl RustArray {
     /// `apply_accumulated_gradient` call (`self.W -= ...`).
     fn __isub__(&mut self, other: &Bound<'_, PyAny>) -> PyResult<()> {
         let result = self.__sub__(other)?;
-        self.data = result.data;
-        self.shape = result.shape;
+        self.0 = result.0;
         Ok(())
     }
 }

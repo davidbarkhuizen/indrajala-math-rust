@@ -1,0 +1,17 @@
+Generator uniform 1000	8f5080082b5036d0 1000
+conv_forward_batch 28 x 28, 8 ch	b4abbedea4f28a53 34476
+exp	1ccc2021d0ddd6e2 1009
+gru_forward 4 x 6, state 5	f66e364f4f624391 100
+layer_forward_batch 30 x 784, b5	41a0ffa16f7e9661 150
+layer_norm_forward_batch 4 x 3 tokens x 8	e40a0789ef0b47f4 204
+matmul 256 x 256 @ 256 x 256 (threaded)	0ac54c85d42109e7 65536
+matmul 37 x 29 @ 29 x 13	4efe754dc914e0e6 481
+matmul matrix @ vector 30 x 784	40064de6f9502152 30
+matmul vector @ matrix 30 x 784	c7c04b9ea0c5d19e 784
+matmul_add 30 x 33 @ 33 x 13	046db239f4e4bb9a 390
+matmul_long_k 8 x 4100 @ 4100 x 75	db182ed827d9ddcc 600
+matmul_nt 33 x 5408, 31 x 5408	94f53cf05f627cb3 1023
+max_pool_forward_batch 26 x 26, 8 ch	0b09a5776571f29e 8112
+outer 17 x 23	e6810c1826d7d712 391
+softmax 7 x 10	85ef1bcae248578d 70
+transpose 515 x 31	0fa8fafa0fcd0a8c 15965

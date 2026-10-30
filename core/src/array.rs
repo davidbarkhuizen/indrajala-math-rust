@@ -1,10 +1,14 @@
 //! The array type: a flat, row-major `f64` buffer with a 1D or 2D shape.
 
+use crate::Error;
+
 /// This core only ever needs a 1D vector or a 2D matrix; general N-dimensional machinery is
 /// deliberately not built here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shape {
+    /// A 1D vector of this length.
     Vector(usize),
+    /// A `rows x cols` matrix, row-major.
     Matrix(usize, usize),
 }
 
@@ -18,22 +22,28 @@ impl Shape {
     }
 }
 
-/// An owned array: `data` holds `shape.size()` values, row-major.
+/// An array: `data` holds `shape.size()` values, row-major. Every operation borrows its operands
+/// (`&Array`) and returns a new array.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Array {
-    pub data: Vec<f64>,
-    pub shape: Shape,
+    /// The values, row-major: `shape.size()` of them, an invariant every constructor keeps.
+    pub(crate) data: Vec<f64>,
+    /// 1D or 2D.
+    pub(crate) shape: Shape,
 }
-
-/// A borrowed array, what every operation reads: the same layout as [`Array`], so a caller that
-/// holds its values elsewhere (the Python bindings' `Array`) passes them without a copy.
-#[derive(Clone, Copy, Debug)]
-pub struct ArrayView<'a> {
-    pub data: &'a [f64],
-    pub shape: Shape,
-}
-
 impl Array {
+    /// `data` in `shape`, if it holds `shape.size()` values.
+    pub fn new(data: Vec<f64>, shape: Shape) -> Result<Self, Error> {
+        if data.len() != shape.size() {
+            return Err(Error::invalid(format!(
+                "an array of shape {shape:?} holds {} values, got {}",
+                shape.size(),
+                data.len()
+            )));
+        }
+        Ok(Array { data, shape })
+    }
+
     /// A 1D array of `data`.
     pub fn from_vector(data: Vec<f64>) -> Self {
         let shape = Shape::Vector(data.len());
@@ -41,52 +51,78 @@ impl Array {
     }
 
     /// A `rows x cols` array of `data`, row-major.
+    ///
+    /// # Panics
+    ///
+    /// If `data` doesn't hold `rows * cols` values ([`Array::new`] returns the error instead).
     pub fn from_matrix(data: Vec<f64>, rows: usize, cols: usize) -> Self {
+        assert_eq!(data.len(), rows * cols, "from_matrix: {rows} x {cols} values expected");
         Array {
             data,
             shape: Shape::Matrix(rows, cols),
         }
     }
 
-    /// This array, borrowed.
-    pub fn view(&self) -> ArrayView<'_> {
-        ArrayView {
-            data: &self.data,
-            shape: self.shape,
-        }
+    /// The values, row-major.
+    pub fn data(&self) -> &[f64] {
+        &self.data
+    }
+
+    /// The values, row-major, to change in place (their count can't change).
+    pub fn data_mut(&mut self) -> &mut [f64] {
+        &mut self.data
+    }
+
+    /// The shape.
+    pub fn shape(&self) -> Shape {
+        self.shape
+    }
+
+    /// The values, row-major, moved out.
+    pub fn into_data(self) -> Vec<f64> {
+        self.data
     }
 }
 
-/// `a`'s transpose: a copy on 1D (numpy's `.T` is a no-op there), the real transpose on 2D.
-#[inline]
-pub fn transpose(a: ArrayView<'_>) -> Array {
-    match a.shape {
-        Shape::Vector(_) => Array {
-            data: a.data.to_vec(),
-            shape: a.shape,
-        },
-        Shape::Matrix(rows, cols) => {
-            // In 8 x 8 blocks, so each block reads 8 source lines and writes 8 whole output
-            // lines. A row-by-row loop writes a line per element at a stride of `rows`; at
-            // 512 rows that stride is 4 KB, every write lands in the same L1 set, and the
-            // (512, 30) delta_batch.T of the dense accumulate took 87-107 µs against numpy's
-            // 8-12. A copy, so bit-identical in any order.
-            const BLOCK: usize = 8;
-            let mut out = vec![0.0; rows * cols];
-            for row_start in (0..rows).step_by(BLOCK) {
-                let row_end = (row_start + BLOCK).min(rows);
-                for col_start in (0..cols).step_by(BLOCK) {
-                    let col_end = (col_start + BLOCK).min(cols);
-                    #[cfg(target_arch = "aarch64")]
-                    // Safety: the block lies within both `a.data` and `out`.
-                    unsafe {
-                        transpose_block_neon(a.data, &mut out, rows, cols, row_start..row_end, col_start..col_end);
+impl Array {
+    /// This array's transpose: a copy on 1D (numpy's `.T` is a no-op there), the real transpose on 2D.
+    #[inline]
+    pub fn transpose(&self) -> Array {
+        match self.shape {
+            Shape::Vector(_) => Array {
+                data: self.data.clone(),
+                shape: self.shape,
+            },
+            Shape::Matrix(rows, cols) => {
+                // In 8 x 8 blocks, so each block reads 8 source lines and writes 8 whole output
+                // lines. A row-by-row loop writes a line per element at a stride of `rows`; at
+                // 512 rows that stride is 4 KB, every write lands in the same L1 set, and the
+                // (512, 30) delta_batch.T of the dense accumulate took 87-107 µs against numpy's
+                // 8-12. A copy, so bit-identical in any order.
+                const BLOCK: usize = 8;
+                let mut out = vec![0.0; rows * cols];
+                for row_start in (0..rows).step_by(BLOCK) {
+                    let row_end = (row_start + BLOCK).min(rows);
+                    for col_start in (0..cols).step_by(BLOCK) {
+                        let col_end = (col_start + BLOCK).min(cols);
+                        #[cfg(target_arch = "aarch64")]
+                        // Safety: the block lies within both `self.data` and `out`.
+                        unsafe {
+                            transpose_block_neon(
+                                &self.data,
+                                &mut out,
+                                rows,
+                                cols,
+                                row_start..row_end,
+                                col_start..col_end,
+                            );
+                        }
+                        #[cfg(not(target_arch = "aarch64"))]
+                        transpose_block(&self.data, &mut out, rows, cols, row_start..row_end, col_start..col_end);
                     }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    transpose_block(a.data, &mut out, rows, cols, row_start..row_end, col_start..col_end);
                 }
+                Array::from_matrix(out, cols, rows)
             }
-            Array::from_matrix(out, cols, rows)
         }
     }
 }

@@ -15,7 +15,7 @@
 //!
 //! Copyright (c) 2022-2026 Alexei Sibidanov <sibid@uvic.ca>.
 //!
-//! This file is part of the CORE-MATH project (https://core-math.gitlabpages.inria.fr/).
+//! This file is part of the CORE-MATH project (<https://core-math.gitlabpages.inria.fr/>).
 //!
 //! Permission is hereby granted, free of charge, to any person obtaining a copy of this software
 //! and associated documentation files (the "Software"), to deal in the Software without

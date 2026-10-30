@@ -1,503 +1,13 @@
-//! Multi-head self-attention (indrajala-ml's multi-head attention workplan, D4): one Rust function
-//! per pass of `AttentionArrayLayer` in `indrajala_ml/model/layers/numpy/attention_array_layer.py`,
-//! each one call, so a pass crosses the Python/Rust boundary once. Each pass is a thin wrapper
-//! that validates the shapes, builds an `AttentionOptions` and composes the crate-internal blocks,
-//! project, attend and combine, in indrajala-ml's README's expressions (Layer norm and attention)
-//! and their grouping, with `h` heads of `d_k` features and `[i]` head `i`'s block:
-//!
-//! ```text
-//! project   Q = X Wq^T + bq;  K = X Wk^T + bk;  V = X Wv^T + bv           (T, h·d_k) each
-//! attend    S[i] = (Q[i] K[i]^T) / s;  S[i]_tj = -inf for j > t if causal
-//!           P[i] = softmax_rows(S[i]);  H[i] = P[i] V[i]
-//! combine   H = [H[0] ... H[h-1]];  out = H Wo^T + bo
-//! backward  dH = delta Wo
-//!           dP[i] = dH[i] V[i]^T;  dV[i] = P[i]^T dH[i];  dS[i] = P[i] * (dP[i] - rowsum(dP[i] * P[i]))
-//!           dQ[i] = (dS[i] K[i]) / s;  dK[i] = (dS[i]^T Q[i]) / s
-//!           dX = (dQ Wq + dK Wk) + dV Wv
-//! ```
-//!
-//! with `s = sqrt(d_k)`. Each block is composed of the crate's existing ops, so it has their bits:
-//! project, combine and the parameter gradients are a dense layer's on the `(N * T, d)` and
-//! `(N * T, h·d_k)` rows (`affine_forward_batch`, `layer_downstream_batch`,
-//! `layer_accumulate_gradient_batch`), one product over all heads; attend's products, per example
-//! and head, are `@` (`matmul`) on `(T, d_k)` and `(T, T)` matrices, a transpose copied first as
-//! Python's `a @ b.T` copies it; the row softmax is `array_softmax`; `rowsum` is a left fold from
-//! `0.0` over each row. At one head with `d_k = d` every expression is the single head's.
-//!
-//! A causal mask (indrajala-ml's sequence task workplan, D7) sets each score `S_tj` with `j > t`
-//! to `-inf` after the scale and before the row max, as numpy's `AttentionArrayLayer` does: the row
-//! max comes from the unmasked scores (the diagonal never is), `exp(-inf)` is exactly 0, so a
-//! masked `P_tj` is exactly 0 and so is its `dS_tj`. The backward pass reads `P` and needs no mask,
-//! so only the forward ops take `causal`. An unmasked pass computes what it did before the mask.
-//!
-//! Dropout on `P` (indrajala-ml's attention-dropout workplan, D3-D5): a training pass with
-//! `dropout > 0` draws a 0/1 mask `M[i]` per example and head from the network's `Generator`, `T²`
-//! values each in (example, head, query, key) order, numpy's row-major `(N, h, T, T)` draw, every
-//! entry drawn, the causally masked ones included; `M_tj = u_tj >= dropout`. Then
-//!
-//! ```text
-//! attend    P~[i] = P[i] * M[i] / keep;  H[i] = P~[i] V[i]
-//! backward  dP[i] = (dH[i] V[i]^T) * M[i] / keep;  dV[i] = P~[i]^T dH[i]
-//! ```
-//!
-//! with `keep = 1 - dropout`, the softmax's backward reading the undropped `P`. The forward ops
-//! return `M`, packed as `P`, which the backward op takes; `P~` is recomputed from `P` and `M`, the
-//! same elementwise expression and so the same bits. Without `training`, and at `dropout = 0`,
-//! nothing is drawn, the mask is `None` and every op computes what it did before dropout.
-//!
-//! Rotary positions (indrajala-ml's rotary-positions workplan, D3-D5): a pass given `cos` and
-//! `sin`, `(T, d_k / 2)` each, row `t` token `t`'s angles, ends project by rotating each head's
-//! `Q` and `K`, after the biases, feature `j < d_k / 2` paired with `j + d_k / 2`:
-//!
-//! ```text
-//! project   q'_j = q_j c - q_{j+d_k/2} s;  q'_{j+d_k/2} = q_j s + q_{j+d_k/2} c    (k likewise)
-//! backward  dq_j = dq'_j c + dq'_{j+d_k/2} s;  dq_{j+d_k/2} = dq'_{j+d_k/2} c - dq'_j s
-//! ```
-//!
-//! each entry two products and a sum, numpy's elementwise expressions, so the same bits. The
-//! caches `q` and `k` are the rotated ones, which attend reads; the downstream op rotates `dQ` and
-//! `dK` back before project's products and returns them so, the gradients of the unrotated `Q` and
-//! `K`, which the gradient op takes as before, so it needs no table. `V` isn't rotated. Without a
-//! table every op computes what it did before rotation.
-//!
-//! The caches are packed: `Q`, `K`, `V`, `H` and their gradients `(N * T, h·d_k)`, head `i` in
-//! columns `i·d_k..`, and `P` `(N * T, h·T)`, head `i` in columns `i·T..`.
+//! The bindings of the core's `attention` (`indrajala_math::attention`): each `#[pyfunction]` lends its
+//! arrays to the core's and moves the results in.
 
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-use crate::array::{RustArray, Shape};
-use crate::fused::{affine_forward_batch, layer_accumulate_gradient_batch, layer_downstream_batch};
+use crate::array::RustArray;
 use crate::generator::Generator;
-use crate::linalg::matmul;
-use crate::ufuncs::array_softmax;
+use crate::linalg::py_err;
 
-/// What attend reads besides `Q`, `K` and `V`: the head count, each head's width, whether the
-/// scores are masked causally and the drop probability of each weight in training.
-#[derive(Clone, Copy)]
-struct AttentionOptions {
-    heads: usize,
-    key_size: usize,
-    causal: bool,
-    dropout: f64,
-}
-
-impl AttentionOptions {
-    /// `heads` heads across the projections' `width = h·d_k` columns, `dropout` in `[0, 1)`.
-    fn new(heads: usize, width: usize, causal: bool, dropout: f64, context: &str) -> PyResult<Self> {
-        if heads == 0 || width == 0 || !width.is_multiple_of(heads) {
-            return Err(PyValueError::new_err(format!(
-                "{context} requires heads >= 1 dividing the projections' width {width}, got heads={heads}"
-            )));
-        }
-        if !(0.0..1.0).contains(&dropout) {
-            return Err(PyValueError::new_err(format!(
-                "{context} requires a dropout in [0, 1), got {dropout}"
-            )));
-        }
-        Ok(AttentionOptions {
-            heads,
-            key_size: width / heads,
-            causal,
-            dropout,
-        })
-    }
-
-    /// `1 - dropout`, each kept weight's divisor.
-    fn keep(&self) -> f64 {
-        1.0 - self.dropout
-    }
-
-    /// `h·d_k`, the projections' width.
-    fn width(&self) -> usize {
-        self.heads * self.key_size
-    }
-
-    /// `sqrt(d_k)`, computed once and divided by, never multiplied by its reciprocal.
-    fn scale(&self) -> f64 {
-        (self.key_size as f64).sqrt()
-    }
-}
-
-/// The weights and biases in their order, which is also their draw order.
-struct Projections<'a> {
-    wq: &'a RustArray,
-    bq: &'a RustArray,
-    wk: &'a RustArray,
-    bk: &'a RustArray,
-    wv: &'a RustArray,
-    bv: &'a RustArray,
-    wo: &'a RustArray,
-    bo: &'a RustArray,
-}
-
-/// A rotary pass's table (indrajala-ml's rotary-positions workplan, D4, D5): `cos` and `sin`,
-/// `(T, d_k / 2)` each, row `t` token `t`'s angles, computed by the caller.
-#[derive(Clone, Copy)]
-struct Rotation<'a> {
-    cos: &'a RustArray,
-    sin: &'a RustArray,
-}
-
-impl<'a> Rotation<'a> {
-    /// The table from the ops' `cos` and `sin` keywords: both or neither, each `(T, d_k / 2)` with
-    /// `d_k` even.
-    fn new(
-        cos: Option<&'a RustArray>,
-        sin: Option<&'a RustArray>,
-        tokens: usize,
-        options: &AttentionOptions,
-        context: &str,
-    ) -> PyResult<Option<Self>> {
-        let (cos, sin) = match (cos, sin) {
-            (None, None) => return Ok(None),
-            (Some(cos), Some(sin)) => (cos, sin),
-            _ => {
-                return Err(PyValueError::new_err(format!(
-                    "{context} requires both cos and sin to rotate, or neither"
-                )));
-            }
-        };
-        if !options.key_size.is_multiple_of(2) {
-            return Err(PyValueError::new_err(format!(
-                "{context} requires an even head size to rotate, got d_k={}",
-                options.key_size
-            )));
-        }
-        let shape = Shape::Matrix(tokens, options.key_size / 2);
-        require_shape(cos, shape, "cos", context)?;
-        require_shape(sin, shape, "sin", context)?;
-        Ok(Some(Rotation { cos, sin }))
-    }
-
-    /// The packed `(N * T, h·d_k)` rows `m`, each head's features `j` and `j + d_k / 2` rotated by
-    /// the row's token's angles: `(a c - b s, a s + b c)`; or back, `inverse`, by the transpose:
-    /// `(a c + b s, b c - a s)`. Each entry two products and a sum, as numpy's elementwise
-    /// expressions, so the same bits.
-    fn rotated(&self, m: &RustArray, tokens: usize, options: &AttentionOptions, inverse: bool) -> RustArray {
-        let (d_k, width) = (options.key_size, options.width());
-        let half = d_k / 2;
-        let mut data = m.data.clone();
-        for (r, (row, out)) in m.data.chunks_exact(width).zip(data.chunks_exact_mut(width)).enumerate() {
-            let t = r % tokens;
-            let (cos, sin) = (
-                &self.cos.data[t * half..(t + 1) * half],
-                &self.sin.data[t * half..(t + 1) * half],
-            );
-            for i in 0..options.heads {
-                let (first, second) = out[i * d_k..(i + 1) * d_k].split_at_mut(half);
-                let (a_row, b_row) = row[i * d_k..(i + 1) * d_k].split_at(half);
-                for j in 0..half {
-                    let (a, b, c, s) = (a_row[j], b_row[j], cos[j], sin[j]);
-                    if inverse {
-                        first[j] = a * c + b * s;
-                        second[j] = b * c - a * s;
-                    } else {
-                        first[j] = a * c - b * s;
-                        second[j] = a * s + b * c;
-                    }
-                }
-            }
-        }
-        RustArray { data, shape: m.shape }
-    }
-}
-
-fn require_shape(array: &RustArray, shape: Shape, name: &str, context: &str) -> PyResult<()> {
-    if array.shape != shape {
-        return Err(PyValueError::new_err(format!(
-            "{context} requires {name} of shape {shape:?}, got {:?}",
-            array.shape
-        )));
-    }
-    Ok(())
-}
-
-/// `wq`, `wk`, `wv` `(h·d_k, d)` and `wo` `(d, h·d_k)`, `d` and `width` given.
-fn require_weights(weights: [&RustArray; 4], d: usize, width: usize, context: &str) -> PyResult<()> {
-    let [wq, wk, wv, wo] = weights;
-    for (w, name) in [(wq, "wq"), (wk, "wk"), (wv, "wv")] {
-        require_shape(w, Shape::Matrix(width, d), name, context)?;
-    }
-    require_shape(wo, Shape::Matrix(d, width), "wo", context)
-}
-
-/// `(d, options)`, `d` the token width (`bo`'s length) and the projections' width `bq`'s: every
-/// projection's weight and bias shaped to them.
-fn shapes(
-    projections: &Projections,
-    heads: usize,
-    causal: bool,
-    dropout: f64,
-    context: &str,
-) -> PyResult<(usize, AttentionOptions)> {
-    let (d, width) = (projections.bo.data.len(), projections.bq.data.len());
-    if d == 0 {
-        return Err(PyValueError::new_err(format!("{context} requires a non-empty bo")));
-    }
-    let options = AttentionOptions::new(heads, width, causal, dropout, context)?;
-    let weights = [projections.wq, projections.wk, projections.wv, projections.wo];
-    require_weights(weights, d, width, context)?;
-    for (b, name) in [(projections.bq, "bq"), (projections.bk, "bk"), (projections.bv, "bv")] {
-        require_shape(b, Shape::Vector(width), name, context)?;
-    }
-    require_shape(projections.bo, Shape::Vector(d), "bo", context)?;
-    Ok((d, options))
-}
-
-/// `(examples, tokens)` of `x`, 1D (one example) or 2D, `T * d` values per example.
-fn examples_and_tokens(x: &RustArray, d: usize, name: &str, context: &str) -> PyResult<(usize, usize)> {
-    let (rows, width) = match x.shape {
-        Shape::Vector(n) => (1, n),
-        Shape::Matrix(rows, n) => (rows, n),
-    };
-    if d == 0 || width == 0 || !width.is_multiple_of(d) {
-        return Err(PyValueError::new_err(format!(
-            "{context} requires {name} of whole tokens of {d} features per example, got shape {:?}",
-            x.shape
-        )));
-    }
-    Ok((rows, width / d))
-}
-
-/// `x`'s rows of `d`: `(N * T, d)`, the same values.
-fn token_rows(x: &RustArray, d: usize) -> RustArray {
-    RustArray::from_matrix(x.data.clone(), x.data.len() / d, d)
-}
-
-fn columns(m: &RustArray) -> usize {
-    match m.shape {
-        Shape::Matrix(_, width) => width,
-        Shape::Vector(width) => width,
-    }
-}
-
-/// Example `n`'s head `i`: the `(T, width)` block of an `(N * T, h * width)` matrix at rows
-/// `n·T..` and columns `i·width..`, copied; in one piece when the block spans whole rows.
-fn head(m: &RustArray, n: usize, i: usize, tokens: usize, width: usize) -> RustArray {
-    let stride = columns(m);
-    let rows = &m.data[n * tokens * stride..(n + 1) * tokens * stride];
-    let block = if width == stride {
-        rows.to_vec()
-    } else {
-        let mut block = Vec::with_capacity(tokens * width);
-        for row in rows.chunks_exact(stride) {
-            block.extend_from_slice(&row[i * width..(i + 1) * width]);
-        }
-        block
-    };
-    RustArray::from_matrix(block, tokens, width)
-}
-
-/// `head`'s inverse for one example: its heads' `(T, width)` blocks side by side, appended to
-/// `out` row by row; in one piece when there is one block.
-fn extend_side_by_side(out: &mut Vec<f64>, blocks: &[RustArray]) {
-    if let [block] = blocks {
-        out.extend_from_slice(&block.data);
-        return;
-    }
-    let width = columns(&blocks[0]);
-    for t in 0..blocks[0].data.len() / width {
-        for block in blocks {
-            out.extend_from_slice(&block.data[t * width..(t + 1) * width]);
-        }
-    }
-}
-
-/// A `(T, T)` score matrix with each `S_tj`, `j > t`, set to `-inf`.
-fn masked_causally(mut scores: RustArray, tokens: usize) -> RustArray {
-    for (t, row) in scores.data.chunks_exact_mut(tokens).enumerate() {
-        row[t + 1..].fill(f64::NEG_INFINITY);
-    }
-    scores
-}
-
-/// `P~ = P * M / keep`, elementwise, in that grouping: numpy's `P * M / keep`.
-fn dropped(p: &RustArray, mask: &RustArray, keep: f64) -> RustArray {
-    RustArray {
-        data: p.data.iter().zip(&mask.data).map(|(&pv, &mv)| pv * mv / keep).collect(),
-        shape: p.shape,
-    }
-}
-
-/// Each value divided by `s`.
-fn divided(m: RustArray, s: f64) -> RustArray {
-    RustArray {
-        data: m.data.iter().map(|&v| v / s).collect(),
-        shape: m.shape,
-    }
-}
-
-// project, attend, combine: the forward pass's blocks
-
-/// `Q`, `K`, `V` from the `(N * T, d)` input rows: each the product, then the bias, over all heads;
-/// with a `rotation`, `Q` and `K` then rotated.
-fn project(
-    rows: &RustArray,
-    projections: &Projections,
-    rotation: Option<Rotation>,
-    tokens: usize,
-    options: &AttentionOptions,
-) -> PyResult<(RustArray, RustArray, RustArray)> {
-    let q = affine_forward_batch(projections.wq, rows, projections.bq)?;
-    let k = affine_forward_batch(projections.wk, rows, projections.bk)?;
-    let v = affine_forward_batch(projections.wv, rows, projections.bv)?;
-    Ok(match rotation {
-        Some(rotation) => (
-            rotation.rotated(&q, tokens, options, false),
-            rotation.rotated(&k, tokens, options, false),
-            v,
-        ),
-        None => (q, k, v),
-    })
-}
-
-/// Per example and head, the weights and the weighted sum: `(p, h, mask)`, `p` `(N * T, h·T)` and
-/// `h` `(N * T, h·d_k)`, from the packed `(N * T, h·d_k)` `q`, `k`, `v`. With `rng`, each head's
-/// weights are dropped by a mask drawn from it, returned packed as `p`; without, `mask` is `None`.
-fn attend_forward(
-    q: &RustArray,
-    k: &RustArray,
-    v: &RustArray,
-    tokens: usize,
-    options: &AttentionOptions,
-    mut rng: Option<&mut Generator>,
-) -> PyResult<(RustArray, RustArray, Option<RustArray>)> {
-    let (heads, d_k, width, s) = (options.heads, options.key_size, options.width(), options.scale());
-    let rows = q.data.len() / width;
-    let mut p = Vec::with_capacity(rows * heads * tokens);
-    let mut h = Vec::with_capacity(rows * width);
-    let mut mask = rng.as_ref().map(|_| Vec::with_capacity(rows * heads * tokens));
-    for n in 0..rows / tokens {
-        let (mut p_n, mut h_n) = (Vec::with_capacity(heads), Vec::with_capacity(heads));
-        let mut mask_n = Vec::with_capacity(if mask.is_some() { heads } else { 0 });
-        for i in 0..heads {
-            let (q_ni, k_ni, v_ni) = (
-                head(q, n, i, tokens, d_k),
-                head(k, n, i, tokens, d_k),
-                head(v, n, i, tokens, d_k),
-            );
-            let mut scores = divided(matmul(&q_ni, &k_ni.transpose())?, s);
-            if options.causal {
-                scores = masked_causally(scores, tokens);
-            }
-            let p_ni = array_softmax(&scores);
-            match rng.as_deref_mut() {
-                Some(rng) => {
-                    let m_ni = RustArray::from_matrix(
-                        rng.draw_bernoulli_mask(options.dropout, tokens * tokens),
-                        tokens,
-                        tokens,
-                    );
-                    h_n.push(matmul(&dropped(&p_ni, &m_ni, options.keep()), &v_ni)?);
-                    mask_n.push(m_ni);
-                }
-                None => h_n.push(matmul(&p_ni, &v_ni)?),
-            }
-            p_n.push(p_ni);
-        }
-        extend_side_by_side(&mut p, &p_n);
-        extend_side_by_side(&mut h, &h_n);
-        if let Some(mask) = mask.as_mut() {
-            extend_side_by_side(mask, &mask_n);
-        }
-    }
-    Ok((
-        RustArray::from_matrix(p, rows, heads * tokens),
-        RustArray::from_matrix(h, rows, width),
-        mask.map(|mask| RustArray::from_matrix(mask, rows, heads * tokens)),
-    ))
-}
-
-/// `H`, the heads side by side, through the output projection: one product over all heads.
-fn combine(h: &RustArray, projections: &Projections) -> PyResult<RustArray> {
-    affine_forward_batch(projections.wo, h, projections.bo)
-}
-
-// the backward pass's blocks, last first
-
-/// `dH = delta Wo`, `(N * T, h·d_k)`, from the `(N * T, d)` delta rows.
-fn combine_backward(delta: &RustArray, wo: &RustArray) -> PyResult<RustArray> {
-    layer_downstream_batch(wo, delta)
-}
-
-/// Per example and head, the softmax's and the products' gradients: `(dq, dk, dv)`, each
-/// `(N * T, h·d_k)`, from the forward pass's packed caches and `dh`, and its mask if it drew one.
-fn attend_backward(
-    caches: [&RustArray; 4],
-    mask: Option<&RustArray>,
-    dh: &RustArray,
-    tokens: usize,
-    options: &AttentionOptions,
-) -> PyResult<(RustArray, RustArray, RustArray)> {
-    let [q, k, v, p] = caches;
-    let (heads, d_k, width, s) = (options.heads, options.key_size, options.width(), options.scale());
-    let rows = dh.data.len() / width;
-    let mut dq = Vec::with_capacity(rows * width);
-    let mut dk = Vec::with_capacity(rows * width);
-    let mut dv = Vec::with_capacity(rows * width);
-    for n in 0..rows / tokens {
-        let mut dq_n = Vec::with_capacity(heads);
-        let mut dk_n = Vec::with_capacity(heads);
-        let mut dv_n = Vec::with_capacity(heads);
-        for i in 0..heads {
-            let (q_ni, k_ni, v_ni) = (
-                head(q, n, i, tokens, d_k),
-                head(k, n, i, tokens, d_k),
-                head(v, n, i, tokens, d_k),
-            );
-            let (p_ni, dh_ni) = (head(p, n, i, tokens, tokens), head(dh, n, i, tokens, d_k));
-            let mut dp = matmul(&dh_ni, &v_ni.transpose())?;
-            match mask {
-                Some(mask) => {
-                    let (m_ni, keep) = (head(mask, n, i, tokens, tokens), options.keep());
-                    dv_n.push(matmul(&dropped(&p_ni, &m_ni, keep).transpose(), &dh_ni)?);
-                    dp = dropped(&dp, &m_ni, keep);
-                }
-                None => dv_n.push(matmul(&p_ni.transpose(), &dh_ni)?),
-            }
-            let mut ds = Vec::with_capacity(tokens * tokens);
-            for (dp_row, p_row) in dp.data.chunks_exact(tokens).zip(p_ni.data.chunks_exact(tokens)) {
-                let r = dp_row.iter().zip(p_row).fold(0.0, |acc, (&dpv, &pv)| acc + dpv * pv);
-                ds.extend(dp_row.iter().zip(p_row).map(|(&dpv, &pv)| pv * (dpv - r)));
-            }
-            let ds = RustArray::from_matrix(ds, tokens, tokens);
-            dq_n.push(divided(matmul(&ds, &k_ni)?, s));
-            dk_n.push(divided(matmul(&ds.transpose(), &q_ni)?, s));
-        }
-        extend_side_by_side(&mut dq, &dq_n);
-        extend_side_by_side(&mut dk, &dk_n);
-        extend_side_by_side(&mut dv, &dv_n);
-    }
-    Ok((
-        RustArray::from_matrix(dq, rows, width),
-        RustArray::from_matrix(dk, rows, width),
-        RustArray::from_matrix(dv, rows, width),
-    ))
-}
-
-/// `dX = (dQ Wq + dK Wk) + dV Wv`, `(N * T, d)`: three products over all heads, summed in this order.
-fn project_backward(gradients: [&RustArray; 3], weights: [&RustArray; 3]) -> PyResult<RustArray> {
-    let [dq, dk, dv] = gradients;
-    let [wq, wk, wv] = weights;
-    let dx_q = layer_downstream_batch(wq, dq)?;
-    let dx_k = layer_downstream_batch(wk, dk)?;
-    let dx_v = layer_downstream_batch(wv, dv)?;
-    let dx = dx_q
-        .data
-        .iter()
-        .zip(&dx_k.data)
-        .zip(&dx_v.data)
-        .map(|((&a, &b), &c)| (a + b) + c)
-        .collect();
-    Ok(RustArray {
-        data: dx,
-        shape: dx_q.shape,
-    })
-}
-
-/// The forward pass: `(a, q, k, v, p, h, mask)`, `a` in `x`'s shape, the caches as `(N * T, h·d_k)`
-/// rows, `p` as `(N * T, h·T)` and `mask`, when the pass dropped, as `p`.
+/// `ForwardResult` (`indrajala_math::attention`) with the bindings' arrays.
 type ForwardResult = (
     RustArray,
     RustArray,
@@ -508,52 +18,21 @@ type ForwardResult = (
     Option<RustArray>,
 );
 
-/// How a forward pass drops its weights: `dropout`, and in `training` the generator it draws from.
-struct Dropping<'a, 'py> {
-    dropout: f64,
-    training: bool,
-    rng: Option<PyRefMut<'py, Generator>>,
-    context: &'a str,
+/// The core's forward result, moved into the bindings' arrays.
+fn forward_result(r: indrajala_math::attention::ForwardResult) -> ForwardResult {
+    let (a, b, c, d, e, f, g) = r;
+    (
+        a.into(),
+        b.into(),
+        c.into(),
+        d.into(),
+        e.into(),
+        f.into(),
+        g.map(RustArray::from),
+    )
 }
-
-impl Dropping<'_, '_> {
-    /// The generator to draw from: `rng` in a training pass with `dropout > 0`, which needs one;
-    /// else `None`, and nothing is drawn.
-    fn generator(&mut self) -> PyResult<Option<&mut Generator>> {
-        if !(self.training && self.dropout > 0.0) {
-            return Ok(None);
-        }
-        match self.rng.as_deref_mut() {
-            Some(rng) => Ok(Some(rng)),
-            None => Err(PyValueError::new_err(format!(
-                "{} requires an rng to drop out in training, got dropout={} and none",
-                self.context, self.dropout
-            ))),
-        }
-    }
-}
-
-fn forward(
-    x: &RustArray,
-    projections: &Projections,
-    heads: usize,
-    causal: bool,
-    mut dropping: Dropping,
-    table: (Option<&RustArray>, Option<&RustArray>),
-) -> PyResult<ForwardResult> {
-    let context = dropping.context;
-    let (d, options) = shapes(projections, heads, causal, dropping.dropout, context)?;
-    let (_, tokens) = examples_and_tokens(x, d, "x", context)?;
-    let rotation = Rotation::new(table.0, table.1, tokens, &options, context)?;
-    let (q, k, v) = project(&token_rows(x, d), projections, rotation, tokens, &options)?;
-    let (p, h, mask) = attend_forward(&q, &k, &v, tokens, &options, dropping.generator()?)?;
-    let out = combine(&h, projections)?;
-    let a = RustArray {
-        data: out.data,
-        shape: x.shape,
-    };
-    Ok((a, q, k, v, p, h, mask))
-}
+#[allow(unused_imports)]
+pub(crate) use indrajala_math::attention::*;
 
 /// `AttentionArrayLayer.forward`: one example, `x` 1D of `T * d` values, `d` `bo`'s length, in
 /// `heads` heads across `bq`'s length, masked if `causal`, its weights dropped from `rng` in
@@ -577,18 +56,12 @@ pub fn attention_forward<'py>(
     causal: bool,
     dropout: f64,
     training: bool,
-    rng: Option<PyRefMut<'py, Generator>>,
+    mut rng: Option<PyRefMut<'py, Generator>>,
     cos: Option<&RustArray>,
     sin: Option<&RustArray>,
 ) -> PyResult<ForwardResult> {
-    let context = "attention_forward";
-    if !matches!(x.shape, Shape::Vector(_)) {
-        return Err(PyValueError::new_err(format!(
-            "{context} requires a 1D x, got shape {:?}",
-            x.shape
-        )));
-    }
-    let projections = Projections {
+    indrajala_math::attention::attention_forward(
+        x,
         wq,
         bq,
         wk,
@@ -597,14 +70,16 @@ pub fn attention_forward<'py>(
         bv,
         wo,
         bo,
-    };
-    let dropping = Dropping {
+        heads,
+        causal,
         dropout,
         training,
-        rng,
-        context,
-    };
-    forward(x, &projections, heads, causal, dropping, (cos, sin))
+        rng.as_deref_mut().map(|g| &mut g.0),
+        cos.map(|a| &a.0),
+        sin.map(|a| &a.0),
+    )
+    .map(forward_result)
+    .map_err(py_err)
 }
 
 /// `AttentionArrayLayer.forward_batch`: `x` 2D (`batch, T * d`), each example
@@ -628,18 +103,12 @@ pub fn attention_forward_batch<'py>(
     causal: bool,
     dropout: f64,
     training: bool,
-    rng: Option<PyRefMut<'py, Generator>>,
+    mut rng: Option<PyRefMut<'py, Generator>>,
     cos: Option<&RustArray>,
     sin: Option<&RustArray>,
 ) -> PyResult<ForwardResult> {
-    let context = "attention_forward_batch";
-    if !matches!(x.shape, Shape::Matrix(_, _)) {
-        return Err(PyValueError::new_err(format!(
-            "{context} requires a 2D x, got shape {:?}",
-            x.shape
-        )));
-    }
-    let projections = Projections {
+    indrajala_math::attention::attention_forward_batch(
+        x,
         wq,
         bq,
         wk,
@@ -648,14 +117,16 @@ pub fn attention_forward_batch<'py>(
         bv,
         wo,
         bo,
-    };
-    let dropping = Dropping {
+        heads,
+        causal,
         dropout,
         training,
-        rng,
-        context,
-    };
-    forward(x, &projections, heads, causal, dropping, (cos, sin))
+        rng.as_deref_mut().map(|g| &mut g.0),
+        cos.map(|a| &a.0),
+        sin.map(|a| &a.0),
+    )
+    .map(forward_result)
+    .map_err(py_err)
 }
 
 /// `AttentionArrayLayer._backward`: from `delta_batch` (`dl/dout`, 2D `batch, T * d`, or 1D for
@@ -683,41 +154,32 @@ pub fn attention_downstream_batch(
     cos: Option<&RustArray>,
     sin: Option<&RustArray>,
 ) -> PyResult<(RustArray, RustArray, RustArray, RustArray)> {
-    let context = "attention_downstream_batch";
-    let (width, d) = match wq.shape {
-        Shape::Matrix(width, d) => (width, d),
-        Shape::Vector(d) => (d, 1),
-    };
-    // causal or not, the same: the mask is in `p`
-    let options = AttentionOptions::new(heads, width, false, dropout, context)?;
-    require_weights([wq, wk, wv, wo], d, width, context)?;
-    let (examples, tokens) = examples_and_tokens(delta_batch, d, "delta_batch", context)?;
-    let rows = examples * tokens;
-    for (cache, name) in [(q, "q"), (k, "k"), (v, "v")] {
-        require_shape(cache, Shape::Matrix(rows, width), name, context)?;
-    }
-    require_shape(p, Shape::Matrix(rows, heads * tokens), "p", context)?;
-    if let Some(mask) = mask {
-        require_shape(mask, p.shape, "mask", context)?;
-    }
-    let rotation = Rotation::new(cos, sin, tokens, &options, context)?;
-
-    let dh = combine_backward(&token_rows(delta_batch, d), wo)?;
-    let (dq, dk, dv) = attend_backward([q, k, v, p], mask, &dh, tokens, &options)?;
-    // project's backward starts by rotating back: the gradients of the unrotated Q and K
-    let (dq, dk) = match rotation {
-        Some(rotation) => (
-            rotation.rotated(&dq, tokens, &options, true),
-            rotation.rotated(&dk, tokens, &options, true),
-        ),
-        None => (dq, dk),
-    };
-    let dx = project_backward([&dq, &dk, &dv], [wq, wk, wv])?;
-    let dx = RustArray {
-        data: dx.data,
-        shape: delta_batch.shape,
-    };
-    Ok((dx, dq, dk, dv))
+    indrajala_math::attention::attention_downstream_batch(
+        delta_batch,
+        wq,
+        wk,
+        wv,
+        wo,
+        q,
+        k,
+        v,
+        p,
+        heads,
+        mask.map(|a| &a.0),
+        dropout,
+        cos.map(|a| &a.0),
+        sin.map(|a| &a.0),
+    )
+    .map(|r| {
+        let (r0, r1, r2, r3) = r;
+        (
+            RustArray::from(r0),
+            RustArray::from(r1),
+            RustArray::from(r2),
+            RustArray::from(r3),
+        )
+    })
+    .map_err(py_err)
 }
 
 /// `AttentionArrayLayer.accumulate_gradient_batch`: each projection's `(grad_W, grad_b)` as a
@@ -752,19 +214,34 @@ pub fn attention_accumulate_gradient_batch(
     RustArray,
     RustArray,
 )> {
-    let context = "attention_accumulate_gradient_batch";
-    let (d, width) = (grad_bo.data.len(), grad_bq.data.len());
-    let (examples, tokens) = examples_and_tokens(delta_batch, d, "delta_batch", context)?;
-    let rows = examples * tokens;
-    require_shape(x, delta_batch.shape, "x", context)?;
-    for (cache, name) in [(h, "h"), (dq, "dq"), (dk, "dk"), (dv, "dv")] {
-        require_shape(cache, Shape::Matrix(rows, width), name, context)?;
-    }
-    let x_rows = token_rows(x, d);
-    let delta = token_rows(delta_batch, d);
-    let (grad_wq, grad_bq) = layer_accumulate_gradient_batch(dq, &x_rows, grad_wq, grad_bq)?;
-    let (grad_wk, grad_bk) = layer_accumulate_gradient_batch(dk, &x_rows, grad_wk, grad_bk)?;
-    let (grad_wv, grad_bv) = layer_accumulate_gradient_batch(dv, &x_rows, grad_wv, grad_bv)?;
-    let (grad_wo, grad_bo) = layer_accumulate_gradient_batch(&delta, h, grad_wo, grad_bo)?;
-    Ok((grad_wq, grad_bq, grad_wk, grad_bk, grad_wv, grad_bv, grad_wo, grad_bo))
+    indrajala_math::attention::attention_accumulate_gradient_batch(
+        delta_batch,
+        x,
+        h,
+        dq,
+        dk,
+        dv,
+        grad_wq,
+        grad_bq,
+        grad_wk,
+        grad_bk,
+        grad_wv,
+        grad_bv,
+        grad_wo,
+        grad_bo,
+    )
+    .map(|r| {
+        let (r0, r1, r2, r3, r4, r5, r6, r7) = r;
+        (
+            RustArray::from(r0),
+            RustArray::from(r1),
+            RustArray::from(r2),
+            RustArray::from(r3),
+            RustArray::from(r4),
+            RustArray::from(r5),
+            RustArray::from(r6),
+            RustArray::from(r7),
+        )
+    })
+    .map_err(py_err)
 }

@@ -1,10 +1,12 @@
-use pyo3::exceptions::PyValueError;
+//! The bindings of the core's `ufuncs` (`indrajala_math::ufuncs`): each `#[pyfunction]` lends its
+//! arrays to the core's and moves the results in.
+
 use pyo3::prelude::*;
 
-use crate::array::{RustArray, Shape};
-use crate::fused::dropout_hidden_delta_from_downstream;
-use crate::ops::same_shape_elementwise;
-use crate::scalar::{max, relu};
+use crate::array::RustArray;
+use crate::linalg::py_err;
+#[allow(unused_imports)]
+pub(crate) use indrajala_math::ufuncs::*;
 
 /// Elementwise `e^x` over a whole array - mirrors `array_layer.sigmoid`'s own reliance on
 /// `exp`'s overflow behavior (a large negative `z` drives `exp(-z)` to `f64::INFINITY`, and
@@ -14,19 +16,14 @@ use crate::scalar::{max, relu};
 /// itself is ever built on top of it.
 #[pyfunction]
 pub fn exp(arr: &RustArray) -> RustArray {
-    let mut data = vec![0.0; arr.data.len()];
-    crate::cr_exp::exp_into(&arr.data, &mut data);
-    RustArray { data, shape: arr.shape }
+    RustArray::from(indrajala_math::ufuncs::exp(arr))
 }
 
 /// `exp` one value at a time (`cr_exp::exp`, no vector lanes): the vector kernel's reference in
 /// the tests, which check the two agree bit for bit.
 #[pyfunction]
 pub fn exp_scalar(arr: &RustArray) -> RustArray {
-    RustArray {
-        data: arr.data.iter().map(|&v| crate::cr_exp::exp(v)).collect(),
-        shape: arr.shape,
-    }
+    RustArray::from(indrajala_math::ufuncs::exp_scalar(arr))
 }
 
 /// `exp` in place on a copy of `arr` (`cr_exp::exp_in_place`, where `exp` writes a new buffer), and
@@ -34,9 +31,10 @@ pub fn exp_scalar(arr: &RustArray) -> RustArray {
 /// outside the fast path's ordinary range, and the tail short of a vector. For the tests.
 #[pyfunction]
 pub fn exp_lanes(arr: &RustArray) -> (RustArray, usize) {
-    let mut data = arr.data.clone();
-    let redone = crate::cr_exp::exp_in_place(&mut data);
-    (RustArray { data, shape: arr.shape }, redone)
+    {
+        let (r0, r1) = indrajala_math::ufuncs::exp_lanes(arr);
+        (RustArray::from(r0), r1)
+    }
 }
 
 /// Sums a 2D array's rows into a 1D vector - the one fixed-axis (`axis=0`) reduction this core
@@ -46,18 +44,9 @@ pub fn exp_lanes(arr: &RustArray) -> (RustArray, usize) {
 /// fixed case, not a general `axis=` parameter.
 #[pyfunction]
 pub fn sum_axis0(arr: &RustArray) -> PyResult<RustArray> {
-    match arr.shape {
-        Shape::Matrix(rows, cols) => {
-            let mut out = vec![0.0; cols];
-            for row in 0..rows {
-                for col in 0..cols {
-                    out[col] += arr.data[row * cols + col];
-                }
-            }
-            Ok(RustArray::from_vector(out))
-        }
-        Shape::Vector(_) => Err(PyValueError::new_err("sum_axis0 requires a 2D array, got a 1D vector")),
-    }
+    indrajala_math::ufuncs::sum_axis0(arr)
+        .map(RustArray::from)
+        .map_err(py_err)
 }
 
 /// Elementwise `max(0.0, x)` - the Rust core's counterpart to `np.maximum(0.0, z)`
@@ -65,10 +54,7 @@ pub fn sum_axis0(arr: &RustArray) -> PyResult<RustArray> {
 /// otherwise out of scope for this core; this is the one exception.
 #[pyfunction]
 pub fn array_relu(arr: &RustArray) -> RustArray {
-    RustArray {
-        data: arr.data.iter().map(|&v| relu(v)).collect(),
-        shape: arr.shape,
-    }
+    RustArray::from(indrajala_math::ufuncs::array_relu(arr))
 }
 
 /// `downstream * (a > 0.0)` - ReLU's derivative mask, zeroing out the downstream gradient
@@ -77,16 +63,9 @@ pub fn array_relu(arr: &RustArray) -> RustArray {
 /// 2D), so one function covers both call shapes.
 #[pyfunction]
 pub fn array_relu_mask(downstream: &RustArray, a: &RustArray) -> PyResult<RustArray> {
-    if downstream.shape != a.shape {
-        return Err(PyValueError::new_err(format!(
-            "array_relu_mask requires matching shapes, got {:?} and {:?}",
-            downstream.shape, a.shape
-        )));
-    }
-    Ok(RustArray {
-        data: same_shape_elementwise(&downstream.data, &a.data, |d, av| if av > 0.0 { d } else { 0.0 }),
-        shape: downstream.shape,
-    })
+    indrajala_math::ufuncs::array_relu_mask(downstream, a)
+        .map(RustArray::from)
+        .map_err(py_err)
 }
 
 /// `downstream * a * (1 - a)` - the sigmoid's derivative applied to a downstream that a dense
@@ -96,16 +75,9 @@ pub fn array_relu_mask(downstream: &RustArray, a: &RustArray) -> PyResult<RustAr
 /// same downstream it computes their bits. Shape-agnostic, as `array_relu_mask`.
 #[pyfunction]
 pub fn array_sigmoid_mask(downstream: &RustArray, a: &RustArray) -> PyResult<RustArray> {
-    if downstream.shape != a.shape {
-        return Err(PyValueError::new_err(format!(
-            "array_sigmoid_mask requires matching shapes, got {:?} and {:?}",
-            downstream.shape, a.shape
-        )));
-    }
-    Ok(RustArray {
-        data: same_shape_elementwise(&downstream.data, &a.data, |d, av| d * av * (1.0 - av)),
-        shape: downstream.shape,
-    })
+    indrajala_math::ufuncs::array_sigmoid_mask(downstream, a)
+        .map(RustArray::from)
+        .map_err(py_err)
 }
 
 /// `downstream * base_activation * (1 - base_activation) * scale`, `scale = mask /
@@ -120,19 +92,9 @@ pub fn array_dropout_mask(
     keep_probability: f64,
     was_training: bool,
 ) -> PyResult<RustArray> {
-    if downstream.shape != base_activation.shape || mask.shape != base_activation.shape {
-        return Err(PyValueError::new_err(format!(
-            "array_dropout_mask requires matching shapes, got {:?}, {:?} and {:?}",
-            downstream.shape, base_activation.shape, mask.shape
-        )));
-    }
-    Ok(dropout_hidden_delta_from_downstream(
-        downstream,
-        base_activation,
-        mask,
-        keep_probability,
-        was_training,
-    ))
+    indrajala_math::ufuncs::array_dropout_mask(downstream, base_activation, mask, keep_probability, was_training)
+        .map(RustArray::from)
+        .map_err(py_err)
 }
 
 /// Numerically-stable softmax normalization - `SoftmaxArrayLayer.forward`/`forward_batch`'s own
@@ -146,32 +108,7 @@ pub fn array_dropout_mask(
 /// output's sum in indrajala-ml), not `e.sum()`'s pairwise sum.
 #[pyfunction]
 pub fn array_softmax(arr: &RustArray) -> RustArray {
-    fn normalize_row(row: &[f64]) -> Vec<f64> {
-        let max_value = row.iter().fold(f64::NEG_INFINITY, |running, &v| max(running, v));
-        let mut exp_values: Vec<f64> = row.iter().map(|&v| v - max_value).collect();
-        crate::cr_exp::exp_in_place(&mut exp_values);
-        let total = exp_values.iter().fold(0.0, |acc, &e| acc + e);
-        exp_values.iter().map(|&e| e / total).collect()
-    }
-
-    match arr.shape {
-        Shape::Vector(_) => RustArray {
-            data: normalize_row(&arr.data),
-            shape: arr.shape,
-        },
-        Shape::Matrix(rows, cols) => {
-            let mut out = vec![0.0; rows * cols];
-            for row in 0..rows {
-                let start = row * cols;
-                let normalized = normalize_row(&arr.data[start..start + cols]);
-                out[start..start + cols].copy_from_slice(&normalized);
-            }
-            RustArray {
-                data: out,
-                shape: arr.shape,
-            }
-        }
-    }
+    RustArray::from(indrajala_math::ufuncs::array_softmax(arr))
 }
 
 /// The index of the largest element in a 1D array - `classify_state`'s own
@@ -180,21 +117,5 @@ pub fn array_softmax(arr: &RustArray) -> RustArray {
 /// - a real behavioral detail to match, not assume.
 #[pyfunction]
 pub fn argmax(arr: &RustArray) -> PyResult<usize> {
-    match arr.shape {
-        Shape::Vector(n) => {
-            if n == 0 {
-                return Err(PyValueError::new_err("argmax of an empty array"));
-            }
-            let mut best_index = 0;
-            let mut best_value = arr.data[0];
-            for i in 1..n {
-                if arr.data[i] > best_value {
-                    best_value = arr.data[i];
-                    best_index = i;
-                }
-            }
-            Ok(best_index)
-        }
-        Shape::Matrix(_, _) => Err(PyValueError::new_err("argmax requires a 1D array")),
-    }
+    indrajala_math::ufuncs::argmax(arr).map_err(py_err)
 }
