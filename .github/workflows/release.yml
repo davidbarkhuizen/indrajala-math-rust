@@ -1,0 +1,184 @@
+# Publishes a release (indrajala-ml's release workplan, stage 5): a `v<version>` tag publishes the
+# core to crates.io, then the wheels and sdist to PyPI; a `testpypi-v<version>` tag rehearses the
+# PyPI half on TestPyPI. Only what this run built and tested is published, and the indexes' copies
+# are installed and tested again afterwards. The `crates-io` and `pypi` environments need the
+# owner's approval; no job here can publish without it.
+
+name: release
+
+on:
+  push:
+    tags: ["v*", "testpypi-v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # The tag names the workspace's version, on a commit already on main.
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: version
+        name: The tag against the workspace version and main
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#testpypi-}"
+          version="${version#v}"
+          cargo_version=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "indrajala-math"))')
+          if [ "$version" != "$cargo_version" ]; then
+            echo "::error::tag $tag names $version, the workspace is $cargo_version"
+            exit 1
+          fi
+          git fetch --quiet origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$tag ($GITHUB_SHA) is not on main"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build-test:
+    needs: verify
+    uses: ./.github/workflows/build-test.yml
+
+  # The core first (the workplan's D11): a PyPI package never names kernels crates.io lacks. A
+  # version crates.io already has is skipped, so a re-run after a later job's failure repeats nothing.
+  crates-io:
+    if: startsWith(github.ref_name, 'v')
+    needs: [verify, build-test]
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Publish indrajala-math
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          status=$(curl -s -o /dev/null -w '%{http_code}' -A "indrajala-math-rust release" \
+            "https://crates.io/api/v1/crates/indrajala-math/$VERSION")
+          if [ "$status" = 200 ]; then
+            echo "indrajala-math $VERSION is on crates.io already"
+          else
+            cargo publish -p indrajala-math
+          fi
+
+  pypi:
+    if: ${{ !cancelled() && needs.build-test.result == 'success' && (needs.crates-io.result == 'success' || needs.crates-io.result == 'skipped') }}
+    needs: [verify, build-test, crates-io]
+    runs-on: ubuntu-latest
+    environment: ${{ startsWith(github.ref_name, 'v') && 'pypi' || 'testpypi' }}
+    permissions:
+      id-token: write # trusted publishing; only this job
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: "{wheels-*,sdist}"
+          path: dist
+          merge-multiple: true
+      - name: Publish to PyPI
+        if: startsWith(github.ref_name, 'v')
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+      - name: Publish to TestPyPI
+        if: startsWith(github.ref_name, 'testpypi-v')
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+  # What users get: the published package installed from its index on every platform and tested.
+  verify-pypi:
+    needs: [verify, pypi]
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest, windows-11-arm]
+        python: ["3.14", "3.15"]
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install from the index (retrying while it updates) and test
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          # TestPyPI holds this package but not numpy, which comes from PyPI
+          INDEX: ${{ startsWith(github.ref_name, 'v') && '--index-url https://pypi.org/simple' || '--index-url https://test.pypi.org/simple --extra-index-url https://pypi.org/simple' }}
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          source "$RUNNER_TEMP/venv/bin/activate" 2>/dev/null || source "$RUNNER_TEMP/venv/Scripts/activate"
+          python -m pip install pytest numpy
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            python -m pip install --no-cache-dir --only-binary :all: $INDEX "indrajala-math-rust==$VERSION" && break
+            [ "$attempt" = 10 ] && exit 1
+            sleep 30
+          done
+          cp -r tests "$RUNNER_TEMP/tests" && cd "$RUNNER_TEMP" && python -m pytest -q tests/
+
+  # The crate as a Rust user gets it: a new project depending on the published version.
+  verify-crates-io:
+    if: startsWith(github.ref_name, 'v')
+    needs: [verify, crates-io]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: A project on the published crate
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          rustup toolchain install
+          cargo new --quiet "$RUNNER_TEMP/user" && cp rust-toolchain.toml "$RUNNER_TEMP/user/"
+          cd "$RUNNER_TEMP/user"
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            cargo add --quiet "indrajala-math@=$VERSION" && break
+            [ "$attempt" = 10 ] && exit 1
+            sleep 30
+          done
+          cat > src/main.rs <<'RUST'
+          use indrajala_math::linalg::matmul;
+          use indrajala_math::Array;
+
+          fn main() {
+              let w = Array::from_matrix(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3);
+              let x = Array::from_vector(vec![1.0, 0.0, -1.0]);
+              assert_eq!(matmul(&w, &x).unwrap().data(), &[-2.0, -2.0]);
+              println!("indrajala-math works");
+          }
+          RUST
+          cargo run --quiet --release
+
+  github-release:
+    if: startsWith(github.ref_name, 'v')
+    needs: [verify, verify-pypi, verify-crates-io]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: "{wheels-*,sdist}"
+          path: dist
+          merge-multiple: true
+      - name: The .crate
+        run: |
+          rustup toolchain install
+          cargo package --quiet -p indrajala-math
+          cp target/package/indrajala-math-*.crate dist/
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
