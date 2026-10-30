@@ -1,8 +1,15 @@
 [package]
 name = "indrajala-math"
-version = "0.1.0"
-license = "MIT"
-edition = "2021"
+description = "A 1D/2D f64 array and neural network kernels with the same bits on every machine, and numpy's generators bit for bit"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/indrajala-math"
+keywords = ["neural-network", "matrix", "deterministic", "simd", "numpy"]
+categories = ["science", "mathematics"]
 
 [lints.clippy]
 # The kernels index several fixed-size accumulators and tiles in lockstep with one loop
