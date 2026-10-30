@@ -27,15 +27,25 @@ use crate::Error;
 /// every call. Pooling uses it with `kernel_size = pool_size`.
 #[derive(Clone, Copy, Debug)]
 pub struct ConvGeometry {
+    /// The input's height.
     pub input_height: usize,
+    /// The input's width.
     pub input_width: usize,
+    /// The input's channels.
     pub input_channels: usize,
+    /// The square kernel's side (the pool's, for pooling).
     pub kernel_size: usize,
+    /// The kernel's step.
     pub stride: usize,
+    /// The output's height, `(input_height - kernel_size) / stride + 1`.
     pub out_height: usize,
+    /// The output's width, `(input_width - kernel_size) / stride + 1`.
     pub out_width: usize,
+    /// The output positions per channel, `out_height * out_width`.
     pub positions: usize,
+    /// One kernel's inputs, `input_channels * kernel_size * kernel_size`.
     pub fan_in: usize,
+    /// One example's inputs, `input_channels * input_height * input_width`.
     pub input_size: usize,
 }
 
@@ -92,7 +102,7 @@ impl ConvGeometry {
     }
 }
 
-pub fn require_matrix(arr: &Array, rows: Option<usize>, cols: usize, context: &str) -> Result<usize, Error> {
+pub(crate) fn require_matrix(arr: &Array, rows: Option<usize>, cols: usize, context: &str) -> Result<usize, Error> {
     match arr.shape {
         Shape::Matrix(r, c) if c == cols && rows.is_none_or(|expected| expected == r) => Ok(r),
         shape => Err(Error::invalid(format!(

@@ -43,7 +43,10 @@ pub enum Op {
     /// the tokens plus `P` as one row; parameters `P` `(T, d)`
     Position,
     /// `state_input_forward` with the window's state; parameters `P`
-    StateInput { tokens: usize },
+    StateInput {
+        /// the window's tokens
+        tokens: usize,
+    },
     /// a residual block opens: its input kept for its add
     Fork,
     /// a residual block closes: the body's output plus the block's input
@@ -58,21 +61,40 @@ pub enum Op {
     /// summed in order, the last branch's end its input
     Merge,
     /// `layer_norm_forward_batch`; parameters `gamma`, `beta`
-    LayerNorm { epsilon: f64 },
+    LayerNorm {
+        /// added to the variance
+        epsilon: f64,
+    },
     /// a dense layer on each token's row, ReLU or affine; parameters `W`, `b`
-    TokenDense { tokens: usize, relu: bool },
+    TokenDense {
+        /// the window's tokens
+        tokens: usize,
+        /// ReLU; else affine
+        relu: bool,
+    },
     /// the token-wise softmax output layer; parameters `W`, `b`
-    TokenOutput { tokens: usize },
+    TokenOutput {
+        /// the window's tokens
+        tokens: usize,
+    },
     /// `attention_forward_batch`; parameters `Wq`, `bq`, `Wk`, `bk`, `Wv`, `bv`, `Wo`, `bo`
     Attention {
+        /// the heads
         heads: usize,
+        /// each token attends only to itself and the tokens before it
         causal: bool,
+        /// the attention weights' drop probability in training
         dropout: f64,
+        /// the rotary table's cosines, with `sin`; None for no rotary embedding
         cos: Option<Array>,
+        /// the rotary table's sines
         sin: Option<Array>,
     },
     /// token-wise dropout, its drop probability: a mask drawn in training, nothing in inference
-    Dropout { p: f64 },
+    Dropout {
+        /// the drop probability
+        p: f64,
+    },
 }
 
 impl Op {
@@ -126,7 +148,9 @@ pub struct WindowProgram {
 
 /// `WindowProgram`'s `reads`: one op for every factor, or each factor's.
 pub enum Reads {
+    /// one op for every factor
     One(usize),
+    /// each factor's op
     Each(Vec<usize>),
 }
 

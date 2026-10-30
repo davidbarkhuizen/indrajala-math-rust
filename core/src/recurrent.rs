@@ -42,7 +42,7 @@ use crate::ufuncs::array_softmax;
 use crate::Error;
 
 /// `(rows, cols)` of a matrix, refused for a vector.
-pub fn matrix_shape(x: &Array, name: &str, context: &str) -> Result<(usize, usize), Error> {
+pub(crate) fn matrix_shape(x: &Array, name: &str, context: &str) -> Result<(usize, usize), Error> {
     match x.shape {
         Shape::Matrix(rows, cols) => Ok((rows, cols)),
         shape => Err(Error::invalid(format!(
@@ -52,7 +52,7 @@ pub fn matrix_shape(x: &Array, name: &str, context: &str) -> Result<(usize, usiz
 }
 
 /// `x` refused unless of shape `expected`.
-pub fn require_shape(x: &Array, expected: Shape, name: &str, context: &str) -> Result<(), Error> {
+pub(crate) fn require_shape(x: &Array, expected: Shape, name: &str, context: &str) -> Result<(), Error> {
     if x.shape != expected {
         return Err(Error::invalid(format!(
             "{context} requires {name} of shape {expected:?}, got {:?}",
@@ -63,7 +63,7 @@ pub fn require_shape(x: &Array, expected: Shape, name: &str, context: &str) -> R
 }
 
 /// The features per token of `width` values in `tokens` tokens, refused unless it divides.
-pub fn features_per_token(tokens: usize, width: usize, context: &str) -> Result<usize, Error> {
+pub(crate) fn features_per_token(tokens: usize, width: usize, context: &str) -> Result<usize, Error> {
     if tokens == 0 || !width.is_multiple_of(tokens) {
         return Err(Error::invalid(format!(
             "{context} requires tokens x features values per example, {tokens} tokens, got {width}"
@@ -491,7 +491,7 @@ pub fn codes_backward(
 }
 
 /// A soft factor's temperature checked: finite and above 0.
-pub fn require_temperature(temperature: f64, context: &str) -> Result<(), Error> {
+pub(crate) fn require_temperature(temperature: f64, context: &str) -> Result<(), Error> {
     if !(temperature.is_finite() && temperature > 0.0) {
         return Err(Error::invalid(format!(
             "{context} requires a temperature above 0 and finite, got {temperature}"
@@ -638,7 +638,7 @@ pub fn concatenate_columns(arrays: &[&Array]) -> Result<Array, Error> {
 }
 
 /// `concatenate_columns` over plain references, under `context`'s name.
-pub fn join_columns(arrays: &[&Array], context: &str) -> Result<Array, Error> {
+pub(crate) fn join_columns(arrays: &[&Array], context: &str) -> Result<Array, Error> {
     let Some(first) = arrays.first() else {
         return Err(Error::invalid(format!("{context} requires 1 or more arrays, got none")));
     };

@@ -1,3 +1,5 @@
+//! The MNIST record decode: raw `uint8` records to normalized pixels.
+
 use crate::array::Array;
 use crate::Error;
 

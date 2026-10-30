@@ -1,3 +1,7 @@
+//! Matrix products: `a @ b` in its three shape cases, `c + a @ b`, `a @ b.T`, the long-`K` product
+//! and `outer`, each output one FMA chain in a fixed grouping, so a product's bits are the same on
+//! every machine (AVX2/FMA and NEON kernels, a scalar fallback, the same bits).
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
@@ -309,7 +313,7 @@ pub fn set_matmul_threading(max_threads: usize, threshold_flops: usize) {
 /// No rows-per-thread floor either: products with few output rows and a long `k` gain the most
 /// (conv's accumulate, 8 rows, halves on 8 threads at N = 512). With a floor of 32 rows per
 /// thread, the MNIST conv mini-batch 512 epoch took 1.03-1.12 s against 0.84-0.88.
-pub fn matmul_thread_count(rows: usize, total_flops: usize) -> usize {
+pub(crate) fn matmul_thread_count(rows: usize, total_flops: usize) -> usize {
     const THREADING_THRESHOLD_FLOPS: usize = 8_000_000;
     const MAX_THREADS: usize = 8;
 
@@ -794,9 +798,9 @@ fn product_shape(a: &Array, b: &Array) -> Result<(usize, usize, usize), Error> {
 /// How `tiled_row_range` starts and stores each output's chain: from 0.0, stored over `out`; from
 /// 0.0, added to the value in `out` (`c + chain`, the separate elementwise add's single rounding);
 /// or continued from the partial chain in `out` (a slab of `k` after an earlier one).
-pub const OVERWRITE: u8 = 0;
-pub const ADD: u8 = 1;
-pub const RESUME: u8 = 2;
+pub(crate) const OVERWRITE: u8 = 0;
+pub(crate) const ADD: u8 = 1;
+pub(crate) const RESUME: u8 = 2;
 
 /// The part of `a @ b` (`a` `M x K`, `b` `K x N`, both row-major) one `tiled_row_range` call
 /// computes: rows `row_start..row_end`, columns `col_start..col_end`, and `k` over
@@ -804,7 +808,7 @@ pub const RESUME: u8 = 2;
 /// col_start` of the call's `out`. Only `RESUME` calls take part of the columns or of `k`; the
 /// others must pass `Panel::whole`.
 #[derive(Clone, Copy)]
-pub struct Panel {
+pub(crate) struct Panel {
     pub row_start: usize,
     pub row_end: usize,
     #[cfg_attr(
@@ -850,7 +854,7 @@ impl Panel {
 /// Blocked over rows: for each block of `rows_per_block` rows, each column tile runs over every
 /// row of the block, so the tile's `K x 16` panel of `b` is read from cache by all of them. The
 /// order of rows and tiles doesn't change any output's value.
-pub fn tiled_row_range<const MODE: u8>(a_data: &[f64], b_data: &[f64], out: &mut [f64], panel: Panel) {
+pub(crate) fn tiled_row_range<const MODE: u8>(a_data: &[f64], b_data: &[f64], out: &mut [f64], panel: Panel) {
     debug_assert!(
         MODE == RESUME
             || (

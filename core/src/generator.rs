@@ -35,7 +35,7 @@ fn mix(x: u32, y: u32) -> u32 {
 }
 
 /// `SeedSequence.mix_entropy`: hashes the assembled entropy words into the pool.
-pub fn mix_entropy(entropy: &[u32]) -> [u32; POOL_SIZE] {
+pub(crate) fn mix_entropy(entropy: &[u32]) -> [u32; POOL_SIZE] {
     let mut hash_const = INIT_A;
     let mut pool = [0u32; POOL_SIZE];
     for (i, word) in pool.iter_mut().enumerate() {
@@ -57,7 +57,7 @@ pub fn mix_entropy(entropy: &[u32]) -> [u32; POOL_SIZE] {
 }
 
 /// `SeedSequence.generate_state(n_words, np.uint32)`: the pool expanded into `n_words` words.
-pub fn generate_words(pool: &[u32; POOL_SIZE], n_words: usize) -> Vec<u32> {
+pub(crate) fn generate_words(pool: &[u32; POOL_SIZE], n_words: usize) -> Vec<u32> {
     let mut hash_const = INIT_B;
     (0..n_words)
         .map(|i| {
@@ -70,7 +70,7 @@ pub fn generate_words(pool: &[u32; POOL_SIZE], n_words: usize) -> Vec<u32> {
 }
 
 /// numpy's uint64 view of the uint32 words: little-endian pairs, low word first.
-pub fn words_to_u64(words: &[u32]) -> Vec<u64> {
+pub(crate) fn words_to_u64(words: &[u32]) -> Vec<u64> {
     words
         .chunks(2)
         .map(|pair| pair[0] as u64 | (pair[1] as u64) << 32)
@@ -114,7 +114,7 @@ impl SeedSequence {
     }
 
     /// The 256 bits PCG64 seeds from: `generate_state(4, np.uint64)`.
-    pub fn pcg64(&self) -> Pcg64 {
+    pub(crate) fn pcg64(&self) -> Pcg64 {
         let words = words_to_u64(&generate_words(&self.pool, 8));
         Pcg64::seeded(
             (words[0] as u128) << 64 | words[1] as u128,
@@ -126,7 +126,7 @@ impl SeedSequence {
 /// PCG XSL-RR 128/64 (O'Neill 2014) as numpy's `PCG64`: a 128-bit LCG stepped before each
 /// output, whose two halves are xored and rotated by the state's top six bits.
 #[derive(Clone, Debug)]
-pub struct Pcg64 {
+pub(crate) struct Pcg64 {
     /// The LCG's state.
     pub state: u128,
     /// Its increment (odd).

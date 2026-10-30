@@ -1,3 +1,6 @@
+//! The crate's global generator, numpy's legacy `np.random` MT19937 bit for bit: `seed`, `random`,
+//! `uniform` and the dropout mask.
+
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::{Mutex, MutexGuard};
@@ -16,7 +19,7 @@ const LOWER_MASK: u32 = 0x7fff_ffff;
 /// seeding (`init_genrand`, `init_by_array`, and the `None` entropy procedure), twist, tempering
 /// and `random_double`, so after `seed(s)` this crate's draws are bit-identical to numpy's after
 /// `np.random.seed(s)`. numpy freezes this stream (NEP 19), so it is a stable target.
-pub struct Mt19937 {
+pub(crate) struct Mt19937 {
     key: [u32; N],
     pos: usize,
 }

@@ -4,7 +4,9 @@
 /// deliberately not built here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shape {
+    /// A 1D vector of this length.
     Vector(usize),
+    /// A `rows x cols` matrix, row-major.
     Matrix(usize, usize),
 }
 
@@ -22,7 +24,9 @@ impl Shape {
 /// (`&Array`) and returns a new array.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Array {
+    /// The values, row-major: `shape.size()` of them.
     pub data: Vec<f64>,
+    /// 1D or 2D.
     pub shape: Shape,
 }
 

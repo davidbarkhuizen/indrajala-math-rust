@@ -4,10 +4,11 @@ use crate::array::{Array, Shape};
 use crate::Error;
 
 // fused's layer_apply_accumulated_gradient reuses this directly rather than hand-writing the same zip/map loop for its own W/grad_W and b/grad_b scaled-subtract pairs.
-pub fn same_shape_elementwise(a: &[f64], b: &[f64], op: impl Fn(f64, f64) -> f64) -> Vec<f64> {
+pub(crate) fn same_shape_elementwise(a: &[f64], b: &[f64], op: impl Fn(f64, f64) -> f64) -> Vec<f64> {
     a.iter().zip(b.iter()).map(|(&x, &y)| op(x, y)).collect()
 }
 
+/// `op(a[i], scalar)` for every value of `a`.
 pub fn scalar_elementwise(a: &[f64], scalar: f64, op: impl Fn(f64, f64) -> f64) -> Vec<f64> {
     a.iter().map(|&x| op(x, scalar)).collect()
 }
@@ -15,7 +16,7 @@ pub fn scalar_elementwise(a: &[f64], scalar: f64, op: impl Fn(f64, f64) -> f64) 
 /// Broadcasts `vector` (length `cols`) across every row of a `rows x cols` matrix - the one
 /// broadcasting case this core needs, alongside plain same-shape elementwise addition
 /// (`X @ self.W.T + self.b`).
-pub fn broadcast_row(
+pub(crate) fn broadcast_row(
     matrix: &[f64],
     rows: usize,
     cols: usize,

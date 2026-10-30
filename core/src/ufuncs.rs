@@ -1,3 +1,6 @@
+//! Elementwise functions over one array: `exp` (correctly rounded), ReLU, softmax and the masks
+//! the backward passes apply, `sum_axis0` and `argmax`.
+
 use crate::array::{Array, Shape};
 use crate::fused::dropout_hidden_delta_from_downstream;
 use crate::ops::same_shape_elementwise;

@@ -345,6 +345,9 @@ fn adam_update(
     )
 }
 
+/// `AdamArrayLayer.apply_accumulated_gradient`: the Adam (Kingma & Ba, 2014) update of `W` and `b`
+/// from their accumulated gradients over `batch_size` examples, with step count `t` (after
+/// incrementing, so 1 or more). Returns `(W, b, m_W, v_W, m_b, v_b)`, the new parameters and moments.
 #[allow(clippy::too_many_arguments)]
 pub fn layer_adam_apply_accumulated_gradient(
     w: &Array,
@@ -717,7 +720,7 @@ pub fn layer_dropout_hidden_delta_batch(
 /// Shared by `layer_dropout_hidden_delta`/`layer_dropout_hidden_delta_batch` above and by
 /// `ufuncs.rs`'s `array_dropout_mask` - they differ only in how `downstream` was computed, not in
 /// the elementwise formula applied on top of it.
-pub fn dropout_hidden_delta_from_downstream(
+pub(crate) fn dropout_hidden_delta_from_downstream(
     downstream: &Array,
     base_activation: &Array,
     mask: &Array,

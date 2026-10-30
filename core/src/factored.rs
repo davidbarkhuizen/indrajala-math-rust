@@ -342,9 +342,13 @@ fn others(c: &Array, total: usize, start: usize, size: usize) -> Array {
 pub struct StepCore {
     tokens: usize,
     cross: bool,
+    /// The tokens' features `d`.
     pub features: usize,
+    /// The examples `N`.
     pub rows: usize,
+    /// The factors' state sizes.
     pub sizes: Vec<usize>,
+    /// Each factor's first column in the state.
     pub starts: Vec<usize>,
     factors: Vec<FactorTape>,
     /// the next state, `(N, S)`
@@ -412,7 +416,7 @@ fn code_shape(e: &Array) -> (usize, usize) {
 /// The consolidation table (indrajala-ml's code-consolidation workplan, D1): each duplicate joint
 /// code, a code index per factor, to its representative's, checked against the factors' `codes`
 /// (every factor snapped, every index one of its factor's codes, each duplicate once).
-pub struct Consolidation {
+pub(crate) struct Consolidation {
     table: HashMap<Vec<usize>, Vec<usize>>,
 }
 
@@ -600,16 +604,21 @@ pub fn step_forward(
 
 /// The parameters' gradients a step's backward pass accumulates onto, each factor's.
 pub struct StepGradients<'a> {
+    /// Each factor's pooling query's gradient.
     pub queries: &'a [&'a Array],
+    /// Each factor's cell's input weights' gradient.
     pub w: &'a [&'a Array],
+    /// Each factor's cell's state weights' gradient.
     pub u: &'a [&'a Array],
+    /// Each factor's cell's biases' gradient.
     pub b: &'a [&'a Array],
+    /// Each factor's codes' gradient; None for a continuous factor.
     pub codes: &'a [Option<&'a Array>],
 }
 
 /// `StepCore::backward`'s result: `(dxs, dc, grad_queries, grad_w, grad_u, grad_b, grad_codes)`,
 /// `dxs` each factor's pooling's gradient of its tokens.
-pub type StepBackward = (
+pub(crate) type StepBackward = (
     Vec<Array>,
     Array,
     Vec<Array>,
