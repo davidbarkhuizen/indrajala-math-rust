@@ -2,7 +2,7 @@ use pyo3::prelude::*;
 
 mod array;
 // moved to the core, kept at their old paths for the bindings' modules
-use indrajala_math::{cr_exp, scalar};
+use indrajala_math::cr_exp;
 mod attention;
 mod batch_norm;
 mod conv;
