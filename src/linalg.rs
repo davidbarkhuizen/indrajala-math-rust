@@ -22,16 +22,6 @@ pub(crate) fn matmul(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
     linalg::matmul(a, b).map(RustArray::from).map_err(py_err)
 }
 
-/// `c + a @ b`, bit-identical to the product then the add (`linalg::matmul_add`).
-pub(crate) fn matmul_add(c: &RustArray, a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
-    linalg::matmul_add(c, a, b).map(RustArray::from).map_err(py_err)
-}
-
-/// `a @ b.T` (`linalg::matmul_nt`).
-pub(crate) fn matmul_nt(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
-    linalg::matmul_nt(a, b).map(RustArray::from).map_err(py_err)
-}
-
 /// Test/benchmark hook: max threads and threshold in flops for every threaded matmul
 /// (`linalg::set_matmul_threading`; `(0, 0)` resets).
 #[pyfunction]

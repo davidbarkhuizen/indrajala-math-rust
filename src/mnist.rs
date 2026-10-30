@@ -1,7 +1,12 @@
-use pyo3::exceptions::PyValueError;
+//! The bindings of the core's `mnist` (`indrajala_math::mnist`): each `#[pyfunction]` lends its
+//! arrays to the core's and moves the results in.
+
 use pyo3::prelude::*;
 
 use crate::array::RustArray;
+use crate::linalg::py_err;
+#[allow(unused_imports)]
+pub(crate) use indrajala_math::mnist::*;
 
 /// A direct port of `load_mnist_dataset_as_array`'s own decode
 /// (`np.frombuffer(data, dtype=np.uint8).reshape(n, RECORD_SIZE)[:, :-1].astype(np.float64) / 255.0`),
@@ -14,25 +19,7 @@ use crate::array::RustArray;
 /// `load_mnist_dataset_as_array` itself drops them.
 #[pyfunction]
 pub fn decode_mnist_pixels(data: &[u8], record_size: usize) -> PyResult<RustArray> {
-    if record_size == 0 {
-        return Err(PyValueError::new_err("record_size must be at least 1"));
-    }
-    if !data.len().is_multiple_of(record_size) {
-        return Err(PyValueError::new_err(format!(
-            "data length {} is not a multiple of record_size {}",
-            data.len(),
-            record_size
-        )));
-    }
-
-    let record_count = data.len() / record_size;
-    let pixel_count = record_size - 1;
-    let mut pixels = Vec::with_capacity(record_count * pixel_count);
-    for record in 0..record_count {
-        let base = record * record_size;
-        for pixel in &data[base..base + pixel_count] {
-            pixels.push(*pixel as f64 / 255.0);
-        }
-    }
-    Ok(RustArray::from_matrix(pixels, record_count, pixel_count))
+    indrajala_math::mnist::decode_mnist_pixels(data, record_size)
+        .map(RustArray::from)
+        .map_err(py_err)
 }

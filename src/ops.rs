@@ -17,7 +17,7 @@ fn extract_scalar(value: &Bound<'_, PyAny>) -> PyResult<f64> {
     Err(PyTypeError::new_err("expected a numeric scalar"))
 }
 
-pub(crate) use indrajala_math::ops::{same_shape_elementwise, scalar_elementwise};
+pub(crate) use indrajala_math::ops::scalar_elementwise;
 
 impl RustArray {
     /// The core's `combine_with_array`, raised as `ValueError`; for the bindings' own modules.

@@ -85,7 +85,7 @@ impl ConvGeometry {
     /// The flat index into one example's `C*H*W` input that kernel offset `(kr, kc)` of channel
     /// `c` reads at output position `(out_row, out_col)`.
     #[inline]
-    pub(crate) fn input_index(&self, c: usize, out_row: usize, out_col: usize, kr: usize, kc: usize) -> usize {
+    pub fn input_index(&self, c: usize, out_row: usize, out_col: usize, kr: usize, kc: usize) -> usize {
         let row = out_row * self.stride + kr;
         let col = out_col * self.stride + kc;
         (c * self.input_height + row) * self.input_width + col
