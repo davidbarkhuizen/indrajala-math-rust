@@ -36,7 +36,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Lint levels are in Cargo.toml's [lints]; -D warnings fails the job on any warning.
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      # The pure-Rust core (indrajala-math, core/): its own tests, among them the bit fixtures every
+      # platform must reproduce, the doctests, and its docs with no warning (what docs.rs builds).
+      - name: Core tests
+        run: cargo test -p indrajala-math --release
+      - name: Core docs
+        run: RUSTDOCFLAGS="-D warnings" cargo doc -p indrajala-math --no-deps
       # maturin, ruff and pyright pinned to match indrajala-ml's ./cli (maturin_version,
       # ruff_version, pyright_version), mypy for its stubtest; numpy and pytest left unpinned, so
       # this CI checks the crate against the latest numpy while indrajala-ml's CI checks it
@@ -91,6 +97,7 @@ jobs:
             curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
             . "$HOME/.cargo/env"
             rustup toolchain install
+            cargo test -p indrajala-math --release
             python -m venv /venv
             . /venv/bin/activate
             pip install maturin==1.15.0 pytest numpy
