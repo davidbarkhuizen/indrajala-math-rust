@@ -396,7 +396,7 @@ pub fn matmul_nt(a: ArrayView<'_>, b: ArrayView<'_>) -> Result<Array, Error> {
         }
         // NEON is part of aarch64's baseline: its blocks always run there
         #[cfg(target_arch = "aarch64")]
-        let row = unsafe { matmul_nt_blocks_neon(&a.data, &b.data, chunk, row_start, row_end, k, n) };
+        let row = unsafe { matmul_nt_blocks_neon(a.data, b.data, chunk, row_start, row_end, k, n) };
         // the rows left over after the last full block, or every row without the vector blocks
         for row in row..row_end {
             let a_row = &a.data[row * k..(row + 1) * k];
