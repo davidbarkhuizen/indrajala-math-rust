@@ -60,3 +60,25 @@ fn a_range_out_of_bounds_is_an_overflow() {
         Err(Error::InvalidArgument(_))
     ));
 }
+
+#[test]
+fn exp_into_and_in_place_give_exps_bits() {
+    let values: Vec<f64> = (0..11).map(|i| f64::from(i) * 0.7 - 3.0).collect();
+    let mut out = vec![0.0; values.len()];
+    indrajala_math::cr_exp::exp_into(&values, &mut out);
+    let mut in_place = values.clone();
+    indrajala_math::cr_exp::exp_in_place(&mut in_place);
+    for ((&x, &a), &b) in values.iter().zip(&out).zip(&in_place) {
+        let e = indrajala_math::cr_exp::exp(x);
+        assert_eq!((a.to_bits(), b.to_bits()), (e.to_bits(), e.to_bits()));
+    }
+}
+
+#[test]
+fn small_products_and_a_transpose_run_their_scalar_paths() {
+    let a = Array::from_matrix((0..12).map(f64::from).collect(), 3, 4);
+    let b = Array::from_matrix((0..20).map(f64::from).collect(), 4, 5);
+    assert_eq!(matmul(&a, &b).unwrap().shape(), Shape::Matrix(3, 5));
+    assert_eq!(matmul_nt(&a, &a).unwrap().shape(), Shape::Matrix(3, 3));
+    assert_eq!(a.transpose().transpose(), a);
+}

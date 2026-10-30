@@ -664,7 +664,9 @@ def test_policy_threads_the_batch_512_products_all_or_nothing(reset_matmul_threa
     }
     assert len(set(counts.values())) == 1, counts
     assert 1 <= counts[CONV_TAIL_BATCH_512] <= 8
-    if len(os.sched_getaffinity(0)) >= 2:
+    # the CPUs this process may run on (sched_getaffinity, Linux only), else every CPU
+    cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
+    if cpus >= 2:
         assert counts[CONV_TAIL_BATCH_512] >= 2
 
 

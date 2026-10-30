@@ -35,6 +35,14 @@ def seed_both(seed: Any) -> None:
     pa.seed(seed)
 
 
+def unfused_uniform(low: float, high: float, size: Any) -> FloatArray:
+    """`np.random.uniform` as numpy's C source writes it, `low + range * random()`, each operation
+    rounded: what the crate computes on every platform. numpy's own build contracts it to one FMA on
+    some (macOS and Windows on arm64), so it can differ there in the last bit
+    (`test_numpys_own_uniform_where_it_is_unfused`)."""
+    return low + (high - low) * np.random.random(size)
+
+
 def assert_identical(rust: pa.Array, reference: FloatArray) -> None:
     result = as_numpy(rust)
     assert result.shape == reference.shape
@@ -61,7 +69,17 @@ def test_random_and_uniform_match_numpy_after_the_same_seed(seed: int, shape: in
 @pytest.mark.parametrize(("low", "high"), [(0.0, 1.0), (-1.0, 1.0), (1.0, 0.0), (5.0, 5.0), (-1e300, 1e300)])
 def test_uniform_matches_numpy_at_any_finite_range(low: float, high: float):
     seed_both(7)
-    assert_identical(pa.uniform(low, high, 500), np.random.uniform(low, high, 500))
+    assert_identical(pa.uniform(low, high, 500), unfused_uniform(low, high, 500))
+
+
+def test_numpys_own_uniform_where_it_is_unfused():
+    np.random.seed(7)
+    contracted = np.random.uniform(-3.0, 3.0, 1000)
+    np.random.seed(7)
+    if not np.array_equal(contracted, unfused_uniform(-3.0, 3.0, 1000)):
+        pytest.skip("this numpy build contracts uniform's low + range * u to an FMA")
+    seed_both(7)
+    assert_identical(pa.uniform(-1e300, 1e300, 500), np.random.uniform(-1e300, 1e300, 500))
 
 
 @pytest.mark.parametrize(("low", "high"), [(0.0, float("inf")), (float("-inf"), 0.0), (float("nan"), 1.0)])
@@ -83,12 +101,12 @@ def test_bernoulli_mask_matches_numpys_dropout_mask(drop_probability: float, sha
 def test_interleaved_calls_carry_the_position_across_calls_and_kinds():
     seed_both(2024)
     steps: list[tuple[Callable[[], pa.Array], Callable[[], FloatArray]]] = [
-        (lambda: pa.uniform(-1.0, 1.0, (7, 11)), lambda: np.random.uniform(-1.0, 1.0, (7, 11))),
-        (lambda: pa.uniform(0.0, 2.0, 5), lambda: np.random.uniform(0.0, 2.0, 5)),
+        (lambda: pa.uniform(-1.0, 1.0, (7, 11)), lambda: unfused_uniform(-1.0, 1.0, (7, 11))),
+        (lambda: pa.uniform(0.0, 2.0, 5), lambda: unfused_uniform(0.0, 2.0, 5)),
         (lambda: pa.random(301), lambda: np.random.random(301)),
         (lambda: pa.bernoulli_mask(0.3, (9, 13)), lambda: (np.random.random((9, 13)) >= 0.3).astype(np.float64)),
         (lambda: pa.random((1, 1)), lambda: np.random.random((1, 1))),
-        (lambda: pa.uniform(-3.0, 3.0, 640), lambda: np.random.uniform(-3.0, 3.0, 640)),
+        (lambda: pa.uniform(-3.0, 3.0, 640), lambda: unfused_uniform(-3.0, 3.0, 640)),
     ]
     for _ in range(3):
         for rust, reference in steps:
