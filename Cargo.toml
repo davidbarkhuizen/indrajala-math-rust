@@ -30,3 +30,5 @@ needless_range_loop = "allow"
 # out of `max_pool_downstream_batch` (+54% at 6x6 b32) (indrajala-ml's crate kernels workplan,
 # stage 2). Only how the code is compiled changes, never an operation, so no bit moves.
 codegen-units = 1
+# Probe: fat LTO, so the core inlines across the crate boundary as one crate did (stage 2a, D6).
+lto = "fat"
