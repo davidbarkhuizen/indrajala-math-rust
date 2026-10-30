@@ -12,6 +12,7 @@ threading threshold, so its threaded products are covered.
 
 import numpy as np
 import pytest
+from array_helpers import bits, to_array, to_numpy
 
 from indrajala_math_rust import (
     Array,
@@ -46,25 +47,12 @@ GRUS = [(1, 1, 1), (3, 16, 4), (5, 33, 16), (2048, 64, 64)]
 CODES = [(1, 1, 1), (5, 3, 4), (64, 16, 16), (7, 8, 33)]
 
 
-def _numpy(array: Array) -> np.ndarray:
-    return np.array(array.tolist())
-
-
-def _array(values: np.ndarray) -> Array:
-    return Array(values.tolist())
-
-
-def _bits(values: np.ndarray) -> list[bytes]:
-    # by bits, so -0.0 and 0.0 differ, where np.array_equal takes them as equal
-    return [v.tobytes() for v in np.ravel(values).astype(np.float64)]
-
-
 def _fold(values: np.ndarray, axis: int) -> np.ndarray:
     return np.take(np.cumsum(values, axis=axis), -1, axis=axis)
 
 
 def _crate_exp(values: np.ndarray) -> np.ndarray:
-    return _numpy(exp(_array(values))).reshape(values.shape)
+    return to_numpy(exp(to_array(values))).reshape(values.shape)
 
 
 def _sigmoid(values: np.ndarray) -> np.ndarray:
@@ -79,10 +67,10 @@ def _tanh(values: np.ndarray) -> np.ndarray:
 def test_state_input_forward_adds_the_projected_state_to_every_token(n: int, tokens: int, d: int, s: int):
     rng = np.random.default_rng(n + tokens + d + s)
     X, C, P = rng.uniform(-1, 1, (n, tokens * d)), rng.uniform(-1, 1, (n, s)), rng.uniform(-1, 1, (d, s))
-    out = _numpy(state_input_forward(_array(X), _array(C), _array(P), tokens))
-    projected = _numpy(linear_forward_batch(_array(P), _array(C)))
+    out = to_numpy(state_input_forward(to_array(X), to_array(C), to_array(P), tokens))
+    projected = to_numpy(linear_forward_batch(to_array(P), to_array(C)))
     expected = (X.reshape(n, tokens, d) + projected[:, np.newaxis, :]).reshape(n, -1)
-    assert _bits(out) == _bits(expected)
+    assert bits(out) == bits(expected)
 
 
 @pytest.mark.parametrize("n,tokens,d,s", STATE_INPUTS)
@@ -90,11 +78,11 @@ def test_state_input_backward_is_the_token_sum_through_p(n: int, tokens: int, d:
     rng = np.random.default_rng(n * tokens + d + s)
     delta, C = rng.uniform(-1, 1, (n, tokens * d)), rng.uniform(-1, 1, (n, s))
     P, grad_P = rng.uniform(-1, 1, (d, s)), rng.uniform(-1, 1, (d, s))
-    state_delta, new_grad_P = state_input_backward(_array(delta), _array(C), _array(P), _array(grad_P), tokens)
-    sums = _array(_fold(delta.reshape(n, tokens, d), axis=1))
-    assert _bits(_numpy(state_delta)) == _bits(_numpy(layer_downstream_batch(_array(P), sums)))
-    expected = linear_accumulate_gradient_batch(sums, _array(C), _array(grad_P))
-    assert _bits(_numpy(new_grad_P)) == _bits(_numpy(expected))
+    state_delta, new_grad_P = state_input_backward(to_array(delta), to_array(C), to_array(P), to_array(grad_P), tokens)
+    sums = to_array(_fold(delta.reshape(n, tokens, d), axis=1))
+    assert bits(to_numpy(state_delta)) == bits(to_numpy(layer_downstream_batch(to_array(P), sums)))
+    expected = linear_accumulate_gradient_batch(sums, to_array(C), to_array(grad_P))
+    assert bits(to_numpy(new_grad_P)) == bits(to_numpy(expected))
 
 
 def test_the_large_state_input_and_gru_cases_are_threaded():
@@ -106,9 +94,11 @@ def test_the_large_state_input_and_gru_cases_are_threaded():
 
 def _pooling_forward_reference(X: np.ndarray, q: np.ndarray, tokens: int) -> tuple[np.ndarray, np.ndarray]:
     n, d = X.shape[0], q.shape[0]
-    scores = _numpy(_array(X.reshape(n * tokens, d)) @ _array(q)).reshape(n, tokens)
-    p = _numpy(array_softmax(_array(scores))).reshape(n, tokens)
-    u = np.array([_numpy(_array(p[i : i + 1]) @ _array(X[i].reshape(tokens, d)))[0] for i in range(n)]).reshape(n, d)
+    scores = to_numpy(to_array(X.reshape(n * tokens, d)) @ to_array(q)).reshape(n, tokens)
+    p = to_numpy(array_softmax(to_array(scores))).reshape(n, tokens)
+    u = np.array([to_numpy(to_array(p[i : i + 1]) @ to_array(X[i].reshape(tokens, d)))[0] for i in range(n)]).reshape(
+        n, d
+    )
     return u, p
 
 
@@ -116,16 +106,16 @@ def _pooling_forward_reference(X: np.ndarray, q: np.ndarray, tokens: int) -> tup
 def test_attention_pooling_forward_is_its_composition(n: int, tokens: int, d: int):
     rng = np.random.default_rng(n + 10 * tokens + d)
     X, q = rng.uniform(-1, 1, (n, tokens * d)), rng.uniform(-1, 1, d)
-    u, p = attention_pooling_forward(_array(X), _array(q), tokens)
+    u, p = attention_pooling_forward(to_array(X), to_array(q), tokens)
     expected_u, expected_p = _pooling_forward_reference(X, q, tokens)
-    assert _bits(_numpy(p)) == _bits(expected_p)
-    assert _bits(_numpy(u)) == _bits(expected_u)
+    assert bits(to_numpy(p)) == bits(expected_p)
+    assert bits(to_numpy(u)) == bits(expected_u)
 
 
 def test_a_zero_query_pools_the_mean_weights():
     X = np.random.default_rng(1).uniform(-1, 1, (3, 4 * 5))
-    _, p = attention_pooling_forward(_array(X), Array.zeros(5), 4)
-    assert _bits(_numpy(p)) == _bits(np.full((3, 4), 0.25))
+    _, p = attention_pooling_forward(to_array(X), Array.zeros(5), 4)
+    assert bits(to_numpy(p)) == bits(np.full((3, 4), 0.25))
 
 
 @pytest.mark.parametrize("n,tokens,d", POOLINGS)
@@ -134,15 +124,17 @@ def test_attention_pooling_backward_is_its_composition(n: int, tokens: int, d: i
     X, q = rng.uniform(-1, 1, (n, tokens * d)), rng.uniform(-1, 1, d)
     dU, grad_q = rng.uniform(-1, 1, (n, d)), rng.uniform(-1, 1, d)
     _, p = _pooling_forward_reference(X, q, tokens)
-    dX, new_grad_q = attention_pooling_backward(_array(X), _array(p), _array(q), _array(dU), _array(grad_q), tokens)
+    dX, new_grad_q = attention_pooling_backward(
+        to_array(X), to_array(p), to_array(q), to_array(dU), to_array(grad_q), tokens
+    )
 
     X3 = X.reshape(n, tokens, d)
-    dp = np.array([_numpy(_array(X3[i]) @ _array(dU[i])) for i in range(n)]).reshape(n, tokens)
+    dp = np.array([to_numpy(to_array(X3[i]) @ to_array(dU[i])) for i in range(n)]).reshape(n, tokens)
     dS = p * (dp - _fold(dp * p, axis=1)[:, np.newaxis])
     expected_grad_q = grad_q + _fold(dS.reshape(-1)[:, np.newaxis] * X3.reshape(-1, d), axis=0)
     expected_dX = p[:, :, np.newaxis] * dU[:, np.newaxis, :] + dS[:, :, np.newaxis] * q
-    assert _bits(_numpy(new_grad_q)) == _bits(expected_grad_q)
-    assert _bits(_numpy(dX)) == _bits(expected_dX.reshape(n, -1))
+    assert bits(to_numpy(new_grad_q)) == bits(expected_grad_q)
+    assert bits(to_numpy(dX)) == bits(expected_dX.reshape(n, -1))
 
 
 def _gru_inputs(n: int, d: int, s: int, seed: int) -> dict[str, np.ndarray]:
@@ -158,20 +150,20 @@ def _gru_inputs(n: int, d: int, s: int, seed: int) -> dict[str, np.ndarray]:
 
 def _gru_forward_reference(g: dict[str, np.ndarray], s: int) -> tuple[np.ndarray, ...]:
     u, c, W, U, b = g["u"], g["c"], g["W"], g["U"], g["b"]
-    A = _numpy(affine_forward_batch(_array(W), _array(u), _array(b)))
-    rz = A[:, : 2 * s] + _numpy(linear_forward_batch(_array(U[: 2 * s]), _array(c)))
+    A = to_numpy(affine_forward_batch(to_array(W), to_array(u), to_array(b)))
+    rz = A[:, : 2 * s] + to_numpy(linear_forward_batch(to_array(U[: 2 * s]), to_array(c)))
     r, z = _sigmoid(rz[:, :s]), _sigmoid(rz[:, s:])
     rc = r * c
-    h_tilde = _tanh(A[:, 2 * s :] + _numpy(linear_forward_batch(_array(U[2 * s :]), _array(rc))))
+    h_tilde = _tanh(A[:, 2 * s :] + to_numpy(linear_forward_batch(to_array(U[2 * s :]), to_array(rc))))
     return z * c + (1.0 - z) * h_tilde, r, z, h_tilde, rc
 
 
 @pytest.mark.parametrize("n,d,s", GRUS)
 def test_gru_forward_is_its_composition(n: int, d: int, s: int):
     g = _gru_inputs(n, d, s, n + d + s)
-    out = gru_forward(*(_array(g[k]) for k in ("u", "c", "W", "U", "b")))
+    out = gru_forward(*(to_array(g[k]) for k in ("u", "c", "W", "U", "b")))
     for actual, expected in zip(out, _gru_forward_reference(g, s), strict=True):
-        assert _bits(_numpy(actual).reshape(n, s)) == _bits(expected)
+        assert bits(to_numpy(actual).reshape(n, s)) == bits(expected)
 
 
 def test_tanh_saturates_to_exactly_one_and_minus_one():
@@ -179,9 +171,9 @@ def test_tanh_saturates_to_exactly_one_and_minus_one():
     s = 3
     b = np.array([0.0] * s + [-1e300] * s + [1e3, -1e3, 0.0])
     h, *_ = gru_forward(
-        Array.zeros((1, 1)), Array.zeros((1, s)), Array.zeros((3 * s, 1)), Array.zeros((3 * s, s)), _array(b)
+        Array.zeros((1, 1)), Array.zeros((1, s)), Array.zeros((3 * s, 1)), Array.zeros((3 * s, s)), to_array(b)
     )
-    assert _bits(_numpy(h)) == _bits(np.array([[1.0, -1.0, 0.0]]))
+    assert bits(to_numpy(h)) == bits(np.array([[1.0, -1.0, 0.0]]))
 
 
 @pytest.mark.parametrize("n,d,s", GRUS)
@@ -193,32 +185,34 @@ def test_gru_backward_is_its_composition(n: int, d: int, s: int):
     _, r, z, h_tilde, rc = _gru_forward_reference(g, s)
     u, c, W, U = g["u"], g["c"], g["W"], g["U"]
     out = gru_backward(
-        *(_array(v) for v in (dH, u, c, r, z, h_tilde, rc, W, U, grad_W, grad_U, grad_b)),
+        *(to_array(v) for v in (dH, u, c, r, z, h_tilde, rc, W, U, grad_W, grad_U, grad_b)),
     )
 
     dA_h = dH * (1.0 - z) * (1.0 - h_tilde * h_tilde)
-    d_rc = _numpy(layer_downstream_batch(_array(U[2 * s :]), _array(dA_h))).reshape(n, s)
+    d_rc = to_numpy(layer_downstream_batch(to_array(U[2 * s :]), to_array(dA_h))).reshape(n, s)
     dA_r = d_rc * c * r * (1.0 - r)
     dA_z = dH * (c - h_tilde) * z * (1.0 - z)
     dA_rz = np.concatenate([dA_r, dA_z], axis=1)
     dA = np.concatenate([dA_rz, dA_h], axis=1)
-    expected_W, expected_b = layer_accumulate_gradient_batch(_array(dA), _array(u), _array(grad_W), _array(grad_b))
+    expected_W, expected_b = layer_accumulate_gradient_batch(
+        to_array(dA), to_array(u), to_array(grad_W), to_array(grad_b)
+    )
     expected_U = np.concatenate(
         [
-            _numpy(linear_accumulate_gradient_batch(_array(dA_rz), _array(c), _array(grad_U[: 2 * s]))),
-            _numpy(linear_accumulate_gradient_batch(_array(dA_h), _array(rc), _array(grad_U[2 * s :]))),
+            to_numpy(linear_accumulate_gradient_batch(to_array(dA_rz), to_array(c), to_array(grad_U[: 2 * s]))),
+            to_numpy(linear_accumulate_gradient_batch(to_array(dA_h), to_array(rc), to_array(grad_U[2 * s :]))),
         ]
     )
-    expected_du = _numpy(layer_downstream_batch(_array(W), _array(dA)))
-    dc_state = _numpy(layer_downstream_batch(_array(U[: 2 * s]), _array(dA_rz))).reshape(n, s)
+    expected_du = to_numpy(layer_downstream_batch(to_array(W), to_array(dA)))
+    dc_state = to_numpy(layer_downstream_batch(to_array(U[: 2 * s]), to_array(dA_rz))).reshape(n, s)
     expected_dc = (dH * z + d_rc * r) + dc_state
 
     du, dc, new_W, new_U, new_b = out
-    assert _bits(_numpy(du).reshape(n, d)) == _bits(expected_du)
-    assert _bits(_numpy(dc).reshape(n, s)) == _bits(expected_dc)
-    assert _bits(_numpy(new_W)) == _bits(_numpy(expected_W))
-    assert _bits(_numpy(new_U)) == _bits(expected_U)
-    assert _bits(_numpy(new_b)) == _bits(_numpy(expected_b))
+    assert bits(to_numpy(du).reshape(n, d)) == bits(expected_du)
+    assert bits(to_numpy(dc).reshape(n, s)) == bits(expected_dc)
+    assert bits(to_numpy(new_W)) == bits(to_numpy(expected_W))
+    assert bits(to_numpy(new_U)) == bits(expected_U)
+    assert bits(to_numpy(new_b)) == bits(to_numpy(expected_b))
 
 
 def _codes_inputs(n: int, count: int, size: int) -> tuple[np.ndarray, np.ndarray]:
@@ -235,16 +229,16 @@ def _nearest(H: np.ndarray, E: np.ndarray) -> np.ndarray:
 @pytest.mark.parametrize("n,count,size", CODES)
 def test_codes_forward_snaps_each_row_to_numpys_nearest_code(n: int, count: int, size: int):
     H, E = _codes_inputs(n, count, size)
-    Q, indices = codes_forward(_array(H), _array(E))
+    Q, indices = codes_forward(to_array(H), to_array(E))
     expected = _nearest(H, E)
     assert indices == expected.tolist()
-    assert _bits(_numpy(Q).reshape(n, size)) == _bits(E[expected])
+    assert bits(to_numpy(Q).reshape(n, size)) == bits(E[expected])
 
 
 def test_codes_forward_takes_the_lowest_index_on_a_tie_and_the_first_nan():
     E = np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]])
     H = np.array([[1.0, 0.0], [0.0, 1.0], [0.5, 0.5], [np.nan, 0.0]])
-    _, indices = codes_forward(_array(H), _array(E))
+    _, indices = codes_forward(to_array(H), to_array(E))
     assert indices == [0, 1, 0, 0] == _nearest(H, E).tolist()
 
 
@@ -257,13 +251,13 @@ def test_codes_backward_is_numpys_straight_through_and_scatter_add(n: int, count
     indices = _nearest(H, E)
     Q = E[indices]
     dH, new_grad_E = codes_backward(
-        _array(dQ), _array(H), _array(Q), indices.tolist(), _array(grad_E), weight, commitment
+        to_array(dQ), to_array(H), to_array(Q), indices.tolist(), to_array(grad_E), weight, commitment
     )
     differences = H - Q
     expected_grad_E = grad_E.copy()
     np.add.at(expected_grad_E, indices, -2.0 * weight * differences)
-    assert _bits(_numpy(new_grad_E)) == _bits(expected_grad_E)
-    assert _bits(_numpy(dH).reshape(n, size)) == _bits(dQ + (2.0 * weight * commitment) * differences)
+    assert bits(to_numpy(new_grad_E)) == bits(expected_grad_E)
+    assert bits(to_numpy(dH).reshape(n, size)) == bits(dQ + (2.0 * weight * commitment) * differences)
 
 
 @pytest.mark.parametrize("n,count,size", CODES)
@@ -276,20 +270,22 @@ def test_codes_backward_holds_h_to_a_given_target_and_the_codes_to_h(n: int, cou
     indices = _nearest(H, E)
     Q, T = E[indices], E[(indices + 1) % count]
     dH, new_grad_E = codes_backward(
-        _array(dQ), _array(H), _array(Q), indices.tolist(), _array(grad_E), weight, commitment, _array(T)
+        to_array(dQ), to_array(H), to_array(Q), indices.tolist(), to_array(grad_E), weight, commitment, to_array(T)
     )
     expected_grad_E = grad_E.copy()
     np.add.at(expected_grad_E, indices, -2.0 * weight * (H - Q))
-    assert _bits(_numpy(new_grad_E)) == _bits(expected_grad_E)
-    assert _bits(_numpy(dH).reshape(n, size)) == _bits(dQ + (2.0 * weight * commitment) * (H - T))
+    assert bits(to_numpy(new_grad_E)) == bits(expected_grad_E)
+    assert bits(to_numpy(dH).reshape(n, size)) == bits(dQ + (2.0 * weight * commitment) * (H - T))
 
     # q as the target is no target, by bits
-    untargeted = codes_backward(_array(dQ), _array(H), _array(Q), indices.tolist(), _array(grad_E), weight, commitment)
+    untargeted = codes_backward(
+        to_array(dQ), to_array(H), to_array(Q), indices.tolist(), to_array(grad_E), weight, commitment
+    )
     targeted = codes_backward(
-        _array(dQ), _array(H), _array(Q), indices.tolist(), _array(grad_E), weight, commitment, _array(Q)
+        to_array(dQ), to_array(H), to_array(Q), indices.tolist(), to_array(grad_E), weight, commitment, to_array(Q)
     )
     for a, b in zip(untargeted, targeted, strict=True):
-        assert _bits(_numpy(a)) == _bits(_numpy(b))
+        assert bits(to_numpy(a)) == bits(to_numpy(b))
 
 
 def test_codes_backward_refuses_a_target_of_another_shape():
@@ -343,22 +339,22 @@ def _soft_backward(dQ, H, Q, W, E, grad_E, weight, commitment, temperature, stra
 @pytest.mark.parametrize("n,count,size", CODES)
 def test_soft_codes_forward_is_numpys_softmax_mix(n: int, count: int, size: int, temperature: float):
     H, E = _codes_inputs(n, count, size)
-    Q, W, indices = soft_codes_forward(_array(H), _array(E), temperature)
+    Q, W, indices = soft_codes_forward(to_array(H), to_array(E), temperature)
     expected_Q, expected_W = _soft(H, E, temperature)
-    assert _bits(_numpy(Q).reshape(n, size)) == _bits(expected_Q)
-    assert _bits(_numpy(W).reshape(n, count)) == _bits(expected_W)
+    assert bits(to_numpy(Q).reshape(n, size)) == bits(expected_Q)
+    assert bits(to_numpy(W).reshape(n, count)) == bits(expected_W)
     assert indices == _nearest(H, E).tolist()
 
 
 def test_soft_codes_forward_nears_the_snap_as_it_cools():
     H, E = _codes_inputs(64, 16, 16)
-    hot, _, _ = soft_codes_forward(_array(H), _array(E), 4.0)
-    cold, W, indices = soft_codes_forward(_array(H), _array(E), 1e-4)
-    snapped, _ = codes_forward(_array(H), _array(E))
-    assert np.allclose(_numpy(cold), _numpy(snapped), atol=1e-9)
-    assert not np.allclose(_numpy(hot), _numpy(snapped), atol=1e-3)
-    assert np.allclose(_numpy(W).reshape(64, 16).sum(axis=1), 1.0)
-    assert (np.argmax(_numpy(W).reshape(64, 16), axis=1) == indices).all()
+    hot, _, _ = soft_codes_forward(to_array(H), to_array(E), 4.0)
+    cold, W, indices = soft_codes_forward(to_array(H), to_array(E), 1e-4)
+    snapped, _ = codes_forward(to_array(H), to_array(E))
+    assert np.allclose(to_numpy(cold), to_numpy(snapped), atol=1e-9)
+    assert not np.allclose(to_numpy(hot), to_numpy(snapped), atol=1e-3)
+    assert np.allclose(to_numpy(W).reshape(64, 16).sum(axis=1), 1.0)
+    assert (np.argmax(to_numpy(W).reshape(64, 16), axis=1) == indices).all()
 
 
 @pytest.mark.parametrize("temperature", TEMPERATURES)
@@ -370,11 +366,19 @@ def test_soft_codes_backward_is_numpys(n: int, count: int, size: int, temperatur
     weight, commitment = 1.0 / 3.0, 0.25
     Q, W = _soft(H, E, temperature)
     dH, new_grad_E = soft_codes_backward(
-        _array(dQ), _array(H), _array(Q), _array(W), _array(E), _array(grad_E), weight, commitment, temperature
+        to_array(dQ),
+        to_array(H),
+        to_array(Q),
+        to_array(W),
+        to_array(E),
+        to_array(grad_E),
+        weight,
+        commitment,
+        temperature,
     )
     expected_dH, expected_grad_E = _soft_backward(dQ, H, Q, W, E, grad_E, weight, commitment, temperature)
-    assert _bits(_numpy(dH).reshape(n, size)) == _bits(expected_dH)
-    assert _bits(_numpy(new_grad_E).reshape(count, size)) == _bits(expected_grad_E)
+    assert bits(to_numpy(dH).reshape(n, size)) == bits(expected_dH)
+    assert bits(to_numpy(new_grad_E).reshape(count, size)) == bits(expected_grad_E)
 
 
 @pytest.mark.parametrize("temperature", TEMPERATURES)
@@ -386,13 +390,13 @@ def test_soft_codes_backward_straight_through_is_numpys(n: int, count: int, size
     dQ, grad_E = rng.uniform(-1, 1, (n, size)), rng.uniform(-1, 1, (count, size))
     weight, commitment = 1.0 / 3.0, 0.25
     Q, W = _soft(H, E, temperature)
-    arrays = (_array(dQ), _array(H), _array(Q), _array(W), _array(E), _array(grad_E))
+    arrays = (to_array(dQ), to_array(H), to_array(Q), to_array(W), to_array(E), to_array(grad_E))
     dH, new_grad_E = soft_codes_backward(*arrays, weight, commitment, temperature, straight=True)
     expected_dH, expected_grad_E = _soft_backward(dQ, H, Q, W, E, grad_E, weight, commitment, temperature, True)
-    assert _bits(_numpy(dH).reshape(n, size)) == _bits(expected_dH)
-    assert _bits(_numpy(new_grad_E).reshape(count, size)) == _bits(expected_grad_E)
+    assert bits(to_numpy(dH).reshape(n, size)) == bits(expected_dH)
+    assert bits(to_numpy(new_grad_E).reshape(count, size)) == bits(expected_grad_E)
     _, soft_grad_E = soft_codes_backward(*arrays, weight, commitment, temperature)
-    assert _bits(_numpy(new_grad_E)) == _bits(_numpy(soft_grad_E))
+    assert bits(to_numpy(new_grad_E)) == bits(to_numpy(soft_grad_E))
 
 
 def test_soft_codes_backward_straight_through_nears_the_hard_snaps_as_it_cools():
@@ -401,13 +405,13 @@ def test_soft_codes_backward_straight_through_nears_the_hard_snaps_as_it_cools()
     H, E = _codes_inputs(64, 16, 16)
     rng = np.random.default_rng(11)
     dQ, grad_E = rng.uniform(-1, 1, (64, 16)), np.zeros((16, 16))
-    Q, W, _ = soft_codes_forward(_array(H), _array(E), 1e-4)
+    Q, W, _ = soft_codes_forward(to_array(H), to_array(E), 1e-4)
     dH, soft_grad_E = soft_codes_backward(
-        _array(dQ), _array(H), Q, W, _array(E), _array(grad_E), 0.5, 0.25, 1e-4, straight=True
+        to_array(dQ), to_array(H), Q, W, to_array(E), to_array(grad_E), 0.5, 0.25, 1e-4, straight=True
     )
-    snapped, indices = codes_forward(_array(H), _array(E))
-    hard_dH, hard_grad_E = codes_backward(_array(dQ), _array(H), snapped, indices, _array(grad_E), 0.5, 0.25)
-    np.testing.assert_allclose(_numpy(dH), _numpy(hard_dH), atol=1e-9)
+    snapped, indices = codes_forward(to_array(H), to_array(E))
+    hard_dH, hard_grad_E = codes_backward(to_array(dQ), to_array(H), snapped, indices, to_array(grad_E), 0.5, 0.25)
+    np.testing.assert_allclose(to_numpy(dH), to_numpy(hard_dH), atol=1e-9)
     assert soft_grad_E.shape == hard_grad_E.shape
 
 
@@ -425,18 +429,18 @@ def test_soft_codes_backward_is_the_losss_gradient_by_central_differences():
         return float(np.sum(G * Q_) + weight * (committed + codebook))
 
     dH, grad_E = soft_codes_backward(
-        _array(G),
-        _array(H),
-        _array(Q),
-        _array(W),
-        _array(E),
-        _array(np.zeros((count, size))),
+        to_array(G),
+        to_array(H),
+        to_array(Q),
+        to_array(W),
+        to_array(E),
+        to_array(np.zeros((count, size))),
         weight,
         commitment,
         temperature,
     )
     step = 1e-6
-    for X, analytic, of in ((H, _numpy(dH).reshape(n, size), "h"), (E, _numpy(grad_E).reshape(count, size), "e")):
+    for X, analytic, of in ((H, to_numpy(dH).reshape(n, size), "h"), (E, to_numpy(grad_E).reshape(count, size), "e")):
         numeric = np.zeros_like(X)
         for i in np.ndindex(X.shape):
             up, down = X.copy(), X.copy()
@@ -469,8 +473,8 @@ def test_soft_codes_refuse_a_temperature_not_above_0_and_finite(temperature: flo
 def test_concatenate_columns_is_numpys(widths: list[int]):
     rng = np.random.default_rng(len(widths))
     arrays = [rng.uniform(-1, 1, (4, w)) for w in widths]
-    out = concatenate_columns([_array(a) for a in arrays])
-    assert _bits(_numpy(out)) == _bits(np.concatenate(arrays, axis=1))
+    out = concatenate_columns([to_array(a) for a in arrays])
+    assert bits(to_numpy(out)) == bits(np.concatenate(arrays, axis=1))
 
 
 def test_concatenate_columns_refuses_different_row_counts():

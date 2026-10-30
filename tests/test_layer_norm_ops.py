@@ -7,6 +7,7 @@ numpy transcriptions of indrajala-ml's README expressions (Layer norm and attent
 
 import numpy as np
 import pytest
+from array_helpers import bits, to_numpy
 
 from indrajala_math_rust import (
     Array,
@@ -19,15 +20,6 @@ from indrajala_math_rust import (
 EPSILON = 1e-5
 # (examples, tokens, features): a flat layer is one token; 33 features cross numpy's pairwise block
 SHAPES = [(1, 1, 1), (1, 1, 7), (2, 1, 33), (3, 4, 5), (2, 16, 32), (5, 3, 2)]
-
-
-def _numpy(array: Array) -> np.ndarray:
-    return np.array(array.tolist())
-
-
-def _bits(values: np.ndarray) -> list[bytes]:
-    # by bits, so -0.0 and 0.0 differ, where np.array_equal takes them as equal
-    return [v.tobytes() for v in np.ravel(values).astype(np.float64)]
 
 
 def _sum_features(rows: np.ndarray) -> np.ndarray:
@@ -67,7 +59,7 @@ def _forward(c: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     result = layer_norm_forward_batch(
         Array(c["x"].tolist()), Array(c["gamma"].tolist()), Array(c["beta"].tolist()), EPSILON
     )
-    return {name: _numpy(array) for name, array in zip(["a", "xhat", "std"], result)}
+    return {name: to_numpy(array) for name, array in zip(["a", "xhat", "std"], result)}
 
 
 @pytest.mark.parametrize("examples,tokens,features", SHAPES)
@@ -76,7 +68,7 @@ def test_the_forward_pass_is_the_readmes_expressions(examples: int, tokens: int,
     out, reference = _forward(c), _forward_reference(c)
     for name in ["a", "xhat", "std"]:
         assert out[name].shape == reference[name].shape, name
-        assert _bits(out[name]) == _bits(reference[name]), name
+        assert bits(out[name]) == bits(reference[name]), name
 
 
 @pytest.mark.parametrize("examples,tokens,features", SHAPES)
@@ -87,9 +79,9 @@ def test_one_examples_forward_pass_is_its_batch_rows(examples: int, tokens: int,
         a, xhat, std = layer_norm_forward(
             Array(c["x"][i].tolist()), Array(c["gamma"].tolist()), Array(c["beta"].tolist()), EPSILON
         )
-        assert _bits(_numpy(a)) == _bits(batch["a"][i])
-        assert _bits(_numpy(xhat)) == _bits(batch["xhat"][i])
-        assert _bits(_numpy(std)) == _bits(batch["std"][i * tokens : (i + 1) * tokens])
+        assert bits(to_numpy(a)) == bits(batch["a"][i])
+        assert bits(to_numpy(xhat)) == bits(batch["xhat"][i])
+        assert bits(to_numpy(std)) == bits(batch["std"][i * tokens : (i + 1) * tokens])
 
 
 @pytest.mark.parametrize("examples,tokens,features", SHAPES)
@@ -105,7 +97,7 @@ def test_the_downstream_is_the_readmes_expression(examples: int, tokens: int, fe
     dx = layer_norm_downstream_batch(
         Array(c["delta"].tolist()), Array(c["gamma"].tolist()), Array(t["xhat"].tolist()), Array(t["std"].tolist())
     )
-    assert _bits(_numpy(dx)) == _bits(reference)
+    assert bits(to_numpy(dx)) == bits(reference)
 
 
 @pytest.mark.parametrize("examples,tokens,features", SHAPES)
@@ -119,8 +111,8 @@ def test_the_gradients_are_left_folds_over_the_rows(examples: int, tokens: int, 
         Array(c["grad_gamma"].tolist()),
         Array(c["grad_beta"].tolist()),
     )
-    assert _bits(_numpy(grad_gamma)) == _bits(c["grad_gamma"] + np.cumsum(delta * rows, axis=0)[-1])
-    assert _bits(_numpy(grad_beta)) == _bits(c["grad_beta"] + np.cumsum(delta, axis=0)[-1])
+    assert bits(to_numpy(grad_gamma)) == bits(c["grad_gamma"] + np.cumsum(delta * rows, axis=0)[-1])
+    assert bits(to_numpy(grad_beta)) == bits(c["grad_beta"] + np.cumsum(delta, axis=0)[-1])
 
 
 def test_a_constant_token_normalizes_to_beta():
@@ -158,9 +150,9 @@ def test_one_examples_backward_is_a_batch_of_ones(tokens: int, features: int):
     single = layer_norm_downstream_batch(Array(c["delta"][0].tolist()), gamma, xhat, std)
     batch = layer_norm_downstream_batch(Array(c["delta"].tolist()), gamma, xhat_batch, std_batch)
     assert single.shape == (tokens * features,)
-    assert _bits(_numpy(single)) == _bits(_numpy(batch))
+    assert bits(to_numpy(single)) == bits(to_numpy(batch))
     grads = Array(c["grad_gamma"].tolist()), Array(c["grad_beta"].tolist())
     one = layer_norm_accumulate_gradient_batch(Array(c["delta"][0].tolist()), xhat, *grads)
     many = layer_norm_accumulate_gradient_batch(Array(c["delta"].tolist()), xhat_batch, *grads)
     for u, w in zip(one, many):
-        assert _bits(_numpy(u)) == _bits(_numpy(w))
+        assert bits(to_numpy(u)) == bits(to_numpy(w))

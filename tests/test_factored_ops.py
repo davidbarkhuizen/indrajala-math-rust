@@ -12,6 +12,7 @@ from typing import NamedTuple
 
 import numpy as np
 import pytest
+from array_helpers import bits, to_array, to_numpy
 
 from indrajala_math_rust import (
     Array,
@@ -54,21 +55,8 @@ MIRRORED: list[tuple[Factors, bool]] = [
 ]
 
 
-def _numpy(array: Array) -> np.ndarray:
-    return np.array(array.tolist())
-
-
-def _array(values: np.ndarray) -> Array:
-    return Array(values.tolist())
-
-
-def _bits(values: np.ndarray) -> list[bytes]:
-    # by bits, so -0.0 and 0.0 differ, where np.array_equal takes them as equal
-    return [v.tobytes() for v in np.ravel(values).astype(np.float64)]
-
-
 def _assert_bits(actual: Array, expected: np.ndarray) -> None:
-    assert _bits(_numpy(actual).reshape(expected.shape)) == _bits(expected)
+    assert bits(to_numpy(actual).reshape(expected.shape)) == bits(expected)
 
 
 class Parameters(NamedTuple):
@@ -104,19 +92,19 @@ def _inputs(n: int, tokens: int, d: int, factors: Factors, cross: bool, seed: in
 
 
 def _crate(values: list[np.ndarray]) -> list[Array]:
-    return [_array(v) for v in values]
+    return [to_array(v) for v in values]
 
 
 def _crate_codes(values: list[np.ndarray | None]) -> list[Array | None]:
-    return [None if v is None else _array(v) for v in values]
+    return [None if v is None else to_array(v) for v in values]
 
 
 def _forward(
     X: np.ndarray, C: np.ndarray, params: Parameters, tokens: int, cross: bool, temperatures=None, couplings=None
 ) -> RecurrenceStep:
     return recurrence_step_forward(
-        _array(X),
-        _array(C),
+        to_array(X),
+        to_array(C),
         _crate(params.q),
         _crate(params.W),
         _crate(params.U),
@@ -163,7 +151,7 @@ def _backward(
 ):
     return recurrence_step_backward(
         step,
-        _array(dQ),
+        to_array(dQ),
         _crate(params.q),
         _crate(params.W),
         _crate(params.U),
@@ -194,21 +182,23 @@ def _compose_forward(
     states, hs, indices, saved = [], [], [], []
     for g, ((s, _), start) in enumerate(zip(factors, _starts(factors), strict=True)):
         c = C[:, start : start + s]
-        u, p = attention_pooling_forward(_array(X), _array(params.q[g]), tokens)
-        u = _numpy(u).reshape(X.shape[0], -1)
+        u, p = attention_pooling_forward(to_array(X), to_array(params.q[g]), tokens)
+        u = to_numpy(u).reshape(X.shape[0], -1)
         i = np.concatenate([u, _others(C, factors, g)], axis=1) if cross else u
-        h, *gates = gru_forward(_array(i), _array(c), _array(params.W[g]), _array(params.U[g]), _array(params.b[g]))
+        h, *gates = gru_forward(
+            to_array(i), to_array(c), to_array(params.W[g]), to_array(params.U[g]), to_array(params.b[g])
+        )
         E = params.E[g]
         temperature = None if temperatures is None else temperatures[g]
         weights = None
         if E is None:
             q, idx = h, None
         elif temperature is None:
-            q, idx = codes_forward(h, _array(E))
+            q, idx = codes_forward(h, to_array(E))
         else:
-            q, weights, idx = soft_codes_forward(h, _array(E), temperature)
-        states.append(_numpy(q).reshape(-1, s))
-        hs.append(_numpy(h).reshape(-1, s))
+            q, weights, idx = soft_codes_forward(h, to_array(E), temperature)
+        states.append(to_numpy(q).reshape(-1, s))
+        hs.append(to_numpy(h).reshape(-1, s))
         indices.append(idx)
         saved.append((p, i, c, gates, h, q, idx, (temperature, weights)))
     return Composed(np.concatenate(states, axis=1), np.concatenate(hs, axis=1), indices, saved)
@@ -225,37 +215,39 @@ def _compose_backward(X, dQ, params, grads, composed, factors, tokens, cross, we
         if idx is None:
             dh, grad_e = dq, None
         elif weights is not None:
-            E = _array(params.E[g])
+            E = to_array(params.E[g])
             dh, grad_e = soft_codes_backward(
-                _array(dq), h, q, weights, E, _array(grads.E[g]), weight, commitments[g], temperature
+                to_array(dq), h, q, weights, E, to_array(grads.E[g]), weight, commitments[g], temperature
             )
-            dh = _numpy(dh).reshape(n, s)
+            dh = to_numpy(dh).reshape(n, s)
         else:
-            target = None if targets is None or targets[g] is None else _array(targets[g])
-            dh, grad_e = codes_backward(_array(dq), h, q, idx, _array(grads.E[g]), weight, commitments[g], target)
-            dh = _numpy(dh).reshape(n, s)
+            target = None if targets is None or targets[g] is None else to_array(targets[g])
+            dh, grad_e = codes_backward(to_array(dq), h, q, idx, to_array(grads.E[g]), weight, commitments[g], target)
+            dh = to_numpy(dh).reshape(n, s)
         d_i, dc, gw, gu, gb = gru_backward(
-            _array(dh),
-            _array(i),
-            _array(c),
+            to_array(dh),
+            to_array(i),
+            to_array(c),
             r,
             z,
             h_tilde,
             rc,
-            _array(params.W[g]),
-            _array(params.U[g]),
-            _array(grads.W[g]),
-            _array(grads.U[g]),
-            _array(grads.b[g]),
+            to_array(params.W[g]),
+            to_array(params.U[g]),
+            to_array(grads.W[g]),
+            to_array(grads.U[g]),
+            to_array(grads.b[g]),
         )
-        d_i = _numpy(d_i).reshape(n, -1)
+        d_i = to_numpy(d_i).reshape(n, -1)
         if cross:
             dC_cross.append(d_i[:, d:])
         du = d_i[:, :d]
-        dx, gq = attention_pooling_backward(_array(X), p, _array(params.q[g]), _array(du), _array(grads.q[g]), tokens)
-        dx = _numpy(dx).reshape(n, -1)
+        dx, gq = attention_pooling_backward(
+            to_array(X), p, to_array(params.q[g]), to_array(du), to_array(grads.q[g]), tokens
+        )
+        dx = to_numpy(dx).reshape(n, -1)
         dX = dx if dX is None else dX + dx
-        dC_own.append(_numpy(dc).reshape(n, s))
+        dC_own.append(to_numpy(dc).reshape(n, s))
         new.append((gq, gw, gu, gb, grad_e))
     dC = np.concatenate(dC_own, axis=1)
     for g, piece in enumerate(dC_cross):
@@ -296,11 +288,11 @@ def test_the_step_is_its_composition_factor_by_factor(
     _assert_bits(dC, expected_dC)
     for g, (gq, gw, gu, gb, ge) in enumerate(expected):
         for actual, value in [(grad_q[g], gq), (grad_w[g], gw), (grad_u[g], gu), (grad_b[g], gb)]:
-            assert _bits(_numpy(actual)) == _bits(_numpy(value))
+            assert bits(to_numpy(actual)) == bits(to_numpy(value))
         actual_e = grad_codes[g]
         assert (actual_e is None) == (ge is None)
         if actual_e is not None and ge is not None:
-            assert _bits(_numpy(actual_e)) == _bits(_numpy(ge))
+            assert bits(to_numpy(actual_e)) == bits(to_numpy(ge))
 
 
 def test_the_large_step_is_threaded():
@@ -316,7 +308,7 @@ def test_factored_codes_are_each_factors_codes(n: int, _tokens: int, _d: int, fa
     rng = np.random.default_rng(n)
     sizes = [s for s, _ in factors]
     H = rng.uniform(-1, 1, (n, sum(sizes)))
-    Q, indices = factored_codes_forward(_array(H), sizes, _crate_codes(params.E))
+    Q, indices = factored_codes_forward(to_array(H), sizes, _crate_codes(params.E))
     expected_Q, expected_indices = [], []
     for g, ((s, _), start) in enumerate(zip(factors, _starts(factors), strict=True)):
         h, E = H[:, start : start + s], params.E[g]
@@ -324,8 +316,8 @@ def test_factored_codes_are_each_factors_codes(n: int, _tokens: int, _d: int, fa
             expected_Q.append(h)
             expected_indices.append(None)
         else:
-            q, idx = codes_forward(_array(h), _array(E))
-            expected_Q.append(_numpy(q).reshape(n, s))
+            q, idx = codes_forward(to_array(h), to_array(E))
+            expected_Q.append(to_numpy(q).reshape(n, s))
             expected_indices.append(idx)
     expected = np.concatenate(expected_Q, axis=1)
     _assert_bits(Q, expected)
@@ -336,7 +328,7 @@ def test_factored_codes_are_each_factors_codes(n: int, _tokens: int, _d: int, fa
     weight, commitments = 0.5, [0.25] * len(factors)
     targets: list[np.ndarray | None] = _targets(params, indices) if targeted else [None] * len(factors)
     dH, grad_codes = factored_codes_backward(
-        _array(dQ), _array(H), Q, sizes, indices, _crate_codes(grads), weight, commitments, _crate_codes(targets)
+        to_array(dQ), to_array(H), Q, sizes, indices, _crate_codes(grads), weight, commitments, _crate_codes(targets)
     )
     expected_dH = []
     for g, ((s, _), start) in enumerate(zip(factors, _starts(factors), strict=True)):
@@ -346,18 +338,18 @@ def test_factored_codes_are_each_factors_codes(n: int, _tokens: int, _d: int, fa
             assert grad_codes[g] is None
             continue
         dh, ge = codes_backward(
-            _array(dq),
-            _array(H[:, start : start + s]),
-            _array(expected[:, start : start + s]),
+            to_array(dq),
+            to_array(H[:, start : start + s]),
+            to_array(expected[:, start : start + s]),
             idx,
-            _array(grad),
+            to_array(grad),
             weight,
             commitments[g],
-            None if (target := targets[g]) is None else _array(target),
+            None if (target := targets[g]) is None else to_array(target),
         )
-        expected_dH.append(_numpy(dh).reshape(n, s))
+        expected_dH.append(to_numpy(dh).reshape(n, s))
         actual = grad_codes[g]
-        assert actual is not None and _bits(_numpy(actual)) == _bits(_numpy(ge))
+        assert actual is not None and bits(to_numpy(actual)) == bits(to_numpy(ge))
     _assert_bits(dH, np.concatenate(expected_dH, axis=1))
 
 
@@ -397,7 +389,7 @@ def test_the_step_agrees_with_the_numpy_mirror_and_its_gradients_with_central_di
     X, C, params = _inputs(n, tokens, d, factors, cross, 7 * len(factors))
     step = _forward(X, C, params, tokens, cross)
     np.testing.assert_allclose(
-        _numpy(step.state).reshape(n, -1), _mirror(X, C, params, factors, tokens, cross), atol=1e-12
+        to_numpy(step.state).reshape(n, -1), _mirror(X, C, params, factors, tokens, cross), atol=1e-12
     )
 
     # the loss sum(R * state): its gradient is R, and the parameters' gradients start at zero
@@ -422,7 +414,7 @@ def test_the_step_agrees_with_the_numpy_mirror_and_its_gradients_with_central_di
         return gradient
 
     def close(actual: Array, values: np.ndarray) -> None:
-        np.testing.assert_allclose(_numpy(actual).reshape(values.shape), central(values), rtol=1e-6, atol=1e-8)
+        np.testing.assert_allclose(to_numpy(actual).reshape(values.shape), central(values), rtol=1e-6, atol=1e-8)
 
     assert isinstance(dX, Array)
     close(dX, X)
@@ -438,8 +430,8 @@ def test_the_step_refuses_mismatched_factor_lists():
     X, C, params = _inputs(2, 1, 3, [(2, 4), (2, 4)], False, 1)
     with pytest.raises(ValueError, match="one entry per factor"):
         recurrence_step_forward(
-            _array(X),
-            _array(C),
+            to_array(X),
+            to_array(C),
             _crate(params.q),
             _crate(params.W),
             _crate(params.U),
@@ -484,7 +476,7 @@ def test_temperatures_of_none_are_the_hard_step_by_bits():
     hard = _forward(X, C, params, 2, False)
     nones = _forward(X, C, params, 2, False, [None, None, None])
     for a, b in [(hard.state, nones.state), (hard.h, nones.h)]:
-        assert _bits(_numpy(a)) == _bits(_numpy(b))
+        assert bits(to_numpy(a)) == bits(to_numpy(b))
     assert hard.indices == nones.indices
 
 
@@ -508,7 +500,7 @@ def test_a_coupled_step_passes_on_its_blend_and_splits_its_gradient(soft: bool):
     temperatures = _temperatures(factors) if soft else None
     coupled = _forward(X, C, params, 2, True, temperatures, couplings)
     snapped = _forward(X, C, params, 2, True, temperatures)
-    H, Q = _numpy(snapped.h), _numpy(snapped.state)
+    H, Q = to_numpy(snapped.h), to_numpy(snapped.state)
     starts = np.cumsum([0] + [s for s, _ in factors])
     want = Q.copy()
     for g, l in enumerate(couplings):
@@ -536,7 +528,7 @@ def test_a_coupled_step_passes_on_its_blend_and_splits_its_gradient(soft: bool):
     beside = _backward(free, dQ * (1.0 - scale), free_params, zeros._replace(E=[None, None, None]), 0.5, [0.0] * 3)
 
     def close(a: Array, b: Array, c: Array) -> None:
-        np.testing.assert_allclose(_numpy(a), _numpy(b) + _numpy(c), rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(to_numpy(a), to_numpy(b) + to_numpy(c), rtol=1e-12, atol=1e-12)
 
     for part in (0, 1):  # the tokens' gradient (one array: every factor read the same) and the state's
         a, b, c = got[part], through[part], beside[part]
@@ -553,7 +545,7 @@ def test_a_coupled_step_passes_on_its_blend_and_splits_its_gradient(soft: bool):
     for a, b in zip(got[6], through[6], strict=True):  # the codes' gradients: the snapped path's alone
         assert (a is None) == (b is None)
         if a is not None and b is not None:
-            np.testing.assert_allclose(_numpy(a), _numpy(b), rtol=1e-12, atol=1e-12)
+            np.testing.assert_allclose(to_numpy(a), to_numpy(b), rtol=1e-12, atol=1e-12)
 
 
 def test_a_straight_soft_step_passes_dq_whole_to_its_cell_at_any_coupling():
@@ -580,18 +572,18 @@ def test_a_straight_soft_step_passes_dq_whole_to_its_cell_at_any_coupling():
     for part in (0, 1):
         a, b = got[part], whole[part]
         assert isinstance(a, Array) and isinstance(b, Array)
-        np.testing.assert_allclose(_numpy(a), _numpy(b), rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(to_numpy(a), to_numpy(b), rtol=1e-12, atol=1e-12)
     for a, b in [
         *zip(got[2], whole[2], strict=True),
         *zip(got[3], whole[3], strict=True),
         *zip(got[4], whole[4], strict=True),
         *zip(got[5], whole[5], strict=True),
     ]:
-        np.testing.assert_allclose(_numpy(a), _numpy(b), rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(to_numpy(a), to_numpy(b), rtol=1e-12, atol=1e-12)
     for a, b in zip(got[6], soft[6], strict=True):
         assert (a is None) == (b is None)
         if a is not None and b is not None:
-            assert _numpy(a).tolist() == _numpy(b).tolist()
+            assert to_numpy(a).tolist() == to_numpy(b).tolist()
 
 
 def test_couplings_of_1_are_the_snapped_step_by_bits():
@@ -599,7 +591,7 @@ def test_couplings_of_1_are_the_snapped_step_by_bits():
     X, C, params = _inputs(6, 2, 9, factors, False, 43)
     plain, ones = _forward(X, C, params, 2, False), _forward(X, C, params, 2, False, None, [1.0, 1.0, 1.0])
     for a, b in [(plain.state, ones.state), (plain.h, ones.h)]:
-        assert _bits(_numpy(a)) == _bits(_numpy(b))
+        assert bits(to_numpy(a)) == bits(to_numpy(b))
     dQ = np.random.default_rng(44).uniform(-1, 1, C.shape)
     grads = _gradients(params, np.random.default_rng(45))
     want = _backward(plain, dQ, params, grads, 0.5, [0.25, 0.25, 0.0])
@@ -613,7 +605,7 @@ def test_couplings_of_1_are_the_snapped_step_by_bits():
     for a, b in arrays:
         assert (a is None) == (b is None)
         if a is not None and b is not None:
-            assert _bits(_numpy(a)) == _bits(_numpy(b))
+            assert bits(to_numpy(a)) == bits(to_numpy(b))
 
 
 def test_the_step_refuses_a_coupling_out_of_range_or_below_1_for_a_continuous_factor():

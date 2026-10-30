@@ -11,6 +11,7 @@ numpy's mask from one seed, `X * M / keep` and `delta * M / keep`, by bits.
 
 import numpy as np
 import pytest
+from array_helpers import bits, to_numpy
 
 from indrajala_math_rust import (
     Array,
@@ -33,15 +34,6 @@ ROWS = [None, 1, 3]  # None: a single example
 TOKENS = [(1, 1), (1, 7), (16, 32), (5, 3), (9, 33)]
 # (tokens, vocabulary, size)
 EMBEDDINGS = [(1, 1, 1), (1, 5, 3), (8, 3, 4), (64, 65, 32), (7, 76, 33)]
-
-
-def _numpy(array: Array) -> np.ndarray:
-    return np.array(array.tolist())
-
-
-def _bits(values: np.ndarray) -> list[bytes]:
-    # by bits, so -0.0 and 0.0 differ, where np.array_equal takes them as equal
-    return [v.tobytes() for v in np.ravel(values).astype(np.float64)]
 
 
 def _batch(values: np.ndarray, rows: int | None) -> np.ndarray:
@@ -68,24 +60,24 @@ def test_patches_are_numpys_permutation_and_the_downstream_its_inverse(
 ):
     rng = np.random.default_rng(height * 1000 + width * 10 + channels)
     x = rng.uniform(-1.0, 1.0, (rows or 1, height * width * channels))
-    out = _numpy(patches_forward(Array(_batch(x, rows).tolist()), height, width, channels, p))
+    out = to_numpy(patches_forward(Array(_batch(x, rows).tolist()), height, width, channels, p))
     assert out.shape == _batch(x, rows).shape
-    assert _bits(out) == _bits(_patches_reference(x, height, width, channels, p))
+    assert bits(out) == bits(_patches_reference(x, height, width, channels, p))
 
     delta = rng.uniform(-1.0, 1.0, x.shape)
-    dx = _numpy(patches_downstream(Array(_batch(delta, rows).tolist()), height, width, channels, p))
-    assert _bits(dx) == _bits(_patches_downstream_reference(delta, height, width, channels, p))
+    dx = to_numpy(patches_downstream(Array(_batch(delta, rows).tolist()), height, width, channels, p))
+    assert bits(dx) == bits(_patches_downstream_reference(delta, height, width, channels, p))
     # the inverse: the downstream of the forward's output is the input
     back = patches_downstream(
         patches_forward(Array(x.tolist()), height, width, channels, p), height, width, channels, p
     )
-    assert _bits(_numpy(back)) == _bits(x)
+    assert bits(to_numpy(back)) == bits(x)
 
 
 def test_mnist_patches_put_each_7x7_patch_in_its_token():
     # pixel (h, w) of a 28 x 28 image is feature (h % 7) * 7 + (w % 7) of token (h // 7) * 4 + w // 7
     x = np.arange(28 * 28, dtype=np.float64)
-    out = _numpy(patches_forward(Array(x.tolist()), 28, 28, 1, 7)).reshape(16, 49)
+    out = to_numpy(patches_forward(Array(x.tolist()), 28, 28, 1, 7)).reshape(16, 49)
     for h, w in [(0, 0), (6, 6), (7, 0), (13, 20), (27, 27)]:
         assert out[(h // 7) * 4 + w // 7, (h % 7) * 7 + w % 7] == h * 28 + w
 
@@ -98,24 +90,24 @@ def test_the_token_mean_is_a_left_fold_over_the_tokens_and_its_downstream_shares
     rng = np.random.default_rng(tokens * 100 + features)
     n = rows or 1
     x = rng.uniform(-1.0, 1.0, (n, tokens * features))
-    out = _numpy(token_mean_forward(Array(_batch(x, rows).tolist()), tokens))
+    out = to_numpy(token_mean_forward(Array(_batch(x, rows).tolist()), tokens))
     reference = np.cumsum(x.reshape(n, tokens, features), axis=1)[:, -1, :] / tokens
     assert out.shape == _batch(reference, rows).shape
-    assert _bits(out) == _bits(reference)
+    assert bits(out) == bits(reference)
 
     delta = rng.uniform(-1.0, 1.0, (n, features))
-    dx = _numpy(token_mean_downstream(Array(_batch(delta, rows).tolist()), tokens))
+    dx = to_numpy(token_mean_downstream(Array(_batch(delta, rows).tolist()), tokens))
     share = (delta / tokens)[:, np.newaxis, :]
     assert dx.shape == ((tokens * features,) if rows is None else (n, tokens * features))
-    assert _bits(dx) == _bits(np.broadcast_to(share, (n, tokens, features)))
+    assert bits(dx) == bits(np.broadcast_to(share, (n, tokens, features)))
 
 
 def test_a_position_table_is_added_with_plus_and_its_gradient_summed_with_sum_axis0():
     rng = np.random.default_rng(7)
     x, table, delta = rng.uniform(-1.0, 1.0, (5, 12)), rng.uniform(-1.0, 1.0, 12), rng.uniform(-1.0, 1.0, (5, 12))
     out = Array(x.tolist()) + Array(table.tolist())
-    assert _bits(_numpy(out)) == _bits(x + table)
-    assert _bits(_numpy(sum_axis0(Array(delta.tolist())))) == _bits(np.cumsum(delta, axis=0)[-1])
+    assert bits(to_numpy(out)) == bits(x + table)
+    assert bits(to_numpy(sum_axis0(Array(delta.tolist())))) == bits(np.cumsum(delta, axis=0)[-1])
 
 
 @pytest.mark.parametrize("tokens,vocabulary,size", EMBEDDINGS)
@@ -128,10 +120,10 @@ def test_an_embedding_reads_each_ids_row_and_scatter_adds_its_gradient_in_row_or
     n = rows or 1
     ids = rng.integers(0, vocabulary, (n, tokens)).astype(np.float64)
     table = rng.uniform(-1.0, 1.0, (vocabulary, size))
-    out = _numpy(embedding_forward(Array(_batch(ids, rows).tolist()), Array(table.tolist())))
+    out = to_numpy(embedding_forward(Array(_batch(ids, rows).tolist()), Array(table.tolist())))
     reference = table[ids.astype(np.intp)].reshape(n, tokens * size)
     assert out.shape == _batch(reference, rows).shape
-    assert _bits(out) == _bits(reference)
+    assert bits(out) == bits(reference)
 
     delta = rng.uniform(-1.0, 1.0, (n, tokens * size))
     grad = rng.uniform(-1.0, 1.0, (vocabulary, size))
@@ -141,13 +133,15 @@ def test_an_embedding_reads_each_ids_row_and_scatter_adds_its_gradient_in_row_or
     expected = grad.copy()
     np.add.at(expected, ids.astype(np.intp).reshape(-1), delta.reshape(-1, size))
     assert updated.shape == (vocabulary, size)
-    assert _bits(_numpy(updated)) == _bits(expected)
+    assert bits(to_numpy(updated)) == bits(expected)
 
 
 def test_an_embeddings_gradient_adds_a_repeated_ids_rows_in_their_order():
     # 1e16 + 1.0 + 1.0 loses both ones, (1.0 + 1.0) + 1e16 keeps them: the order shows
     delta = Array([[1e16, 1.0, 1.0], [1.0, 1.0, 1e16]])
-    out = _numpy(embedding_accumulate_gradient(delta, Array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]), Array([[0.0], [0.0]])))
+    out = to_numpy(
+        embedding_accumulate_gradient(delta, Array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]), Array([[0.0], [0.0]]))
+    )
     assert out.tolist() == [[(1e16 + 1.0) + 1.0], [(1.0 + 1.0) + 1e16]]
     assert out[0, 0] != out[1, 0]
 
@@ -192,11 +186,11 @@ def test_the_token_dropout_is_numpys_mask_and_scaling(
     reference = np.random.default_rng(9)
     expected = (reference.random(x.shape) >= drop_probability).astype(np.float64)
     keep = 1.0 - drop_probability
-    assert _bits(_numpy(mask)) == _bits(expected) and _numpy(mask).shape == x.shape
-    assert _bits(_numpy(a)) == _bits(x * expected / keep)
+    assert bits(to_numpy(mask)) == bits(expected) and to_numpy(mask).shape == x.shape
+    assert bits(to_numpy(a)) == bits(x * expected / keep)
     assert rng.state == reference.bit_generator.state
     downstream = token_dropout_downstream(Array(delta.tolist()), mask, drop_probability)
-    assert _bits(_numpy(downstream)) == _bits(delta * expected / keep)
+    assert bits(to_numpy(downstream)) == bits(delta * expected / keep)
 
 
 def test_the_token_dropout_ops_refuse_a_probability_outside_0_to_1_and_misshapen_masks():

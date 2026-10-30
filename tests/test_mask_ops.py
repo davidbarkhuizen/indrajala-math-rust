@@ -8,6 +8,7 @@ expression in the same grouping, which is correctly rounded, so the bits must ag
 
 import numpy as np
 import pytest
+from array_helpers import bits, to_numpy
 
 from indrajala_math_rust import (
     Array,
@@ -25,15 +26,6 @@ from indrajala_math_rust import (
 SIZES = [(1, 1), (3, 2), (8, 5), (33, 7)]
 ROWS = [None, 1, 2, 9]  # None: a single example
 KEEP = 0.75
-
-
-def _numpy(array: Array) -> np.ndarray:
-    return np.array(array.tolist())
-
-
-def _bits(values: np.ndarray) -> list[bytes]:
-    # by bits, so -0.0 and 0.0 differ, where np.array_equal takes them as equal
-    return [v.tobytes() for v in np.ravel(values).astype(np.float64)]
 
 
 def _arrays(seed: int, next_size: int, size: int, rows: int | None) -> dict[str, np.ndarray]:
@@ -61,9 +53,9 @@ def test_the_sigmoid_mask_of_the_downstream_is_the_fused_hidden_delta(next_size:
     a = Array(c["a"].tolist())
     w, delta = Array(c["next_w"].tolist()), Array(c["next_delta"].tolist())
     fused = layer_hidden_delta(w, delta, a) if rows is None else layer_hidden_delta_batch(w, delta, a)
-    masked = _numpy(array_sigmoid_mask(downstream, a))
-    assert _bits(masked) == _bits(_numpy(fused))
-    assert _bits(masked) == _bits(_numpy(downstream) * c["a"] * (1.0 - c["a"]))
+    masked = to_numpy(array_sigmoid_mask(downstream, a))
+    assert bits(masked) == bits(to_numpy(fused))
+    assert bits(masked) == bits(to_numpy(downstream) * c["a"] * (1.0 - c["a"]))
 
 
 @pytest.mark.parametrize("next_size,size", SIZES)
@@ -78,10 +70,10 @@ def test_the_dropout_mask_of_the_downstream_is_the_fused_hidden_delta(
     w, delta = Array(c["next_w"].tolist()), Array(c["next_delta"].tolist())
     op = layer_dropout_hidden_delta if rows is None else layer_dropout_hidden_delta_batch
     fused = op(w, delta, base, mask, KEEP, was_training)
-    masked = _numpy(array_dropout_mask(downstream, base, mask, KEEP, was_training))
+    masked = to_numpy(array_dropout_mask(downstream, base, mask, KEEP, was_training))
     scale = c["mask"] / KEEP if was_training else 1.0
-    assert _bits(masked) == _bits(_numpy(fused))
-    assert _bits(masked) == _bits(_numpy(downstream) * (c["a"] * (1.0 - c["a"])) * scale)
+    assert bits(masked) == bits(to_numpy(fused))
+    assert bits(masked) == bits(to_numpy(downstream) * (c["a"] * (1.0 - c["a"])) * scale)
 
 
 def test_the_mask_ops_refuse_arrays_of_other_shapes():
