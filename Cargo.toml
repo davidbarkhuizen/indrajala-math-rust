@@ -8,7 +8,11 @@ edition = "2021"
 name = "indrajala_math_rust"
 crate-type = ["cdylib"]
 
+[workspace]
+members = ["core"]
+
 [dependencies]
+indrajala-math = { path = "core", version = "0.1.0" }
 # multiple-pymethods: lets each source file (array.rs, ops.rs, linalg.rs, ...) add its own
 # `#[pymethods] impl RustArray` block instead of accreting every method into one growing
 # block in array.rs.

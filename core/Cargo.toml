@@ -1,0 +1,10 @@
+[package]
+name = "indrajala-math"
+version = "0.1.0"
+license = "MIT"
+edition = "2021"
+
+[lints.clippy]
+# The kernels index several fixed-size accumulators and tiles in lockstep with one loop
+# variable (acc[r][j], b_tile[j]), mirroring the math; iterator chains would obscure it.
+needless_range_loop = "allow"
