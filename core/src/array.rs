@@ -42,36 +42,45 @@ impl Array {
     }
 }
 
-/// `a`'s transpose: a copy on 1D (numpy's `.T` is a no-op there), the real transpose on 2D.
-#[inline]
-pub fn transpose(a: &Array) -> Array {
-    match a.shape {
-        Shape::Vector(_) => Array {
-            data: a.data.clone(),
-            shape: a.shape,
-        },
-        Shape::Matrix(rows, cols) => {
-            // In 8 x 8 blocks, so each block reads 8 source lines and writes 8 whole output
-            // lines. A row-by-row loop writes a line per element at a stride of `rows`; at
-            // 512 rows that stride is 4 KB, every write lands in the same L1 set, and the
-            // (512, 30) delta_batch.T of the dense accumulate took 87-107 µs against numpy's
-            // 8-12. A copy, so bit-identical in any order.
-            const BLOCK: usize = 8;
-            let mut out = vec![0.0; rows * cols];
-            for row_start in (0..rows).step_by(BLOCK) {
-                let row_end = (row_start + BLOCK).min(rows);
-                for col_start in (0..cols).step_by(BLOCK) {
-                    let col_end = (col_start + BLOCK).min(cols);
-                    #[cfg(target_arch = "aarch64")]
-                    // Safety: the block lies within both `a.data` and `out`.
-                    unsafe {
-                        transpose_block_neon(a.data, &mut out, rows, cols, row_start..row_end, col_start..col_end);
+impl Array {
+    /// This array's transpose: a copy on 1D (numpy's `.T` is a no-op there), the real transpose on 2D.
+    #[inline]
+    pub fn transpose(&self) -> Array {
+        match self.shape {
+            Shape::Vector(_) => Array {
+                data: self.data.clone(),
+                shape: self.shape,
+            },
+            Shape::Matrix(rows, cols) => {
+                // In 8 x 8 blocks, so each block reads 8 source lines and writes 8 whole output
+                // lines. A row-by-row loop writes a line per element at a stride of `rows`; at
+                // 512 rows that stride is 4 KB, every write lands in the same L1 set, and the
+                // (512, 30) delta_batch.T of the dense accumulate took 87-107 µs against numpy's
+                // 8-12. A copy, so bit-identical in any order.
+                const BLOCK: usize = 8;
+                let mut out = vec![0.0; rows * cols];
+                for row_start in (0..rows).step_by(BLOCK) {
+                    let row_end = (row_start + BLOCK).min(rows);
+                    for col_start in (0..cols).step_by(BLOCK) {
+                        let col_end = (col_start + BLOCK).min(cols);
+                        #[cfg(target_arch = "aarch64")]
+                        // Safety: the block lies within both `self.data` and `out`.
+                        unsafe {
+                            transpose_block_neon(
+                                &self.data,
+                                &mut out,
+                                rows,
+                                cols,
+                                row_start..row_end,
+                                col_start..col_end,
+                            );
+                        }
+                        #[cfg(not(target_arch = "aarch64"))]
+                        transpose_block(&self.data, &mut out, rows, cols, row_start..row_end, col_start..col_end);
                     }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    transpose_block(&a.data, &mut out, rows, cols, row_start..row_end, col_start..col_end);
                 }
+                Array::from_matrix(out, cols, rows)
             }
-            Array::from_matrix(out, cols, rows)
         }
     }
 }

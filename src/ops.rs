@@ -1,7 +1,8 @@
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 
-use crate::array::{RustArray, Shape};
+use crate::array::RustArray;
+use crate::linalg::py_err;
 use indrajala_math::Array;
 
 /// Accepts a Python int or float as a scalar operand (`grad_W / batch_size` passes a Python
@@ -16,58 +17,20 @@ fn extract_scalar(value: &Bound<'_, PyAny>) -> PyResult<f64> {
     Err(PyTypeError::new_err("expected a numeric scalar"))
 }
 
-// pub(crate): fused.rs's layer_apply_accumulated_gradient reuses this directly rather than
-// hand-writing the same zip/map loop for its own W/grad_W and b/grad_b scaled-subtract pairs.
-pub(crate) fn same_shape_elementwise(a: &[f64], b: &[f64], op: impl Fn(f64, f64) -> f64) -> Vec<f64> {
-    a.iter().zip(b.iter()).map(|(&x, &y)| op(x, y)).collect()
-}
-
-fn scalar_elementwise(a: &[f64], scalar: f64, op: impl Fn(f64, f64) -> f64) -> Vec<f64> {
-    a.iter().map(|&x| op(x, scalar)).collect()
-}
-
-/// Broadcasts `vector` (length `cols`) across every row of a `rows x cols` matrix - the one
-/// broadcasting case this core needs, alongside plain same-shape elementwise addition
-/// (`X @ self.W.T + self.b`).
-fn broadcast_row(matrix: &[f64], rows: usize, cols: usize, vector: &[f64], op: impl Fn(f64, f64) -> f64) -> Vec<f64> {
-    let mut out = Vec::with_capacity(rows * cols);
-    for row in 0..rows {
-        for col in 0..cols {
-            out.push(op(matrix[row * cols + col], vector[col]));
-        }
-    }
-    out
-}
+pub(crate) use indrajala_math::ops::{same_shape_elementwise, scalar_elementwise};
 
 impl RustArray {
+    /// The core's `combine_with_array`, raised as `ValueError`; for the bindings' own modules.
     pub(crate) fn combine_with_array(
         &self,
         other: &RustArray,
         op: impl Fn(f64, f64) -> f64,
         op_name: &str,
     ) -> PyResult<RustArray> {
-        match (self.shape, other.shape) {
-            (Shape::Matrix(rows, cols), Shape::Vector(n)) if n == cols => Ok(RustArray::from_matrix(
-                broadcast_row(&self.data, rows, cols, &other.data, &op),
-                rows,
-                cols,
-            )),
-            (Shape::Vector(n), Shape::Matrix(rows, cols)) if n == cols => Ok(RustArray::from_matrix(
-                broadcast_row(&other.data, rows, cols, &self.data, |matrix_value, vector_value| {
-                    op(vector_value, matrix_value)
-                }),
-                rows,
-                cols,
-            )),
-            (a_shape, b_shape) if a_shape == b_shape => Ok(RustArray(Array {
-                data: same_shape_elementwise(&self.data, &other.data, op),
-                shape: self.shape,
-            })),
-            (a_shape, b_shape) => Err(PyValueError::new_err(format!(
-                "cannot {op_name} arrays of shape {:?} and {:?}",
-                a_shape, b_shape
-            ))),
-        }
+        self.0
+            .combine_with_array(other, op, op_name)
+            .map(RustArray::from)
+            .map_err(py_err)
     }
 }
 

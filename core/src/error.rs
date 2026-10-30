@@ -9,6 +9,13 @@ pub enum Error {
     InvalidArgument(String),
 }
 
+impl Error {
+    /// An [`Error::InvalidArgument`] with `message`.
+    pub(crate) fn invalid(message: impl Into<String>) -> Self {
+        Error::InvalidArgument(message.into())
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

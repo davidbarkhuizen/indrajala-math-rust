@@ -5,9 +5,6 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use indrajala_math::linalg;
-pub(crate) use indrajala_math::linalg::{
-    matmul_thread_count, narrow_rows_per_block, tiled_row_range, Panel, OVERWRITE,
-};
 
 use crate::array::RustArray;
 
@@ -32,11 +29,6 @@ pub(crate) fn matmul_add(c: &RustArray, a: &RustArray, b: &RustArray) -> PyResul
 /// `a @ b.T` (`linalg::matmul_nt`).
 pub(crate) fn matmul_nt(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
     linalg::matmul_nt(a, b).map(RustArray::from).map_err(py_err)
-}
-
-/// `a @ b` for few rows and a long `K` (`linalg::matmul_long_k`).
-pub(crate) fn matmul_long_k(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
-    linalg::matmul_long_k(a, b).map(RustArray::from).map_err(py_err)
 }
 
 /// Test/benchmark hook: max threads and threshold in flops for every threaded matmul

@@ -4,8 +4,14 @@
 //! nothing at the boundary.
 
 mod array;
+pub mod batch_norm;
+pub mod conv;
+pub mod cr_exp;
 mod error;
+pub mod layer_norm;
 pub mod linalg;
+pub mod ops;
+pub mod scalar;
 
-pub use array::{transpose, Array, Shape};
+pub use array::{Array, Shape};
 pub use error::Error;

@@ -230,7 +230,7 @@ impl RustArray {
     pub(crate) fn transpose(&self) -> Self {
         match self.shape {
             Shape::Vector(_) => self.clone(),
-            Shape::Matrix(..) => indrajala_math::transpose(self).into(),
+            Shape::Matrix(..) => self.0.transpose().into(),
         }
     }
 
