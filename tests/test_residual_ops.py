@@ -9,6 +9,7 @@ grouping, so the bits must agree.
 
 import numpy as np
 import pytest
+from array_helpers import bits, to_array, to_numpy
 
 from indrajala_math_rust import (
     Array,
@@ -38,15 +39,6 @@ SIZES = [(1, 1), (3, 2), (8, 5), (33, 7)]
 BATCHES = [1, 2, 9]
 
 
-def _numpy(array: Array) -> np.ndarray:
-    return np.array(array.tolist())
-
-
-def _bits(values: np.ndarray) -> list[bytes]:
-    # by bits, so -0.0 and 0.0 differ, where np.array_equal takes them as equal
-    return [v.tobytes() for v in np.ravel(values).astype(np.float64)]
-
-
 def _arrays(seed: int, body_size: int, size: int, rows: int | None) -> dict[str, np.ndarray]:
     # the body's first layer's W and delta, the add's delta (skip), and this layer's activations,
     # single-example (rows None) or a batch
@@ -64,13 +56,9 @@ def _arrays(seed: int, body_size: int, size: int, rows: int | None) -> dict[str,
     }
 
 
-def _array(values: np.ndarray) -> Array:
-    return Array(values.tolist())
-
-
 def _downstream(arrays: dict[str, np.ndarray], batch: bool) -> np.ndarray:
-    w, delta = _array(arrays["body_w"]), _array(arrays["body_delta"])
-    return _numpy(layer_downstream_batch(w, delta) if batch else layer_downstream(w, delta))
+    w, delta = to_array(arrays["body_w"]), to_array(arrays["body_delta"])
+    return to_numpy(layer_downstream_batch(w, delta) if batch else layer_downstream(w, delta))
 
 
 @pytest.mark.parametrize("rows", [None, *BATCHES])
@@ -82,9 +70,9 @@ def test_the_sigmoid_skip_delta_is_the_downstream_plus_skip_times_the_derivative
     ds = _downstream(arrays, rows is not None) + arrays["skip"]
     a = arrays["a"]
     op = layer_hidden_delta_skip if rows is None else layer_hidden_delta_skip_batch
-    actual = op(_array(arrays["body_w"]), _array(arrays["body_delta"]), _array(arrays["skip"]), _array(a))
+    actual = op(to_array(arrays["body_w"]), to_array(arrays["body_delta"]), to_array(arrays["skip"]), to_array(a))
 
-    assert _bits(_numpy(actual)) == _bits(ds * a * (1.0 - a))
+    assert bits(to_numpy(actual)) == bits(ds * a * (1.0 - a))
 
 
 @pytest.mark.parametrize("rows", [None, *BATCHES])
@@ -94,10 +82,10 @@ def test_the_relu_skip_delta_masks_the_downstream_plus_skip(body_size: int, size
     ds = _downstream(arrays, rows is not None) + arrays["skip"]
     a = arrays["a"]
     op = layer_relu_hidden_delta_skip if rows is None else layer_relu_hidden_delta_skip_batch
-    actual = op(_array(arrays["body_w"]), _array(arrays["body_delta"]), _array(arrays["skip"]), _array(a))
+    actual = op(to_array(arrays["body_w"]), to_array(arrays["body_delta"]), to_array(arrays["skip"]), to_array(a))
 
     # an inactive unit's delta is +0.0, as layer_relu_hidden_delta's
-    assert _bits(_numpy(actual)) == _bits(np.where(a > 0.0, ds, 0.0))
+    assert bits(to_numpy(actual)) == bits(np.where(a > 0.0, ds, 0.0))
 
 
 @pytest.mark.parametrize("was_training", [True, False])
@@ -111,17 +99,17 @@ def test_the_dropout_skip_delta_scales_the_downstream_plus_skip(
     base, mask, keep = arrays["a"], arrays["mask"], 0.7
     op = layer_dropout_hidden_delta_skip if rows is None else layer_dropout_hidden_delta_skip_batch
     actual = op(
-        _array(arrays["body_w"]),
-        _array(arrays["body_delta"]),
-        _array(arrays["skip"]),
-        _array(base),
-        _array(mask),
+        to_array(arrays["body_w"]),
+        to_array(arrays["body_delta"]),
+        to_array(arrays["skip"]),
+        to_array(base),
+        to_array(mask),
         keep,
         was_training,
     )
 
     scale = mask / keep if was_training else 1.0
-    assert _bits(_numpy(actual)) == _bits(ds * (base * (1.0 - base)) * scale)
+    assert bits(to_numpy(actual)) == bits(ds * (base * (1.0 - base)) * scale)
 
 
 @pytest.mark.parametrize("rows", [None, 3])
@@ -129,8 +117,8 @@ def test_a_zero_skip_gives_the_ops_without_it(rows: int | None):
     # the skip is one addition before the derivative, so with skip 0 each op is its non-skip form
     # (up to the sign of a zero: -0.0 + 0.0 is 0.0)
     arrays = _arrays(4, 6, 4, rows)
-    w, delta, a, mask = (_array(arrays[name]) for name in ("body_w", "body_delta", "a", "mask"))
-    zero = _array(np.zeros_like(arrays["skip"]))
+    w, delta, a, mask = (to_array(arrays[name]) for name in ("body_w", "body_delta", "a", "mask"))
+    zero = to_array(np.zeros_like(arrays["skip"]))
     batch = rows is not None
     pairs = [
         (
@@ -149,7 +137,7 @@ def test_a_zero_skip_gives_the_ops_without_it(rows: int | None):
         ),
     ]
     for skip, plain in pairs:
-        assert np.array_equal(_numpy(skip), _numpy(plain))
+        assert np.array_equal(to_numpy(skip), to_numpy(plain))
 
 
 def test_the_skip_ops_refuse_a_skip_of_another_shape():
@@ -165,18 +153,18 @@ def test_the_skip_ops_refuse_a_skip_of_another_shape():
 @pytest.mark.parametrize("size, input_size", [(1, 1), (4, 3), (7, 33)])
 def test_the_affine_forward_pass_is_the_dense_layers_pre_activation(size: int, input_size: int):
     rng = np.random.default_rng(size)
-    w = _array(rng.uniform(-1.0, 1.0, (size, input_size)))
-    b = _array(rng.uniform(-1.0, 1.0, size))
+    w = to_array(rng.uniform(-1.0, 1.0, (size, input_size)))
+    b = to_array(rng.uniform(-1.0, 1.0, size))
     x_rows = rng.uniform(-1.0, 1.0, (5, input_size))
 
-    batch = _numpy(affine_forward_batch(w, _array(x_rows), b))
-    sigmoid_batch = _numpy(layer_forward_batch(w, _array(x_rows), b))
+    batch = to_numpy(affine_forward_batch(w, to_array(x_rows), b))
+    sigmoid_batch = to_numpy(layer_forward_batch(w, to_array(x_rows), b))
     for i, x_row in enumerate(x_rows):
-        z = affine_forward(w, _array(x_row), b)
-        assert _bits(_numpy(z)) == _bits(_numpy(w @ _array(x_row) + b))
+        z = affine_forward(w, to_array(x_row), b)
+        assert bits(to_numpy(z)) == bits(to_numpy(w @ to_array(x_row) + b))
         # row i of the batch is the single-example product, as for layer_forward_batch
-        assert _bits(batch[i]) == _bits(_numpy(z))
+        assert bits(batch[i]) == bits(to_numpy(z))
         # and the sigmoid layer's activation is the sigmoid of it, with the crate's exp
-        sigmoid = 1.0 / (1.0 + _numpy(exp(_array(-_numpy(z)))))
-        assert _bits(_numpy(layer_forward(w, _array(x_row), b))) == _bits(sigmoid)
-        assert _bits(sigmoid_batch[i]) == _bits(sigmoid)
+        sigmoid = 1.0 / (1.0 + to_numpy(exp(to_array(-to_numpy(z)))))
+        assert bits(to_numpy(layer_forward(w, to_array(x_row), b))) == bits(sigmoid)
+        assert bits(sigmoid_batch[i]) == bits(sigmoid)

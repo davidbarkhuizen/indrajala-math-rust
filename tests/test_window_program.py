@@ -17,6 +17,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+from array_helpers import bits
 
 from indrajala_math_rust import (
     Array,
@@ -70,14 +71,9 @@ def _tokens(read: list[Array | None]) -> Array | list[Array]:
     return first if all(a is first for a in read) else [a for a in read if a is not None]
 
 
-def _bits(array: Array) -> list[bytes]:
-    # by bits, so -0.0 and 0.0 differ
-    return [v.tobytes() for v in np.ravel(np.array(array.tolist(), dtype=np.float64))]
-
-
 def _assert_bits(actual: Array, expected: Array) -> None:
     assert actual.shape == expected.shape
-    assert _bits(actual) == _bits(expected)
+    assert bits(actual) == bits(expected)
 
 
 def _random(rng: np.random.Generator, *shape: int) -> Array:
