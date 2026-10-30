@@ -58,6 +58,7 @@ impl Array {
 }
 
 /// `a`'s transpose: a copy on 1D (numpy's `.T` is a no-op there), the real transpose on 2D.
+#[inline]
 pub fn transpose(a: ArrayView<'_>) -> Array {
     match a.shape {
         Shape::Vector(_) => Array {
