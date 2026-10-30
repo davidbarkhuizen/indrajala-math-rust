@@ -9,12 +9,18 @@ use indrajala_math::{random, Shape};
 fn the_global_generator_is_numpys_legacy_stream() {
     random::seed_word(42);
     let draws = random::random(Shape::Vector(3));
-    assert_eq!(draws.data(), &[0.3745401188473625, 0.9507143064099162, 0.7319939418114051]);
+    assert_eq!(
+        draws.data(),
+        &[0.3745401188473625, 0.9507143064099162, 0.7319939418114051]
+    );
 }
 
 #[test]
 fn default_rng_is_numpys_pcg64_stream() {
     let mut generator = Generator::from_seed_sequence(&SeedSequence::from_words(&[42], &[]));
     let draws = generator.random(Shape::Vector(3));
-    assert_eq!(draws.data(), &[0.7739560485559633, 0.4388784397520523, 0.8585979199113825]);
+    assert_eq!(
+        draws.data(),
+        &[0.7739560485559633, 0.4388784397520523, 0.8585979199113825]
+    );
 }
