@@ -41,10 +41,9 @@ impl RustArray {
             self.combine_with_array(&other_ref, |a, b| a + b, "add")
         } else {
             let scalar = extract_scalar(other)?;
-            Ok(RustArray(Array {
-                data: scalar_elementwise(&self.data, scalar, |a, b| a + b),
-                shape: self.shape,
-            }))
+            Ok(RustArray(
+                Array::new(scalar_elementwise(self.0.data(), scalar, |a, b| a + b), self.0.shape()).map_err(py_err)?,
+            ))
         }
     }
 
@@ -53,10 +52,9 @@ impl RustArray {
             self.combine_with_array(&other_ref, |a, b| a - b, "subtract")
         } else {
             let scalar = extract_scalar(other)?;
-            Ok(RustArray(Array {
-                data: scalar_elementwise(&self.data, scalar, |a, b| a - b),
-                shape: self.shape,
-            }))
+            Ok(RustArray(
+                Array::new(scalar_elementwise(self.0.data(), scalar, |a, b| a - b), self.0.shape()).map_err(py_err)?,
+            ))
         }
     }
 
@@ -65,10 +63,9 @@ impl RustArray {
     /// array-minus-array.
     fn __rsub__(&self, other: &Bound<'_, PyAny>) -> PyResult<RustArray> {
         let scalar = extract_scalar(other)?;
-        Ok(RustArray(Array {
-            data: scalar_elementwise(&self.data, scalar, |a, b| b - a),
-            shape: self.shape,
-        }))
+        Ok(RustArray(
+            Array::new(scalar_elementwise(self.0.data(), scalar, |a, b| b - a), self.0.shape()).map_err(py_err)?,
+        ))
     }
 
     fn __mul__(&self, other: &Bound<'_, PyAny>) -> PyResult<RustArray> {
@@ -76,10 +73,9 @@ impl RustArray {
             self.combine_with_array(&other_ref, |a, b| a * b, "multiply")
         } else {
             let scalar = extract_scalar(other)?;
-            Ok(RustArray(Array {
-                data: scalar_elementwise(&self.data, scalar, |a, b| a * b),
-                shape: self.shape,
-            }))
+            Ok(RustArray(
+                Array::new(scalar_elementwise(self.0.data(), scalar, |a, b| a * b), self.0.shape()).map_err(py_err)?,
+            ))
         }
     }
 
@@ -95,14 +91,13 @@ impl RustArray {
             self.combine_with_array(&other_ref, |a, b| a / b, "divide")
         } else {
             let scalar = extract_scalar(other)?;
-            Ok(RustArray(Array {
-                data: scalar_elementwise(&self.data, scalar, |a, b| a / b),
-                shape: self.shape,
-            }))
+            Ok(RustArray(
+                Array::new(scalar_elementwise(self.0.data(), scalar, |a, b| a / b), self.0.shape()).map_err(py_err)?,
+            ))
         }
     }
 
-    /// A true in-place op (mutates `self.data` directly, `&mut self` with a `()` return) -
+    /// A true in-place op (replaces the array's values, `&mut self` with a `()` return) -
     /// `self._grad_W += ...` every training step should not allocate a fresh Python object on
     /// every call.
     fn __iadd__(&mut self, other: &Bound<'_, PyAny>) -> PyResult<()> {

@@ -2,6 +2,7 @@ use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PySlice, PyTuple};
 
+use crate::linalg::py_err;
 use indrajala_math::Array;
 pub use indrajala_math::Shape;
 
@@ -25,7 +26,7 @@ pub(crate) fn parse_shape(shape: &Bound<'_, PyAny>) -> PyResult<Shape> {
 #[derive(Clone)]
 pub struct RustArray(pub Array);
 
-/// Field access (`a.data`, `a.shape`) and every core operation (`&Array`) reach the core array
+/// The core array's methods (`a.data()`, `a.shape()`) and every core operation (`&Array`) reach it
 /// directly, so nothing is copied at the boundary.
 impl std::ops::Deref for RustArray {
     type Target = Array;
@@ -133,7 +134,7 @@ impl RustArray {
         if i >= rows {
             return Err(PyIndexError::new_err("row index out of range"));
         }
-        Ok(RustArray::from_vector(self.data[i * cols..(i + 1) * cols].to_vec()))
+        Ok(RustArray::from_vector(self.0.data()[i * cols..(i + 1) * cols].to_vec()))
     }
 
     /// The given rows of a 2D array, in the given order (repeats allowed), as a new 2D array -
@@ -148,7 +149,7 @@ impl RustArray {
             if i >= rows {
                 return Err(PyIndexError::new_err("row index out of range"));
             }
-            out.extend_from_slice(&self.data[i * cols..(i + 1) * cols]);
+            out.extend_from_slice(&self.0.data()[i * cols..(i + 1) * cols]);
         }
         Ok(RustArray::from_matrix(out, indices.len(), cols))
     }
@@ -156,15 +157,12 @@ impl RustArray {
     #[staticmethod]
     fn zeros(shape: &Bound<'_, PyAny>) -> PyResult<Self> {
         let shape = parse_shape(shape)?;
-        Ok(RustArray(Array {
-            data: vec![0.0; shape.size()],
-            shape,
-        }))
+        Ok(RustArray(Array::new(vec![0.0; shape.size()], shape).map_err(py_err)?))
     }
 
     #[getter]
     fn shape<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        match self.shape {
+        match self.0.shape() {
             Shape::Vector(n) => PyTuple::new(py, [n]),
             Shape::Matrix(rows, cols) => PyTuple::new(py, [rows, cols]),
         }
@@ -176,7 +174,7 @@ impl RustArray {
     /// (`load_mnist_dataset_as_array`'s pixel-vs-label split), not general Python slice
     /// semantics: step must be 1, and there is no fancy/boolean indexing.
     fn __getitem__<'py>(&self, py: Python<'py>, index: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
-        if let Shape::Matrix(rows, cols) = self.shape {
+        if let Shape::Matrix(rows, cols) = self.0.shape() {
             if let Ok((row_slice, col_slice)) = index.extract::<(Bound<'_, PySlice>, Bound<'_, PySlice>)>() {
                 let (r0, r1) = Self::resolve_contiguous_range(&row_slice, rows)?;
                 let (c0, c1) = Self::resolve_contiguous_range(&col_slice, cols)?;
@@ -184,7 +182,7 @@ impl RustArray {
                 let new_cols = c1.saturating_sub(c0);
                 let mut out = Vec::with_capacity(new_rows * new_cols);
                 for row in r0..r1 {
-                    out.extend_from_slice(&self.data[row * cols + c0..row * cols + c1]);
+                    out.extend_from_slice(&self.0.data()[row * cols + c0..row * cols + c1]);
                 }
                 return Ok(RustArray::from_matrix(out, new_rows, new_cols)
                     .into_pyobject(py)?
@@ -192,31 +190,28 @@ impl RustArray {
             }
         }
         let flat_index = self.resolve_index(index)?;
-        Ok(self.data[flat_index].into_pyobject(py)?.into_any())
+        Ok(self.0.data()[flat_index].into_pyobject(py)?.into_any())
     }
 
     fn __setitem__(&mut self, index: &Bound<'_, PyAny>, value: f64) -> PyResult<()> {
         let flat_index = self.resolve_index(index)?;
-        self.data[flat_index] = value;
+        self.0.data_mut()[flat_index] = value;
         Ok(())
     }
 
     fn copy(&self) -> Self {
-        RustArray(Array {
-            data: self.data.clone(),
-            shape: self.shape,
-        })
+        self.clone()
     }
 
     /// The inverse of `Array(nested_list)`/`Array(flat_list)` (see `new` above) - a flat Python
     /// list for a 1D array, a nested list of same-length lists for a 2D array. `save()`/`load()`
     /// round-trip weights through exactly this pair for JSON serialization.
     fn tolist<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        match self.shape {
-            Shape::Vector(_) => self.data.clone().into_pyobject(py),
+        match self.0.shape() {
+            Shape::Vector(_) => self.0.data().to_vec().into_pyobject(py),
             Shape::Matrix(rows, cols) => {
                 let nested: Vec<Vec<f64>> = (0..rows)
-                    .map(|row| self.data[row * cols..(row + 1) * cols].to_vec())
+                    .map(|row| self.0.data()[row * cols..(row + 1) * cols].to_vec())
                     .collect();
                 nested.into_pyobject(py)
             }
@@ -228,7 +223,7 @@ impl RustArray {
     /// `.T`, matching `arr.T`'s usage in `ArrayLayer` (`X @ self.W.T`).
     #[getter(T)]
     pub(crate) fn transpose(&self) -> Self {
-        match self.shape {
+        match self.0.shape() {
             Shape::Vector(_) => self.clone(),
             Shape::Matrix(..) => self.0.transpose().into(),
         }
@@ -243,30 +238,29 @@ impl RustArray {
     /// nothing needs yet.
     fn reshape(&self, shape: &Bound<'_, PyAny>) -> PyResult<Self> {
         let new_shape = parse_shape(shape)?;
-        if new_shape.size() != self.data.len() {
+        if new_shape.size() != self.0.data().len() {
             return Err(PyValueError::new_err(format!(
                 "cannot reshape array of size {} into shape of size {}",
-                self.data.len(),
+                self.0.data().len(),
                 new_shape.size()
             )));
         }
-        Ok(RustArray(Array {
-            data: self.data.clone(),
-            shape: new_shape,
-        }))
+        Ok(RustArray(
+            Array::new(self.0.data().to_vec(), new_shape).map_err(py_err)?,
+        ))
     }
 }
 
 impl RustArray {
     fn matrix_dims(&self, op: &str) -> PyResult<(usize, usize)> {
-        match self.shape {
+        match self.0.shape() {
             Shape::Matrix(rows, cols) => Ok((rows, cols)),
             Shape::Vector(_) => Err(PyValueError::new_err(format!("{op} needs a 2D array"))),
         }
     }
 
     fn resolve_index(&self, index: &Bound<'_, PyAny>) -> PyResult<usize> {
-        match self.shape {
+        match self.0.shape() {
             Shape::Vector(n) => {
                 let i: usize = index
                     .extract()

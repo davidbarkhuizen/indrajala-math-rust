@@ -1,5 +1,7 @@
 //! The array type: a flat, row-major `f64` buffer with a 1D or 2D shape.
 
+use crate::Error;
+
 /// This core only ever needs a 1D vector or a 2D matrix; general N-dimensional machinery is
 /// deliberately not built here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,13 +26,24 @@ impl Shape {
 /// (`&Array`) and returns a new array.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Array {
-    /// The values, row-major: `shape.size()` of them.
-    pub data: Vec<f64>,
+    /// The values, row-major: `shape.size()` of them, an invariant every constructor keeps.
+    pub(crate) data: Vec<f64>,
     /// 1D or 2D.
-    pub shape: Shape,
+    pub(crate) shape: Shape,
 }
-
 impl Array {
+    /// `data` in `shape`, if it holds `shape.size()` values.
+    pub fn new(data: Vec<f64>, shape: Shape) -> Result<Self, Error> {
+        if data.len() != shape.size() {
+            return Err(Error::invalid(format!(
+                "an array of shape {shape:?} holds {} values, got {}",
+                shape.size(),
+                data.len()
+            )));
+        }
+        Ok(Array { data, shape })
+    }
+
     /// A 1D array of `data`.
     pub fn from_vector(data: Vec<f64>) -> Self {
         let shape = Shape::Vector(data.len());
@@ -38,11 +51,36 @@ impl Array {
     }
 
     /// A `rows x cols` array of `data`, row-major.
+    ///
+    /// # Panics
+    ///
+    /// If `data` doesn't hold `rows * cols` values ([`Array::new`] returns the error instead).
     pub fn from_matrix(data: Vec<f64>, rows: usize, cols: usize) -> Self {
+        assert_eq!(data.len(), rows * cols, "from_matrix: {rows} x {cols} values expected");
         Array {
             data,
             shape: Shape::Matrix(rows, cols),
         }
+    }
+
+    /// The values, row-major.
+    pub fn data(&self) -> &[f64] {
+        &self.data
+    }
+
+    /// The values, row-major, to change in place (their count can't change).
+    pub fn data_mut(&mut self) -> &mut [f64] {
+        &mut self.data
+    }
+
+    /// The shape.
+    pub fn shape(&self) -> Shape {
+        self.shape
+    }
+
+    /// The values, row-major, moved out.
+    pub fn into_data(self) -> Vec<f64> {
+        self.data
     }
 }
 
