@@ -8,9 +8,11 @@ pub mod batch_norm;
 pub mod conv;
 pub mod cr_exp;
 mod error;
+pub mod generator;
 pub mod layer_norm;
 pub mod linalg;
 pub mod ops;
+pub mod random;
 pub mod scalar;
 
 pub use array::{Array, Shape};

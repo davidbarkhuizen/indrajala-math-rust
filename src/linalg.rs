@@ -1,7 +1,7 @@
 //! The core's products (`indrajala_math::linalg`) for the bindings: each wrapper lends the core
 //! array inside each `Array` and moves the result in, so nothing is copied at the boundary.
 
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyOverflowError, PyValueError};
 use pyo3::prelude::*;
 
 use indrajala_math::linalg;
@@ -12,6 +12,7 @@ use crate::array::RustArray;
 pub(crate) fn py_err(error: indrajala_math::Error) -> PyErr {
     match error {
         indrajala_math::Error::InvalidArgument(message) => PyValueError::new_err(message),
+        indrajala_math::Error::Overflow(message) => PyOverflowError::new_err(message),
         _ => PyValueError::new_err(error.to_string()),
     }
 }

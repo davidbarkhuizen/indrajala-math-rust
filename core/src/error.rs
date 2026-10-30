@@ -7,6 +7,8 @@ use std::fmt;
 pub enum Error {
     /// An argument's shape or value doesn't fit the operation (Python's `ValueError`).
     InvalidArgument(String),
+    /// A value is out of the operation's range (Python's `OverflowError`).
+    Overflow(String),
 }
 
 impl Error {
@@ -19,7 +21,7 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::InvalidArgument(message) => f.write_str(message),
+            Error::InvalidArgument(message) | Error::Overflow(message) => f.write_str(message),
         }
     }
 }
