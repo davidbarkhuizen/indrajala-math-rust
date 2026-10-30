@@ -1,8 +1,14 @@
+# The Python extension (PyPI: indrajala-math-rust), bindings over the core (core/, crates.io:
+# indrajala-math). One version for both, here (the release workplan's D4).
 [package]
 name = "indrajala_math_rust"
-version = "0.1.0"
-license = "MIT"
-edition = "2021"
+description = "Python bindings of indrajala-math: a numpy-like Array and fused neural network layer ops"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
 
 [lib]
 name = "indrajala_math_rust"
@@ -10,6 +16,13 @@ crate-type = ["cdylib"]
 
 [workspace]
 members = ["core"]
+
+[workspace.package]
+version = "0.1.0"
+license = "MIT"
+edition = "2021"
+repository = "https://github.com/davidbarkhuizen/indrajala-math-rust"
+rust-version = "1.98"
 
 [dependencies]
 indrajala-math = { path = "core", version = "0.1.0" }
