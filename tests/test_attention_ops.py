@@ -28,6 +28,7 @@ import numpy as np
 import pytest
 from array_helpers import bits, to_array, to_numpy
 
+import indrajala_math_rust as pa
 from indrajala_math_rust import (
     Array,
     Generator,
@@ -83,16 +84,24 @@ def _id(shape: tuple[int, ...]) -> str:
 
 
 def _case(examples: int, tokens: int, features: int, heads: int, key_size: int) -> dict[str, np.ndarray]:
-    rng = np.random.default_rng([examples, tokens, features, heads, key_size])
+    # the crate's own PCG64, numpy's `default_rng` stream with `uniform` unfused: the same inputs on
+    # every platform, where numpy's own `uniform` contracts to an FMA on some (macOS and Windows on
+    # arm64), and the recorded digests are of these inputs
+    rng = pa.default_rng([examples, tokens, features, heads, key_size])
+
+    def uniform(low: float, high: float, shape: Any) -> np.ndarray:
+        return to_numpy(rng.uniform(low, high, shape))
+
     d, width = features, heads * key_size
-    c = {"x": rng.uniform(-2.0, 2.0, (examples, tokens * d))}
+    c = {"x": uniform(-2.0, 2.0, (examples, tokens * d))}
     for name in NAMES:
         rows, fan_in = (d, width) if name[1] == "o" else (width, d)
         limit = 1.0 / math.sqrt(fan_in)
-        c[name] = rng.uniform(-limit, limit, (rows, fan_in) if name[0] == "w" else rows)
-    c["delta"] = rng.uniform(-1.0, 1.0, (examples, tokens * d))
+        c[name] = uniform(-limit, limit, (rows, fan_in) if name[0] == "w" else rows)
+    c["delta"] = uniform(-1.0, 1.0, (examples, tokens * d))
     for name in NAMES:
-        c["grad_" + name] = rng.uniform(-1.0, 1.0, c[name].shape)
+        shape = c[name].shape
+        c["grad_" + name] = uniform(-1.0, 1.0, shape if len(shape) == 2 else shape[0])
     return c
 
 

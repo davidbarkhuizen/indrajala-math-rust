@@ -137,7 +137,19 @@ def test_seeds_whose_state_crosses_the_top_bit_match_numpy():
 
 @pytest.mark.parametrize(("low", "high"), [(0.0, 1.0), (-1.0, 1.0), (5.0, 5.0), (-1e300, 1e300)])
 def test_uniform_matches_numpy_at_any_finite_range(low: float, high: float):
-    assert_identical(pa.default_rng(7).uniform(low, high, 500), np.random.default_rng(7).uniform(low, high, 500))
+    # numpy's `low + (high - low) * random()`, each operation rounded: what the crate computes on
+    # every platform; numpy's own build contracts it to one FMA on some (macOS and Windows on arm64)
+    unfused = low + (high - low) * np.random.default_rng(7).random(500)
+    assert_identical(pa.default_rng(7).uniform(low, high, 500), unfused)
+
+
+def test_numpys_own_uniform_where_it_is_unfused():
+    contracted = np.random.default_rng(7).uniform(-3.0, 3.0, 1000)
+    if not np.array_equal(contracted, -3.0 + 6.0 * np.random.default_rng(7).random(1000)):
+        pytest.skip("this numpy build contracts uniform's low + range * u to an FMA")
+    assert_identical(
+        pa.default_rng(7).uniform(-1e300, 1e300, 500), np.random.default_rng(7).uniform(-1e300, 1e300, 500)
+    )
 
 
 @pytest.mark.parametrize(
