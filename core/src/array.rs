@@ -18,18 +18,11 @@ impl Shape {
     }
 }
 
-/// An owned array: `data` holds `shape.size()` values, row-major.
+/// An array: `data` holds `shape.size()` values, row-major. Every operation borrows its operands
+/// (`&Array`) and returns a new array.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Array {
     pub data: Vec<f64>,
-    pub shape: Shape,
-}
-
-/// A borrowed array, what every operation reads: the same layout as [`Array`], so a caller that
-/// holds its values elsewhere (the Python bindings' `Array`) passes them without a copy.
-#[derive(Clone, Copy, Debug)]
-pub struct ArrayView<'a> {
-    pub data: &'a [f64],
     pub shape: Shape,
 }
 
@@ -47,22 +40,14 @@ impl Array {
             shape: Shape::Matrix(rows, cols),
         }
     }
-
-    /// This array, borrowed.
-    pub fn view(&self) -> ArrayView<'_> {
-        ArrayView {
-            data: &self.data,
-            shape: self.shape,
-        }
-    }
 }
 
 /// `a`'s transpose: a copy on 1D (numpy's `.T` is a no-op there), the real transpose on 2D.
 #[inline]
-pub fn transpose(a: ArrayView<'_>) -> Array {
+pub fn transpose(a: &Array) -> Array {
     match a.shape {
         Shape::Vector(_) => Array {
-            data: a.data.to_vec(),
+            data: a.data.clone(),
             shape: a.shape,
         },
         Shape::Matrix(rows, cols) => {
@@ -83,7 +68,7 @@ pub fn transpose(a: ArrayView<'_>) -> Array {
                         transpose_block_neon(a.data, &mut out, rows, cols, row_start..row_end, col_start..col_end);
                     }
                     #[cfg(not(target_arch = "aarch64"))]
-                    transpose_block(a.data, &mut out, rows, cols, row_start..row_end, col_start..col_end);
+                    transpose_block(&a.data, &mut out, rows, cols, row_start..row_end, col_start..col_end);
                 }
             }
             Array::from_matrix(out, cols, rows)

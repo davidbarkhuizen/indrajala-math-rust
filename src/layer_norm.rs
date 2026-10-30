@@ -16,6 +16,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::array::{RustArray, Shape};
+use indrajala_math::Array;
 
 /// A left fold from `0.0` in index order.
 fn fold(values: impl Iterator<Item = f64>) -> f64 {
@@ -72,14 +73,14 @@ fn normalize(
         std.push(s);
     }
     Ok((
-        RustArray {
+        RustArray(Array {
             data: a,
             shape: x.shape,
-        },
-        RustArray {
+        }),
+        RustArray(Array {
             data: xhat,
             shape: x.shape,
-        },
+        }),
         RustArray::from_vector(std),
     ))
 }
@@ -151,10 +152,10 @@ pub fn layer_norm_downstream_batch(
         let m2 = fold(dxhat.iter().zip(xh).map(|(&g, &x)| g * x)) / d as f64;
         dx.extend(dxhat.iter().zip(xh).map(|(&g, &x)| ((g - m1) - x * m2) / s));
     }
-    Ok(RustArray {
+    Ok(RustArray(Array {
         data: dx,
         shape: delta_batch.shape,
-    })
+    }))
 }
 
 /// `LayerNormArrayLayer.accumulate_gradient_batch`: `grad_gamma += sum(delta * xhat)` and

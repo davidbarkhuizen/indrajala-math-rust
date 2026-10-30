@@ -5,6 +5,7 @@ use crate::array::{RustArray, Shape};
 use crate::fused::dropout_hidden_delta_from_downstream;
 use crate::ops::same_shape_elementwise;
 use crate::scalar::{max, relu};
+use indrajala_math::Array;
 
 /// Elementwise `e^x` over a whole array - mirrors `array_layer.sigmoid`'s own reliance on
 /// `exp`'s overflow behavior (a large negative `z` drives `exp(-z)` to `f64::INFINITY`, and
@@ -16,17 +17,17 @@ use crate::scalar::{max, relu};
 pub fn exp(arr: &RustArray) -> RustArray {
     let mut data = vec![0.0; arr.data.len()];
     crate::cr_exp::exp_into(&arr.data, &mut data);
-    RustArray { data, shape: arr.shape }
+    RustArray(Array { data, shape: arr.shape })
 }
 
 /// `exp` one value at a time (`cr_exp::exp`, no vector lanes): the vector kernel's reference in
 /// the tests, which check the two agree bit for bit.
 #[pyfunction]
 pub fn exp_scalar(arr: &RustArray) -> RustArray {
-    RustArray {
+    RustArray(Array {
         data: arr.data.iter().map(|&v| crate::cr_exp::exp(v)).collect(),
         shape: arr.shape,
-    }
+    })
 }
 
 /// `exp` in place on a copy of `arr` (`cr_exp::exp_in_place`, where `exp` writes a new buffer), and
@@ -36,7 +37,7 @@ pub fn exp_scalar(arr: &RustArray) -> RustArray {
 pub fn exp_lanes(arr: &RustArray) -> (RustArray, usize) {
     let mut data = arr.data.clone();
     let redone = crate::cr_exp::exp_in_place(&mut data);
-    (RustArray { data, shape: arr.shape }, redone)
+    (RustArray(Array { data, shape: arr.shape }), redone)
 }
 
 /// Sums a 2D array's rows into a 1D vector - the one fixed-axis (`axis=0`) reduction this core
@@ -65,10 +66,10 @@ pub fn sum_axis0(arr: &RustArray) -> PyResult<RustArray> {
 /// otherwise out of scope for this core; this is the one exception.
 #[pyfunction]
 pub fn array_relu(arr: &RustArray) -> RustArray {
-    RustArray {
+    RustArray(Array {
         data: arr.data.iter().map(|&v| relu(v)).collect(),
         shape: arr.shape,
-    }
+    })
 }
 
 /// `downstream * (a > 0.0)` - ReLU's derivative mask, zeroing out the downstream gradient
@@ -83,10 +84,10 @@ pub fn array_relu_mask(downstream: &RustArray, a: &RustArray) -> PyResult<RustAr
             downstream.shape, a.shape
         )));
     }
-    Ok(RustArray {
+    Ok(RustArray(Array {
         data: same_shape_elementwise(&downstream.data, &a.data, |d, av| if av > 0.0 { d } else { 0.0 }),
         shape: downstream.shape,
-    })
+    }))
 }
 
 /// `downstream * a * (1 - a)` - the sigmoid's derivative applied to a downstream that a dense
@@ -102,10 +103,10 @@ pub fn array_sigmoid_mask(downstream: &RustArray, a: &RustArray) -> PyResult<Rus
             downstream.shape, a.shape
         )));
     }
-    Ok(RustArray {
+    Ok(RustArray(Array {
         data: same_shape_elementwise(&downstream.data, &a.data, |d, av| d * av * (1.0 - av)),
         shape: downstream.shape,
-    })
+    }))
 }
 
 /// `downstream * base_activation * (1 - base_activation) * scale`, `scale = mask /
@@ -155,10 +156,10 @@ pub fn array_softmax(arr: &RustArray) -> RustArray {
     }
 
     match arr.shape {
-        Shape::Vector(_) => RustArray {
+        Shape::Vector(_) => RustArray(Array {
             data: normalize_row(&arr.data),
             shape: arr.shape,
-        },
+        }),
         Shape::Matrix(rows, cols) => {
             let mut out = vec![0.0; rows * cols];
             for row in 0..rows {
@@ -166,10 +167,10 @@ pub fn array_softmax(arr: &RustArray) -> RustArray {
                 let normalized = normalize_row(&arr.data[start..start + cols]);
                 out[start..start + cols].copy_from_slice(&normalized);
             }
-            RustArray {
+            RustArray(Array {
                 data: out,
                 shape: arr.shape,
-            }
+            })
         }
     }
 }

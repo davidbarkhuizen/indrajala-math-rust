@@ -2,8 +2,8 @@ use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PySlice, PyTuple};
 
+use indrajala_math::Array;
 pub use indrajala_math::Shape;
-use indrajala_math::{Array, ArrayView};
 
 pub(crate) fn parse_shape(shape: &Bound<'_, PyAny>) -> PyResult<Shape> {
     if let Ok((rows, cols)) = shape.extract::<(usize, usize)>() {
@@ -23,39 +23,38 @@ pub(crate) fn parse_shape(shape: &Bound<'_, PyAny>) -> PyResult<Shape> {
 /// real numpy's own type of that name.
 #[pyclass(name = "Array", skip_from_py_object)]
 #[derive(Clone)]
-pub struct RustArray {
-    pub data: Vec<f64>,
-    pub shape: Shape,
+pub struct RustArray(pub Array);
+
+/// Field access (`a.data`, `a.shape`) and every core operation (`&Array`) reach the core array
+/// directly, so nothing is copied at the boundary.
+impl std::ops::Deref for RustArray {
+    type Target = Array;
+
+    fn deref(&self) -> &Array {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for RustArray {
+    fn deref_mut(&mut self) -> &mut Array {
+        &mut self.0
+    }
 }
 
 impl RustArray {
     pub fn from_vector(data: Vec<f64>) -> Self {
-        let shape = Shape::Vector(data.len());
-        RustArray { data, shape }
+        RustArray(Array::from_vector(data))
     }
 
     pub fn from_matrix(data: Vec<f64>, rows: usize, cols: usize) -> Self {
-        RustArray {
-            data,
-            shape: Shape::Matrix(rows, cols),
-        }
-    }
-    /// This array, borrowed as the core's view: no copy.
-    pub fn view(&self) -> ArrayView<'_> {
-        ArrayView {
-            data: &self.data,
-            shape: self.shape,
-        }
+        RustArray(Array::from_matrix(data, rows, cols))
     }
 }
 
 /// The core's result moved in: no copy.
 impl From<Array> for RustArray {
     fn from(array: Array) -> Self {
-        RustArray {
-            data: array.data,
-            shape: array.shape,
-        }
+        RustArray(array)
     }
 }
 
@@ -157,10 +156,10 @@ impl RustArray {
     #[staticmethod]
     fn zeros(shape: &Bound<'_, PyAny>) -> PyResult<Self> {
         let shape = parse_shape(shape)?;
-        Ok(RustArray {
+        Ok(RustArray(Array {
             data: vec![0.0; shape.size()],
             shape,
-        })
+        }))
     }
 
     #[getter]
@@ -203,10 +202,10 @@ impl RustArray {
     }
 
     fn copy(&self) -> Self {
-        RustArray {
+        RustArray(Array {
             data: self.data.clone(),
             shape: self.shape,
-        }
+        })
     }
 
     /// The inverse of `Array(nested_list)`/`Array(flat_list)` (see `new` above) - a flat Python
@@ -231,7 +230,7 @@ impl RustArray {
     pub(crate) fn transpose(&self) -> Self {
         match self.shape {
             Shape::Vector(_) => self.clone(),
-            Shape::Matrix(..) => indrajala_math::transpose(self.view()).into(),
+            Shape::Matrix(..) => indrajala_math::transpose(self).into(),
         }
     }
 
@@ -251,10 +250,10 @@ impl RustArray {
                 new_shape.size()
             )));
         }
-        Ok(RustArray {
+        Ok(RustArray(Array {
             data: self.data.clone(),
             shape: new_shape,
-        })
+        }))
     }
 }
 

@@ -1,5 +1,5 @@
-//! The core's products (`indrajala_math::linalg`) for the bindings: each wrapper borrows its
-//! arrays as views and moves the result in, so nothing is copied at the boundary.
+//! The core's products (`indrajala_math::linalg`) for the bindings: each wrapper lends the core
+//! array inside each `Array` and moves the result in, so nothing is copied at the boundary.
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -14,35 +14,29 @@ use crate::array::RustArray;
 /// The core's error as the Python exception its kind names.
 pub(crate) fn py_err(error: indrajala_math::Error) -> PyErr {
     match error {
-        indrajala_math::Error::InvalidShape(message) => PyValueError::new_err(message),
+        indrajala_math::Error::InvalidArgument(message) => PyValueError::new_err(message),
         _ => PyValueError::new_err(error.to_string()),
     }
 }
 
 /// `a @ b` (`indrajala_math::linalg::matmul`).
 pub(crate) fn matmul(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
-    linalg::matmul(a.view(), b.view()).map(RustArray::from).map_err(py_err)
+    linalg::matmul(a, b).map(RustArray::from).map_err(py_err)
 }
 
 /// `c + a @ b`, bit-identical to the product then the add (`linalg::matmul_add`).
 pub(crate) fn matmul_add(c: &RustArray, a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
-    linalg::matmul_add(c.view(), a.view(), b.view())
-        .map(RustArray::from)
-        .map_err(py_err)
+    linalg::matmul_add(c, a, b).map(RustArray::from).map_err(py_err)
 }
 
 /// `a @ b.T` (`linalg::matmul_nt`).
 pub(crate) fn matmul_nt(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
-    linalg::matmul_nt(a.view(), b.view())
-        .map(RustArray::from)
-        .map_err(py_err)
+    linalg::matmul_nt(a, b).map(RustArray::from).map_err(py_err)
 }
 
 /// `a @ b` for few rows and a long `K` (`linalg::matmul_long_k`).
 pub(crate) fn matmul_long_k(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
-    linalg::matmul_long_k(a.view(), b.view())
-        .map(RustArray::from)
-        .map_err(py_err)
+    linalg::matmul_long_k(a, b).map(RustArray::from).map_err(py_err)
 }
 
 /// Test/benchmark hook: max threads and threshold in flops for every threaded matmul
@@ -80,5 +74,5 @@ impl RustArray {
 /// matching `np.outer`'s own call style rather than an operator.
 #[pyfunction]
 pub fn outer(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
-    linalg::outer(a.view(), b.view()).map(RustArray::from).map_err(py_err)
+    linalg::outer(a, b).map(RustArray::from).map_err(py_err)
 }

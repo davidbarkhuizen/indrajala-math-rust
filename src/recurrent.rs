@@ -42,6 +42,7 @@ use crate::fused::{affine_forward_batch, layer_accumulate_gradient_batch};
 use crate::linalg::{matmul, matmul_add, matmul_nt};
 use crate::ops::same_shape_elementwise;
 use crate::ufuncs::array_softmax;
+use indrajala_math::Array;
 
 /// `(rows, cols)` of a matrix, refused for a vector.
 pub(crate) fn matrix_shape(x: &RustArray, name: &str, context: &str) -> PyResult<(usize, usize)> {
@@ -184,12 +185,12 @@ pub fn attention_pooling_forward(x: &RustArray, q: &RustArray, tokens: usize) ->
     let (rows, features) = pooling_shape(x, q, tokens, "attention_pooling_forward")?;
     let token_rows = RustArray::from_matrix(x.data.clone(), rows * tokens, features);
     let scores = matmul(&token_rows, q)?;
-    let p = array_softmax(&RustArray::from_matrix(scores.data, rows, tokens));
+    let p = array_softmax(&RustArray::from_matrix(scores.0.data, rows, tokens));
     let mut data = Vec::with_capacity(rows * features);
     for (weights, example) in p.data.chunks_exact(tokens).zip(x.data.chunks_exact(tokens * features)) {
         let weights = RustArray::from_matrix(weights.to_vec(), 1, tokens);
         let example = RustArray::from_matrix(example.to_vec(), tokens, features);
-        data.extend(matmul(&weights, &example)?.data);
+        data.extend(matmul(&weights, &example)?.0.data);
     }
     Ok((RustArray::from_matrix(data, rows, features), p))
 }
@@ -221,7 +222,7 @@ pub fn attention_pooling_backward(
         .zip(du.data.chunks_exact(features))
     {
         let example_matrix = RustArray::from_matrix(example.to_vec(), tokens, features);
-        let dp = matmul(&example_matrix, &RustArray::from_vector(du_n.to_vec()))?.data;
+        let dp = matmul(&example_matrix, &RustArray::from_vector(du_n.to_vec()))?.0.data;
         let weighted = dp.iter().zip(weights).fold(0.0, |acc, (&d, &w)| acc + d * w);
         let ds: Vec<f64> = weights.iter().zip(&dp).map(|(&w, &d)| w * (d - weighted)).collect();
         for ((token, &w), &s) in example.chunks_exact(features).zip(weights).zip(&ds) {
@@ -377,8 +378,8 @@ pub fn gru_backward(
     let (new_grad_w, new_grad_b) = layer_accumulate_gradient_batch(&da, u, grad_w, grad_b)?;
     let grad_u_rz = matmul_add(&row_block(grad_u, s, 0, 2 * s), &da_rz.transpose(), c)?;
     let grad_u_h = matmul_add(&row_block(grad_u, s, 2 * s, 3 * s), &da_h.transpose(), rc)?;
-    let mut new_grad_u = grad_u_rz.data;
-    new_grad_u.extend(grad_u_h.data);
+    let mut new_grad_u = grad_u_rz.0.data;
+    new_grad_u.extend(grad_u_h.0.data);
 
     let du = matmul(&da, w)?;
     let dc_state = matmul(&da_rz, &u_rz)?;
@@ -494,10 +495,10 @@ pub fn codes_backward(
     };
     Ok((
         RustArray::from_matrix(dh, rows, size),
-        RustArray {
+        RustArray(Array {
             data: new_grad_e,
             shape: grad_e.shape,
-        },
+        }),
     ))
 }
 
@@ -643,10 +644,10 @@ pub fn soft_codes_backward(
     }
     Ok((
         RustArray::from_matrix(dh, rows, size),
-        RustArray {
+        RustArray(Array {
             data: new_grad_e,
             shape: grad_e.shape,
-        },
+        }),
     ))
 }
 

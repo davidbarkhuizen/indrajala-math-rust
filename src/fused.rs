@@ -15,6 +15,7 @@ use crate::ops::same_shape_elementwise;
 use crate::random::draw_bernoulli_mask;
 use crate::scalar::{powi, relu};
 use crate::ufuncs::{array_softmax, sum_axis0};
+use indrajala_math::Array;
 
 fn require_same_shape(a: &RustArray, b: &RustArray, context: &str) -> PyResult<()> {
     if a.shape != b.shape {
@@ -36,7 +37,7 @@ fn require_batch_size(batch_size: usize, context: &str) -> PyResult<()> {
 fn sigmoid(z: &RustArray) -> RustArray {
     let mut data = z.data.clone();
     crate::cr_exp::sigmoid_in_place(&mut data);
-    RustArray { data, shape: z.shape }
+    RustArray(Array { data, shape: z.shape })
 }
 
 /// `self.W @ x + self.b`, `x`/`b` both 1D - the pre-activation shared by every `layer_*forward`
@@ -82,7 +83,7 @@ pub fn layer_output_delta(a: &RustArray, reference: &RustArray) -> PyResult<Rust
         .zip(reference.data.iter())
         .map(|(&av, &rv)| (av - rv) * av * (1.0 - av))
         .collect();
-    Ok(RustArray { data, shape: a.shape })
+    Ok(RustArray(Array { data, shape: a.shape }))
 }
 
 /// `ArrayLayer.downstream`: `self.W.T @ self.delta`, the gradient a dense layer sends back to its
@@ -145,7 +146,7 @@ pub fn layer_hidden_delta(next_w: &RustArray, next_delta: &RustArray, a: &RustAr
         .zip(a.data.iter())
         .map(|(&d, &av)| d * av * (1.0 - av))
         .collect();
-    Ok(RustArray { data, shape: a.shape })
+    Ok(RustArray(Array { data, shape: a.shape }))
 }
 
 /// `ArrayLayer.compute_hidden_delta_batch`: `(next_layer.delta_batch @ next_layer.W) * self.A *
@@ -164,10 +165,10 @@ pub fn layer_hidden_delta_batch(
         .zip(a_batch.data.iter())
         .map(|(&d, &av)| d * av * (1.0 - av))
         .collect();
-    Ok(RustArray {
+    Ok(RustArray(Array {
         data,
         shape: a_batch.shape,
-    })
+    }))
 }
 
 /// `ArrayLayer.accumulate_gradient`: `self._grad_W += outer(delta, input_activation); self._grad_b
@@ -245,14 +246,14 @@ pub fn layer_apply_accumulated_gradient(
     require_same_shape(b, grad_b, "layer_apply_accumulated_gradient (b, grad_b)")?;
     require_batch_size(batch_size, "layer_apply_accumulated_gradient")?;
     let batch_size = batch_size as f64;
-    let new_w = RustArray {
+    let new_w = RustArray(Array {
         data: same_shape_elementwise(&w.data, &grad_w.data, |wv, gv| wv - learning_rate * (gv / batch_size)),
         shape: w.shape,
-    };
-    let new_b = RustArray {
+    });
+    let new_b = RustArray(Array {
         data: same_shape_elementwise(&b.data, &grad_b.data, |bv, gv| bv - learning_rate * (gv / batch_size)),
         shape: b.shape,
-    };
+    });
     Ok((new_w, new_b))
 }
 
@@ -347,18 +348,18 @@ fn adam_update(
     }
 
     (
-        RustArray {
+        RustArray(Array {
             data: new_param_data,
             shape: param.shape,
-        },
-        RustArray {
+        }),
+        RustArray(Array {
             data: new_m_data,
             shape: param.shape,
-        },
-        RustArray {
+        }),
+        RustArray(Array {
             data: new_v_data,
             shape: param.shape,
-        },
+        }),
     )
 }
 
@@ -442,16 +443,16 @@ pub fn layer_l2_apply_accumulated_gradient(
     require_same_shape(b, grad_b, "layer_l2_apply_accumulated_gradient (b, grad_b)")?;
     require_batch_size(batch_size, "layer_l2_apply_accumulated_gradient")?;
     let batch_size = batch_size as f64;
-    let new_w = RustArray {
+    let new_w = RustArray(Array {
         data: same_shape_elementwise(&w.data, &grad_w.data, |wv, gv| {
             wv - learning_rate * (gv / batch_size + l2_lambda * wv)
         }),
         shape: w.shape,
-    };
-    let new_b = RustArray {
+    });
+    let new_b = RustArray(Array {
         data: same_shape_elementwise(&b.data, &grad_b.data, |bv, gv| bv - learning_rate * (gv / batch_size)),
         shape: b.shape,
-    };
+    });
     Ok((new_w, new_b))
 }
 
@@ -493,26 +494,26 @@ pub fn layer_momentum_apply_accumulated_gradient(
     let new_velocity_w_data: Vec<f64> = (0..w.data.len())
         .map(|i| momentum * velocity_w.data[i] + grad_w.data[i] / batch_size)
         .collect();
-    let new_w = RustArray {
+    let new_w = RustArray(Array {
         data: same_shape_elementwise(&w.data, &new_velocity_w_data, |wv, uv| wv - learning_rate * uv),
         shape: w.shape,
-    };
-    let new_velocity_w = RustArray {
+    });
+    let new_velocity_w = RustArray(Array {
         data: new_velocity_w_data,
         shape: w.shape,
-    };
+    });
 
     let new_velocity_b_data: Vec<f64> = (0..b.data.len())
         .map(|i| momentum * velocity_b.data[i] + grad_b.data[i] / batch_size)
         .collect();
-    let new_b = RustArray {
+    let new_b = RustArray(Array {
         data: same_shape_elementwise(&b.data, &new_velocity_b_data, |bv, uv| bv - learning_rate * uv),
         shape: b.shape,
-    };
-    let new_velocity_b = RustArray {
+    });
+    let new_velocity_b = RustArray(Array {
         data: new_velocity_b_data,
         shape: b.shape,
-    };
+    });
 
     Ok((new_w, new_b, new_velocity_w, new_velocity_b))
 }
@@ -523,20 +524,20 @@ pub fn layer_momentum_apply_accumulated_gradient(
 #[pyfunction]
 pub fn layer_relu_forward(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
     let z = linear_preactivation(w, x, b)?;
-    Ok(RustArray {
+    Ok(RustArray(Array {
         data: z.data.iter().map(|&v| relu(v)).collect(),
         shape: z.shape,
-    })
+    }))
 }
 
 /// `ReLUArrayLayer.forward_batch`: `max(0, X @ self.W.T + self.b)`, `X` 2D (`batch, input_size`).
 #[pyfunction]
 pub fn layer_relu_forward_batch(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
     let z = linear_preactivation_batch(w, x, b)?;
-    Ok(RustArray {
+    Ok(RustArray(Array {
         data: z.data.iter().map(|&v| relu(v)).collect(),
         shape: z.shape,
-    })
+    }))
 }
 
 /// `ReLUArrayLayer.compute_hidden_delta`: `(next_layer.W.T @ next_layer.delta) * (self.a > 0.0)` -
@@ -551,7 +552,7 @@ pub fn layer_relu_hidden_delta(next_w: &RustArray, next_delta: &RustArray, a: &R
         .zip(a.data.iter())
         .map(|(&d, &av)| if av > 0.0 { d } else { 0.0 })
         .collect();
-    Ok(RustArray { data, shape: a.shape })
+    Ok(RustArray(Array { data, shape: a.shape }))
 }
 
 /// `ReLUArrayLayer.compute_hidden_delta_batch`: `(next_layer.delta_batch @ next_layer.W) *
@@ -570,10 +571,10 @@ pub fn layer_relu_hidden_delta_batch(
         .zip(a_batch.data.iter())
         .map(|(&d, &av)| if av > 0.0 { d } else { 0.0 })
         .collect();
-    Ok(RustArray {
+    Ok(RustArray(Array {
         data,
         shape: a_batch.shape,
-    })
+    }))
 }
 
 /// `SoftmaxArrayLayer.forward`: `array_softmax(self.W @ x + self.b)`, `x`/`b` both 1D. Reuses
@@ -598,10 +599,10 @@ pub fn layer_softmax_forward_batch(w: &RustArray, x: &RustArray, b: &RustArray) 
 #[pyfunction]
 pub fn layer_softmax_output_delta(a: &RustArray, reference: &RustArray) -> PyResult<RustArray> {
     require_same_shape(a, reference, "layer_softmax_output_delta")?;
-    Ok(RustArray {
+    Ok(RustArray(Array {
         data: same_shape_elementwise(&a.data, &reference.data, |av, rv| av - rv),
         shape: a.shape,
-    })
+    }))
 }
 
 /// `DropoutArrayLayer.forward`: `sigmoid(self.W @ x + self.b)`, with a training-time
@@ -673,22 +674,22 @@ fn dropout_forward_from_base(
             .map(|(&bv, &mv)| bv * mv / keep_probability)
             .collect();
         (
-            RustArray {
+            RustArray(Array {
                 data: a_data,
                 shape: base.shape,
-            },
-            RustArray {
+            }),
+            RustArray(Array {
                 data: mask_data,
                 shape: base.shape,
-            },
+            }),
         )
     } else {
         (
             base.clone(),
-            RustArray {
+            RustArray(Array {
                 data: vec![1.0; size],
                 shape: base.shape,
-            },
+            }),
         )
     }
 }
@@ -772,10 +773,10 @@ pub(crate) fn dropout_hidden_delta_from_downstream(
             d * sigmoid_derivative * scale
         })
         .collect();
-    RustArray {
+    RustArray(Array {
         data,
         shape: base_activation.shape,
-    }
+    })
 }
 
 /// `AffineArrayLayer.forward`: `self.W @ x + self.b` with no activation, the affine layer that ends
@@ -799,10 +800,10 @@ pub fn affine_forward_batch(w: &RustArray, x: &RustArray, b: &RustArray) -> PyRe
 /// operand order can't move bits.
 fn with_skip(downstream: RustArray, skip: &RustArray, context: &str) -> PyResult<RustArray> {
     require_same_shape(&downstream, skip, context)?;
-    Ok(RustArray {
+    Ok(RustArray(Array {
         data: same_shape_elementwise(&downstream.data, &skip.data, |d, s| d + s),
         shape: downstream.shape,
-    })
+    }))
 }
 
 /// `ArrayLayer.compute_hidden_delta` when the next layer is a residual block's fork: `(body_w.T @
@@ -819,7 +820,7 @@ pub fn layer_hidden_delta_skip(
     let downstream = hidden_downstream(body_w, body_delta, a, "layer_hidden_delta_skip")?;
     let downstream = with_skip(downstream, skip, "layer_hidden_delta_skip")?;
     let data = same_shape_elementwise(&downstream.data, &a.data, |d, av| d * av * (1.0 - av));
-    Ok(RustArray { data, shape: a.shape })
+    Ok(RustArray(Array { data, shape: a.shape }))
 }
 
 /// `layer_hidden_delta_skip`, batched: `(body_delta_batch @ body_w + skip_batch) * self.A * (1 -
@@ -834,10 +835,10 @@ pub fn layer_hidden_delta_skip_batch(
     let downstream = hidden_downstream_batch(body_w, body_delta_batch, a_batch, "layer_hidden_delta_skip_batch")?;
     let downstream = with_skip(downstream, skip_batch, "layer_hidden_delta_skip_batch")?;
     let data = same_shape_elementwise(&downstream.data, &a_batch.data, |d, av| d * av * (1.0 - av));
-    Ok(RustArray {
+    Ok(RustArray(Array {
         data,
         shape: a_batch.shape,
-    })
+    }))
 }
 
 /// `ReLUArrayLayer.compute_hidden_delta` when the next layer is a residual block's fork: `(body_w.T
@@ -852,7 +853,7 @@ pub fn layer_relu_hidden_delta_skip(
     let downstream = hidden_downstream(body_w, body_delta, a, "layer_relu_hidden_delta_skip")?;
     let downstream = with_skip(downstream, skip, "layer_relu_hidden_delta_skip")?;
     let data = same_shape_elementwise(&downstream.data, &a.data, |d, av| if av > 0.0 { d } else { 0.0 });
-    Ok(RustArray { data, shape: a.shape })
+    Ok(RustArray(Array { data, shape: a.shape }))
 }
 
 /// `layer_relu_hidden_delta_skip`, batched: `(body_delta_batch @ body_w + skip_batch) * (self.A >
@@ -867,10 +868,10 @@ pub fn layer_relu_hidden_delta_skip_batch(
     let downstream = hidden_downstream_batch(body_w, body_delta_batch, a_batch, "layer_relu_hidden_delta_skip_batch")?;
     let downstream = with_skip(downstream, skip_batch, "layer_relu_hidden_delta_skip_batch")?;
     let data = same_shape_elementwise(&downstream.data, &a_batch.data, |d, av| if av > 0.0 { d } else { 0.0 });
-    Ok(RustArray {
+    Ok(RustArray(Array {
         data,
         shape: a_batch.shape,
-    })
+    }))
 }
 
 /// `DropoutArrayLayer.compute_hidden_delta` when the next layer is a residual block's fork:

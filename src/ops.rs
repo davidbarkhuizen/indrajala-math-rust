@@ -2,6 +2,7 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 
 use crate::array::{RustArray, Shape};
+use indrajala_math::Array;
 
 /// Accepts a Python int or float as a scalar operand (`grad_W / batch_size` passes a Python
 /// int) - numpy itself accepts either for a scalar operation, so this core does too.
@@ -58,10 +59,10 @@ impl RustArray {
                 rows,
                 cols,
             )),
-            (a_shape, b_shape) if a_shape == b_shape => Ok(RustArray {
+            (a_shape, b_shape) if a_shape == b_shape => Ok(RustArray(Array {
                 data: same_shape_elementwise(&self.data, &other.data, op),
                 shape: self.shape,
-            }),
+            })),
             (a_shape, b_shape) => Err(PyValueError::new_err(format!(
                 "cannot {op_name} arrays of shape {:?} and {:?}",
                 a_shape, b_shape
@@ -77,10 +78,10 @@ impl RustArray {
             self.combine_with_array(&other_ref, |a, b| a + b, "add")
         } else {
             let scalar = extract_scalar(other)?;
-            Ok(RustArray {
+            Ok(RustArray(Array {
                 data: scalar_elementwise(&self.data, scalar, |a, b| a + b),
                 shape: self.shape,
-            })
+            }))
         }
     }
 
@@ -89,10 +90,10 @@ impl RustArray {
             self.combine_with_array(&other_ref, |a, b| a - b, "subtract")
         } else {
             let scalar = extract_scalar(other)?;
-            Ok(RustArray {
+            Ok(RustArray(Array {
                 data: scalar_elementwise(&self.data, scalar, |a, b| a - b),
                 shape: self.shape,
-            })
+            }))
         }
     }
 
@@ -101,10 +102,10 @@ impl RustArray {
     /// array-minus-array.
     fn __rsub__(&self, other: &Bound<'_, PyAny>) -> PyResult<RustArray> {
         let scalar = extract_scalar(other)?;
-        Ok(RustArray {
+        Ok(RustArray(Array {
             data: scalar_elementwise(&self.data, scalar, |a, b| b - a),
             shape: self.shape,
-        })
+        }))
     }
 
     fn __mul__(&self, other: &Bound<'_, PyAny>) -> PyResult<RustArray> {
@@ -112,10 +113,10 @@ impl RustArray {
             self.combine_with_array(&other_ref, |a, b| a * b, "multiply")
         } else {
             let scalar = extract_scalar(other)?;
-            Ok(RustArray {
+            Ok(RustArray(Array {
                 data: scalar_elementwise(&self.data, scalar, |a, b| a * b),
                 shape: self.shape,
-            })
+            }))
         }
     }
 
@@ -131,10 +132,10 @@ impl RustArray {
             self.combine_with_array(&other_ref, |a, b| a / b, "divide")
         } else {
             let scalar = extract_scalar(other)?;
-            Ok(RustArray {
+            Ok(RustArray(Array {
                 data: scalar_elementwise(&self.data, scalar, |a, b| a / b),
                 shape: self.shape,
-            })
+            }))
         }
     }
 
@@ -143,8 +144,7 @@ impl RustArray {
     /// every call.
     fn __iadd__(&mut self, other: &Bound<'_, PyAny>) -> PyResult<()> {
         let result = self.__add__(other)?;
-        self.data = result.data;
-        self.shape = result.shape;
+        self.0 = result.0;
         Ok(())
     }
 
@@ -153,8 +153,7 @@ impl RustArray {
     /// `apply_accumulated_gradient` call (`self.W -= ...`).
     fn __isub__(&mut self, other: &Bound<'_, PyAny>) -> PyResult<()> {
         let result = self.__sub__(other)?;
-        self.data = result.data;
-        self.shape = result.shape;
+        self.0 = result.0;
         Ok(())
     }
 }

@@ -37,6 +37,7 @@ use crate::tokens::{
     embedding_accumulate_gradient, embedding_forward, token_dropout_downstream, token_dropout_forward,
 };
 use crate::ufuncs::{array_relu_mask, sum_axis0};
+use indrajala_math::Array;
 
 /// One layer of a window, as the program runs it.
 #[derive(Clone)]
@@ -751,10 +752,10 @@ fn token_rows(
     let (examples, rows) = token_shape(a, tokens, input_size)?;
     let out = forward(w, &reshaped(a, rows, input_size), b)?;
     let width = out.data.len() / examples.max(1);
-    Ok(RustArray {
-        data: out.data,
+    Ok(RustArray(Array {
+        data: out.0.data,
         shape: Shape::Matrix(examples, width),
-    })
+    }))
 }
 
 /// `a` `(N, T * features)`'s examples and its rows of tokens, `N * T`, refused unless whole.
@@ -773,10 +774,10 @@ fn token_shape(a: &RustArray, tokens: usize, features: usize) -> PyResult<(usize
 
 /// `a`'s values as a `(rows, cols)` matrix, a copy (as `Array.reshape`).
 fn reshaped(a: &RustArray, rows: usize, cols: usize) -> RustArray {
-    RustArray {
+    RustArray(Array {
         data: a.data.clone(),
         shape: Shape::Matrix(rows, cols),
-    }
+    })
 }
 
 /// `window_program_forward`'s result: the outputs, and, as kept, each window's next state, its
@@ -902,10 +903,10 @@ impl Backward<'_> {
                 let (size, input_size) = matrix_shape(p[0], "a token-wise layer's w", "window program")?;
                 let (examples, rows) = token_shape(self.delta(j), *tokens, size)?;
                 let out = layer_downstream_batch(p[0], &reshaped(self.delta(j), rows, size))?;
-                RustArray {
-                    data: out.data,
+                RustArray(Array {
+                    data: out.0.data,
                     shape: Shape::Matrix(examples, tokens * input_size),
-                }
+                })
             }
             Op::Attention { .. } => self.attention[j]
                 .as_ref()
@@ -1102,10 +1103,10 @@ impl WindowProgram {
                 }
                 Op::Position => {
                     let sum = sum_axis0(back.delta(i))?;
-                    let shaped = RustArray {
-                        data: sum.data,
+                    let shaped = RustArray(Array {
+                        data: sum.0.data,
                         shape: gradients[at].shape,
-                    };
+                    });
                     gradients[at] = gradients[at].combine_with_array(&shaped, |x, y| x + y, "add")?;
                 }
                 Op::StateInput { .. } => {
@@ -1177,10 +1178,10 @@ impl WindowProgram {
 
 /// `a` with `f` applied to each value, as an `Array`'s scalar operation.
 fn scaled(a: &RustArray, f: impl Fn(f64) -> f64) -> RustArray {
-    RustArray {
+    RustArray(Array {
         data: a.data.iter().map(|&v| f(v)).collect(),
         shape: a.shape,
-    }
+    })
 }
 
 /// The default bound on what a training call keeps of its windows' forward passes (D5): 2 GiB.

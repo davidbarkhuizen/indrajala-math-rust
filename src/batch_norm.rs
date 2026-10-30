@@ -24,6 +24,7 @@ use crate::array::{RustArray, Shape};
 use crate::cr_exp::sigmoid_in_place;
 use crate::linalg::{matmul, matmul_add, matmul_nt};
 use crate::scalar::relu;
+use indrajala_math::Array;
 
 /// A batch-norm layer's activation, fused into it as into a dense layer.
 #[derive(Clone, Copy)]
@@ -234,7 +235,7 @@ pub fn batch_norm_forward(
         gamma.data[j] * xhat + beta.data[j]
     });
     activation.apply(&mut data);
-    Ok(RustArray { data, shape: x.shape })
+    Ok(RustArray(Array { data, shape: x.shape }))
 }
 
 /// `BatchNormArrayLayer.forward_batch` in training, `x` 2D (`batch, channels * positions`), batch

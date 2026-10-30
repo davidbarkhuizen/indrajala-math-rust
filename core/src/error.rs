@@ -5,14 +5,14 @@ use std::fmt;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
-    /// The arguments' shapes don't fit the operation (Python's `ValueError`).
-    InvalidShape(String),
+    /// An argument's shape or value doesn't fit the operation (Python's `ValueError`).
+    InvalidArgument(String),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::InvalidShape(message) => f.write_str(message),
+            Error::InvalidArgument(message) => f.write_str(message),
         }
     }
 }

@@ -36,6 +36,7 @@ use crate::recurrent::{
     gru_backward, gru_forward, matrix_shape, require_shape, require_temperature, soft_codes_backward,
     soft_codes_forward,
 };
+use indrajala_math::Array;
 
 /// Each factor's first column, from the factors' sizes, every one 1 or more; and their total.
 fn factor_starts(sizes: &[usize], context: &str) -> PyResult<(Vec<usize>, usize)> {
@@ -294,10 +295,10 @@ struct FactorTape {
 /// A factor's coupled next state, `(1 - coupling) h + coupling q`, element by element.
 fn couple(h: &RustArray, q: &RustArray, coupling: f64) -> RustArray {
     let rest = 1.0 - coupling;
-    RustArray {
+    RustArray(Array {
         data: same_shape_elementwise(&h.data, &q.data, |h, q| rest * h + coupling * q),
         shape: h.shape,
-    }
+    })
 }
 
 /// Each factor's coupling checked: one a factor, in `[0, 1]`, below 1 only for a factor with codes.
@@ -880,10 +881,10 @@ impl StepCore {
             // cell's output (1 - l_g) dq beside it
             let rest = (f.coupled.is_some()).then(|| (1.0 - f.coupling, dq_g.clone()));
             let through = match rest {
-                Some(_) => RustArray {
+                Some(_) => RustArray(Array {
                     data: dq_g.data.iter().map(|d| f.coupling * d).collect(),
                     shape: dq_g.shape,
-                },
+                }),
                 None => dq_g,
             };
             let (dh, grad_e) = snap_backward(
@@ -900,10 +901,10 @@ impl StepCore {
                 context,
             )?;
             let dh = match rest {
-                Some((share, dq_g)) => RustArray {
+                Some((share, dq_g)) => RustArray(Array {
                     data: same_shape_elementwise(&dh.data, &dq_g.data, |a, d| a + share * d),
                     shape: dh.shape,
-                },
+                }),
                 None => dh,
             };
             let (d_input, dc, gw, gu, gb) = gru_backward(
@@ -963,10 +964,10 @@ pub(crate) fn sum_in_order(dxs: &[RustArray], factors: &[usize]) -> Option<RustA
         let dx = &dxs[g];
         sum = Some(match sum {
             None => dx.clone(),
-            Some(acc) => RustArray {
+            Some(acc) => RustArray(Array {
                 data: same_shape_elementwise(&acc.data, &dx.data, |a, v| a + v),
                 shape: acc.shape,
-            },
+            }),
         });
     }
     sum

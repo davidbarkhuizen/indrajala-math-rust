@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
-use crate::array::{Array, ArrayView, Shape};
+use crate::array::{Array, Shape};
 use crate::Error;
 
 /// `std::thread::available_parallelism()` itself measured at ~50us/call (not cached by the
@@ -21,14 +21,14 @@ fn available_parallelism_cached() -> usize {
 /// (`fused.rs::layer_forward`/`layer_hidden_delta` call it on every `learn()` step), accounting
 /// for ~97% of a fused forward call's cost at the real `dimension=784, hidden=16` shape - without
 /// SIMD acceleration it runs ~3.5x slower than numpy at that shape.
-pub fn matmul(a: ArrayView<'_>, b: ArrayView<'_>) -> Result<Array, Error> {
+pub fn matmul(a: &Array, b: &Array) -> Result<Array, Error> {
     match (a.shape, b.shape) {
         (Shape::Matrix(rows, cols), Shape::Vector(n)) => {
             if cols != n {
                 return Err(shape_error(a.shape, b.shape));
             }
             let mut out = vec![0.0; rows];
-            dot_products_into(a.data, cols, b.data, &mut out);
+            dot_products_into(&a.data, cols, &b.data, &mut out);
             Ok(Array::from_vector(out))
         }
         (Shape::Vector(n), Shape::Matrix(rows, cols)) => {
@@ -40,7 +40,7 @@ pub fn matmul(a: ArrayView<'_>, b: ArrayView<'_>) -> Result<Array, Error> {
             // row per k instead (one load/FMA/store pass over it per row of b) took 43-52 us at
             // 32 x 5408, where the tiled kernel's registers took 21-22.
             let mut out = vec![0.0; cols];
-            tiled_row_range::<OVERWRITE>(a.data, b.data, &mut out, Panel::whole(0, 1, rows, cols, 1));
+            tiled_row_range::<OVERWRITE>(&a.data, &b.data, &mut out, Panel::whole(0, 1, rows, cols, 1));
             Ok(Array::from_vector(out))
         }
         (Shape::Matrix(r1, c1), Shape::Matrix(r2, c2)) => {
@@ -48,7 +48,7 @@ pub fn matmul(a: ArrayView<'_>, b: ArrayView<'_>) -> Result<Array, Error> {
                 return Err(shape_error(a.shape, b.shape));
             }
             let mut out = vec![0.0; r1 * c2];
-            matmul_2d::<OVERWRITE>(a.data, b.data, &mut out, r1, c1, c2);
+            matmul_2d::<OVERWRITE>(&a.data, &b.data, &mut out, r1, c1, c2);
             Ok(Array::from_matrix(out, r1, c2))
         }
         (a_shape, b_shape) => Err(shape_error(a_shape, b_shape)),
@@ -262,7 +262,7 @@ fn matmul_2d<const MODE: u8>(a_data: &[f64], b_data: &[f64], out: &mut [f64], r1
 /// output's chain still starts from 0.0 and runs all of `k`, and only the finished chain is added
 /// to `c`, one rounding as the separate add. Saves that add's full pass over the output, and one
 /// output-sized array (`layer_accumulate_gradient_batch` at 32 x 5408 spent 140-160 us on the pass).
-pub fn matmul_add(c: ArrayView<'_>, a: ArrayView<'_>, b: ArrayView<'_>) -> Result<Array, Error> {
+pub fn matmul_add(c: &Array, a: &Array, b: &Array) -> Result<Array, Error> {
     let (Shape::Matrix(r1, c1), Shape::Matrix(r2, c2)) = (a.shape, b.shape) else {
         return Err(shape_error(a.shape, b.shape));
     };
@@ -270,14 +270,14 @@ pub fn matmul_add(c: ArrayView<'_>, a: ArrayView<'_>, b: ArrayView<'_>) -> Resul
         return Err(shape_error(a.shape, b.shape));
     }
     if c.shape != Shape::Matrix(r1, c2) {
-        return Err(Error::InvalidShape(format!(
+        return Err(Error::InvalidArgument(format!(
             "cannot add a product of shape {:?} to an array of shape {:?}",
             Shape::Matrix(r1, c2),
             c.shape
         )));
     }
-    let mut out = c.data.to_vec();
-    matmul_2d::<ADD>(a.data, b.data, &mut out, r1, c1, c2);
+    let mut out = c.data.clone();
+    matmul_2d::<ADD>(&a.data, &b.data, &mut out, r1, c1, c2);
     Ok(Array::from_matrix(out, r1, c2))
 }
 
@@ -367,15 +367,15 @@ where
 /// batched forward agrees exactly with the single-example one. Rows of `a` go in register tiles
 /// against rows of `b` (`matmul_nt_blocks_avx2_fma`), and the rows left over one at a time.
 /// Threaded over `M` rows like `matmul_2d`.
-pub fn matmul_nt(a: ArrayView<'_>, b: ArrayView<'_>) -> Result<Array, Error> {
+pub fn matmul_nt(a: &Array, b: &Array) -> Result<Array, Error> {
     let (Shape::Matrix(m, k), Shape::Matrix(n, b_k)) = (a.shape, b.shape) else {
-        return Err(Error::InvalidShape(format!(
+        return Err(Error::InvalidArgument(format!(
             "matmul_nt requires two 2D arrays, got shapes {:?} and {:?}",
             a.shape, b.shape
         )));
     };
     if k != b_k {
-        return Err(Error::InvalidShape(format!(
+        return Err(Error::InvalidArgument(format!(
             "cannot compute a @ b.T for shapes {:?} and {:?}",
             a.shape, b.shape
         )));
@@ -391,17 +391,17 @@ pub fn matmul_nt(a: ArrayView<'_>, b: ArrayView<'_>) -> Result<Array, Error> {
         #[cfg(target_arch = "x86_64")]
         {
             if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-                row = unsafe { matmul_nt_blocks_avx2_fma(a.data, b.data, chunk, row_start, row_end, k, n) };
+                row = unsafe { matmul_nt_blocks_avx2_fma(&a.data, &b.data, chunk, row_start, row_end, k, n) };
             }
         }
         // NEON is part of aarch64's baseline: its blocks always run there
         #[cfg(target_arch = "aarch64")]
-        let row = unsafe { matmul_nt_blocks_neon(a.data, b.data, chunk, row_start, row_end, k, n) };
+        let row = unsafe { matmul_nt_blocks_neon(&a.data, &b.data, chunk, row_start, row_end, k, n) };
         // the rows left over after the last full block, or every row without the vector blocks
         for row in row..row_end {
             let a_row = &a.data[row * k..(row + 1) * k];
             let out_row = &mut chunk[(row - row_start) * n..(row - row_start + 1) * n];
-            dot_products_into(b.data, k, a_row, out_row);
+            dot_products_into(&b.data, k, a_row, out_row);
         }
     });
     Ok(Array::from_matrix(out, m, n))
@@ -724,7 +724,7 @@ pub fn narrow_rows_per_block() -> usize {
 /// where it passed the L3. Threaded over 16-wide column chunks of `b`, not rows: each thread
 /// computes every row for its columns into its own buffer, so `b` is still read about once (row
 /// threading made every thread read all of it, and gained nothing from the slabs).
-pub fn matmul_long_k(a: ArrayView<'_>, b: ArrayView<'_>) -> Result<Array, Error> {
+pub fn matmul_long_k(a: &Array, b: &Array) -> Result<Array, Error> {
     let (m, k, n) = product_shape(a, b)?;
     let k_block = overridden_or(&LONG_K_BLOCK_OVERRIDE, LONG_K_BLOCK);
     let chunks = n.div_ceil(16).max(1);
@@ -751,7 +751,7 @@ pub fn matmul_long_k(a: ArrayView<'_>, b: ArrayView<'_>) -> Result<Array, Error>
                 n,
                 out_stride: width,
             };
-            tiled_row_range::<RESUME>(a.data, b.data, &mut part, panel);
+            tiled_row_range::<RESUME>(&a.data, &b.data, &mut part, panel);
             k_start = k_end;
         }
         part
@@ -781,7 +781,7 @@ pub fn matmul_long_k(a: ArrayView<'_>, b: ArrayView<'_>) -> Result<Array, Error>
     Ok(Array::from_matrix(out, m, n))
 }
 
-fn product_shape(a: ArrayView<'_>, b: ArrayView<'_>) -> Result<(usize, usize, usize), Error> {
+fn product_shape(a: &Array, b: &Array) -> Result<(usize, usize, usize), Error> {
     let (Shape::Matrix(m, k), Shape::Matrix(b_k, n)) = (a.shape, b.shape) else {
         return Err(shape_error(a.shape, b.shape));
     };
@@ -1178,24 +1178,24 @@ unsafe fn store_lanes_neon<const MODE: u8>(out: *mut f64, acc: std::arch::aarch6
 }
 
 fn shape_error(a_shape: Shape, b_shape: Shape) -> Error {
-    Error::InvalidShape(format!("cannot matmul arrays of shape {:?} and {:?}", a_shape, b_shape))
+    Error::InvalidArgument(format!("cannot matmul arrays of shape {:?} and {:?}", a_shape, b_shape))
 }
 
 /// The full pairwise-product matrix of two 1D vectors - `accumulate_gradient`'s own
 /// `np.outer(delta, input_layer.a)`. Exposed as a free function (`indrajala_math_rust.outer(a, b)`),
 /// matching `np.outer`'s own call style rather than an operator.
-pub fn outer(a: ArrayView<'_>, b: ArrayView<'_>) -> Result<Array, Error> {
+pub fn outer(a: &Array, b: &Array) -> Result<Array, Error> {
     match (a.shape, b.shape) {
         (Shape::Vector(m), Shape::Vector(n)) => {
             let mut out = Vec::with_capacity(m * n);
-            for &a_value in a.data {
-                for &b_value in b.data {
+            for &a_value in &a.data {
+                for &b_value in &b.data {
                     out.push(a_value * b_value);
                 }
             }
             Ok(Array::from_matrix(out, m, n))
         }
-        (a_shape, b_shape) => Err(Error::InvalidShape(format!(
+        (a_shape, b_shape) => Err(Error::InvalidArgument(format!(
             "outer requires two 1D vectors, got shapes {:?} and {:?}",
             a_shape, b_shape
         ))),

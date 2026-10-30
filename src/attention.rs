@@ -71,6 +71,7 @@ use crate::fused::{affine_forward_batch, layer_accumulate_gradient_batch, layer_
 use crate::generator::Generator;
 use crate::linalg::matmul;
 use crate::ufuncs::array_softmax;
+use indrajala_math::Array;
 
 /// What attend reads besides `Q`, `K` and `V`: the head count, each head's width, whether the
 /// scores are masked causally and the drop probability of each weight in training.
@@ -199,7 +200,7 @@ impl<'a> Rotation<'a> {
                 }
             }
         }
-        RustArray { data, shape: m.shape }
+        RustArray(Array { data, shape: m.shape })
     }
 }
 
@@ -314,18 +315,18 @@ fn masked_causally(mut scores: RustArray, tokens: usize) -> RustArray {
 
 /// `P~ = P * M / keep`, elementwise, in that grouping: numpy's `P * M / keep`.
 fn dropped(p: &RustArray, mask: &RustArray, keep: f64) -> RustArray {
-    RustArray {
+    RustArray(Array {
         data: p.data.iter().zip(&mask.data).map(|(&pv, &mv)| pv * mv / keep).collect(),
         shape: p.shape,
-    }
+    })
 }
 
 /// Each value divided by `s`.
 fn divided(m: RustArray, s: f64) -> RustArray {
-    RustArray {
+    RustArray(Array {
         data: m.data.iter().map(|&v| v / s).collect(),
         shape: m.shape,
-    }
+    })
 }
 
 // project, attend, combine: the forward pass's blocks
@@ -490,10 +491,10 @@ fn project_backward(gradients: [&RustArray; 3], weights: [&RustArray; 3]) -> PyR
         .zip(&dx_v.data)
         .map(|((&a, &b), &c)| (a + b) + c)
         .collect();
-    Ok(RustArray {
+    Ok(RustArray(Array {
         data: dx,
         shape: dx_q.shape,
-    })
+    }))
 }
 
 /// The forward pass: `(a, q, k, v, p, h, mask)`, `a` in `x`'s shape, the caches as `(N * T, h·d_k)`
@@ -548,10 +549,10 @@ fn forward(
     let (q, k, v) = project(&token_rows(x, d), projections, rotation, tokens, &options)?;
     let (p, h, mask) = attend_forward(&q, &k, &v, tokens, &options, dropping.generator()?)?;
     let out = combine(&h, projections)?;
-    let a = RustArray {
-        data: out.data,
+    let a = RustArray(Array {
+        data: out.0.data,
         shape: x.shape,
-    };
+    });
     Ok((a, q, k, v, p, h, mask))
 }
 
@@ -713,10 +714,10 @@ pub fn attention_downstream_batch(
         None => (dq, dk),
     };
     let dx = project_backward([&dq, &dk, &dv], [wq, wk, wv])?;
-    let dx = RustArray {
-        data: dx.data,
+    let dx = RustArray(Array {
+        data: dx.0.data,
         shape: delta_batch.shape,
-    };
+    });
     Ok((dx, dq, dk, dv))
 }
 

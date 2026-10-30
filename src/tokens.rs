@@ -13,6 +13,7 @@ use pyo3::prelude::*;
 
 use crate::array::{RustArray, Shape};
 use crate::generator::Generator;
+use indrajala_math::Array;
 
 /// `(rows, width)` of one example (1 row) or a batch.
 fn rows_and_width(x: &RustArray) -> (usize, usize) {
@@ -259,10 +260,10 @@ pub fn embedding_accumulate_gradient(delta: &RustArray, x: &RustArray, grad_tabl
             *acc += v;
         }
     }
-    Ok(RustArray {
+    Ok(RustArray(Array {
         data,
         shape: grad_table.shape,
-    })
+    }))
 }
 
 /// `drop_probability` checked to be in `[0, 1)`; returns `1 - drop_probability`, the keep divisor.
@@ -277,10 +278,10 @@ fn keep_probability(drop_probability: f64, context: &str) -> PyResult<f64> {
 
 /// `x * mask / keep`, elementwise, in that grouping: numpy's `X * M / keep`.
 fn masked(x: &RustArray, mask: &RustArray, keep: f64) -> RustArray {
-    RustArray {
+    RustArray(Array {
         data: x.data.iter().zip(&mask.data).map(|(&xv, &mv)| xv * mv / keep).collect(),
         shape: x.shape,
-    }
+    })
 }
 
 /// `TokenDropoutArrayLayer.forward_batch` in training: a mask of `x`'s shape drawn from `rng` in
@@ -294,10 +295,10 @@ pub fn token_dropout_forward(
     mut rng: PyRefMut<'_, Generator>,
 ) -> PyResult<(RustArray, RustArray)> {
     let keep = keep_probability(drop_probability, "token_dropout_forward")?;
-    let mask = RustArray {
+    let mask = RustArray(Array {
         data: rng.draw_bernoulli_mask(drop_probability, x.data.len()),
         shape: x.shape,
-    };
+    });
     Ok((masked(x, &mask, keep), mask))
 }
 
