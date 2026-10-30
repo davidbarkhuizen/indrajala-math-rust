@@ -1,0 +1,230 @@
+# Build and test on every platform we ship (indrajala-ml's release workplan, stage 4): called by
+# ci.yml on every push and PR, and by release.yml on a tag, so a release publishes only what this
+# run built and tested on each wheel's own platform.
+
+name: build and test
+
+on:
+  workflow_call:
+
+env:
+  MATURIN_VERSION: "1.15.0" # indrajala-ml's ./cli maturin_version
+  PYTHONS: "3.14 3.15"
+
+jobs:
+  # One Linux job for what doesn't depend on the platform.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Rust format and lints
+        run: |
+          cargo fmt --check
+          cargo clippy --workspace --all-targets -- -D warnings
+      # what docs.rs builds, and the .crate as crates.io would take it, built from its own sources
+      - name: Core docs and package
+        run: |
+          RUSTDOCFLAGS="-D warnings" cargo doc -p indrajala-math --no-deps
+          cargo publish --dry-run -p indrajala-math
+      # ruff, pyright and mypy (for stubtest) pinned to indrajala-ml's ./cli versions
+      - name: Python lints
+        run: |
+          pip install ruff==0.16.9 pyright==1.1.414 pytest numpy
+          ruff check .
+          ruff format --check .
+          pyright
+
+  # The core's undefined-behaviour check: miri runs its scalar paths (it reports no AVX2), the
+  # fallback every unsafe vector path must agree with. Nightly beside the pinned toolchain.
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install nightly with miri
+        run: rustup toolchain install nightly --profile minimal --component miri,rust-src
+      - name: Miri
+        run: cargo +nightly miri test -p indrajala-math --test contract --test numpy_streams
+
+  # The core's own tests, its bit fixtures among them, on every shipped platform's runner.
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Core tests
+        run: cargo test -p indrajala-math --release
+
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, runner: ubuntu-latest, target: x86_64, manylinux: "2_28" }
+          - { name: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64, manylinux: "2_28" }
+          - { name: musllinux-x86_64, runner: ubuntu-latest, target: x86_64, manylinux: musllinux_1_2 }
+          - { name: musllinux-aarch64, runner: ubuntu-24.04-arm, target: aarch64, manylinux: musllinux_1_2 }
+          - { name: macos-arm64, runner: macos-latest, target: aarch64 }
+          - { name: macos-x86_64, runner: macos-15-intel, target: x86_64 }
+          - { name: windows-x86_64, runner: windows-latest, target: x64 }
+          - { name: windows-arm64, runner: windows-11-arm, target: aarch64 }
+    name: wheels (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      # macOS and Windows build against the runner's interpreters; Linux's come from the container
+      - uses: actions/setup-python@v7
+        if: ${{ !startsWith(matrix.runner, 'ubuntu') }}
+        with:
+          python-version: |
+            3.14
+            3.15
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: ${{ env.MATURIN_VERSION }}
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: --release --out dist --interpreter ${{ env.PYTHONS }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.name }}
+          path: dist/*.whl
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: ${{ env.MATURIN_VERSION }}
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  # Each wheel installed into a clean environment on its own platform, and the op suite and the
+  # stub check run against it from outside the checkout, so the installed package is what's tested.
+  test-wheels:
+    needs: wheels
+    strategy:
+      fail-fast: false
+      matrix:
+        name: [linux-x86_64, linux-aarch64, macos-arm64, macos-x86_64, windows-x86_64, windows-arm64]
+        python: ["3.14", "3.15"]
+        include:
+          - { name: linux-x86_64, runner: ubuntu-latest }
+          - { name: linux-aarch64, runner: ubuntu-24.04-arm }
+          - { name: macos-arm64, runner: macos-latest }
+          - { name: macos-x86_64, runner: macos-15-intel }
+          - { name: windows-x86_64, runner: windows-latest }
+          - { name: windows-arm64, runner: windows-11-arm }
+    name: test (${{ matrix.name }}, ${{ matrix.python }})
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v7
+        with:
+          name: wheels-${{ matrix.name }}
+          path: dist
+      - name: Install the wheel
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          source "$RUNNER_TEMP/venv/bin/activate" 2>/dev/null || source "$RUNNER_TEMP/venv/Scripts/activate"
+          python -m pip install pytest numpy mypy==2.3.1
+          python -m pip install --no-index --find-links dist indrajala-math-rust
+      - name: Tests and stubtest
+        run: |
+          source "$RUNNER_TEMP/venv/bin/activate" 2>/dev/null || source "$RUNNER_TEMP/venv/Scripts/activate"
+          cp -r tests "$RUNNER_TEMP/tests"
+          cd "$RUNNER_TEMP"
+          python -m pytest tests/
+          python -m mypy.stubtest indrajala_math_rust --allowlist "$GITHUB_WORKSPACE/stubtest_allowlist.txt"
+
+  # musl's wheels in Alpine (musl's C library and allocator), on both architectures.
+  test-musl:
+    needs: wheels
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: musllinux-x86_64, runner: ubuntu-latest }
+          - { name: musllinux-aarch64, runner: ubuntu-24.04-arm }
+        python: ["3.14", "3.15"]
+    name: test (${{ matrix.name }}, ${{ matrix.python }})
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: wheels-${{ matrix.name }}
+          path: dist
+      - name: Tests in Alpine
+        run: |
+          docker run --rm -v "$PWD:/crate:ro" python:${{ matrix.python }}-alpine sh -euxc '
+            python -m venv /venv && . /venv/bin/activate
+            pip install pytest numpy
+            pip install --no-index --find-links /crate/dist indrajala-math-rust
+            cp -r /crate/tests /tests && cd / && python -m pytest tests/
+          '
+
+  # The sdist builds with rustup and the pinned toolchain (rust-toolchain.toml), and its build passes.
+  test-sdist:
+    needs: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - uses: actions/download-artifact@v7
+        with:
+          name: sdist
+          path: dist
+      - name: Build from the sdist and test
+        run: |
+          python -m venv "$RUNNER_TEMP/venv" && source "$RUNNER_TEMP/venv/bin/activate"
+          pip install pytest numpy
+          pip install dist/*.tar.gz
+          cp -r tests "$RUNNER_TEMP/tests" && cd "$RUNNER_TEMP" && python -m pytest tests/
+
+  # What the indexes will check, and what every wheel must hold.
+  package-check:
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+      - name: twine check and contents
+        run: |
+          pip install twine
+          twine check --strict dist/*
+          for wheel in dist/*.whl; do
+            listing=$(python -m zipfile -l "$wheel")
+            for file in indrajala_math_rust/__init__.pyi indrajala_math_rust/py.typed licenses/LICENSE; do
+              echo "$listing" | grep -q "$file" || { echo "$wheel lacks $file"; exit 1; }
+            done
+          done
+          ls -1 dist
