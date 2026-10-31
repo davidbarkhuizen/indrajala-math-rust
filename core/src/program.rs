@@ -511,6 +511,7 @@ impl WindowProgram {
                         rng.as_deref_mut(),
                         cos.as_ref(),
                         sin.as_ref(),
+                        None, // a window has no segments
                     )?;
                     if rng.is_some() {
                         cache = Cache::Attention {

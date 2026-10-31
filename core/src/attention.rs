@@ -310,6 +310,20 @@ fn masked_causally(mut scores: Array, tokens: usize) -> Array {
     scores
 }
 
+/// A `(T, T)` score matrix with each `S_tj` set to `-inf` where key `j` is in another segment than
+/// query `t`, or a pad's (segment 0), but never on the diagonal (indrajala-ml's segments workplan,
+/// D4): `segments` is one example's `T` segment ids. Computed per head from the ids, never stored.
+fn masked_by_segment(mut scores: Array, segments: &[f64], tokens: usize) -> Array {
+    for (t, row) in scores.data.chunks_exact_mut(tokens).enumerate() {
+        for (j, score) in row.iter_mut().enumerate() {
+            if j != t && (segments[j] != segments[t] || segments[j] == 0.0) {
+                *score = f64::NEG_INFINITY;
+            }
+        }
+    }
+    scores
+}
+
 /// `P~ = P * M / keep`, elementwise, in that grouping: numpy's `P * M / keep`.
 fn dropped(p: &Array, mask: &Array, keep: f64) -> Array {
     Array {
@@ -360,6 +374,7 @@ fn attend_forward(
     tokens: usize,
     options: &AttentionOptions,
     mut rng: Option<&mut Generator>,
+    segments: Option<&Array>,
 ) -> Result<(Array, Array, Option<Array>), Error> {
     let (heads, d_k, width, s) = (options.heads, options.key_size, options.width(), options.scale());
     let rows = q.data.len() / width;
@@ -378,6 +393,9 @@ fn attend_forward(
             let mut scores = divided(matmul(&q_ni, &k_ni.transpose())?, s);
             if options.causal {
                 scores = masked_causally(scores, tokens);
+            }
+            if let Some(segments) = segments {
+                scores = masked_by_segment(scores, &segments.data[n * tokens..(n + 1) * tokens], tokens);
             }
             let p_ni = array_softmax(&scores);
             match rng.as_deref_mut() {
@@ -530,13 +548,22 @@ fn forward(
     causal: bool,
     mut dropping: Dropping,
     table: (Option<&Array>, Option<&Array>),
+    segments: Option<&Array>,
 ) -> Result<ForwardResult, Error> {
     let context = dropping.context;
     let (d, options) = shapes(projections, heads, causal, dropping.dropout, context)?;
-    let (_, tokens) = examples_and_tokens(x, d, "x", context)?;
+    let (examples, tokens) = examples_and_tokens(x, d, "x", context)?;
+    if segments.is_some_and(|segments| segments.data.len() != examples * tokens) {
+        let got = segments.map_or(0, |segments| segments.data.len());
+        return Err(Error::invalid(format!(
+            "{context} requires a segment id per token, {} ({examples} examples of {tokens}); got {}",
+            examples * tokens,
+            got
+        )));
+    }
     let rotation = Rotation::new(table.0, table.1, tokens, &options, context)?;
     let (q, k, v) = project(&token_rows(x, d), projections, rotation, tokens, &options)?;
-    let (p, h, mask) = attend_forward(&q, &k, &v, tokens, &options, dropping.generator()?)?;
+    let (p, h, mask) = attend_forward(&q, &k, &v, tokens, &options, dropping.generator()?, segments)?;
     let out = combine(&h, projections)?;
     let a = Array {
         data: out.data,
@@ -547,7 +574,9 @@ fn forward(
 
 /// `AttentionArrayLayer.forward`: one example, `x` 1D of `T * d` values, `d` `bo`'s length, in
 /// `heads` heads across `bq`'s length, masked if `causal`, its weights dropped from `rng` in
-/// `training` at `dropout > 0`, its queries and keys rotated by `cos` and `sin` when given.
+/// `training` at `dropout > 0`, its queries and keys rotated by `cos` and `sin` when given, and
+/// with `segments` (its `T` segment ids as floats) a key in another segment than its query, or a
+/// pad's (0), masked but for the diagonal (indrajala-ml's segments workplan, D4).
 /// Returns `(a, q, k, v, p, h, mask)`: `a` 1D, and what the backward
 /// pass reads, `q`, `k`, `v` and `h` `(T, h·d_k)`, `p` `(T, h·T)` and `mask` as `p`, or `None`.
 #[allow(clippy::too_many_arguments)]
@@ -568,6 +597,7 @@ pub fn attention_forward(
     rng: Option<&mut Generator>,
     cos: Option<&Array>,
     sin: Option<&Array>,
+    segments: Option<&Array>,
 ) -> Result<ForwardResult, Error> {
     let context = "attention_forward";
     if !matches!(x.shape, Shape::Vector(_)) {
@@ -592,11 +622,12 @@ pub fn attention_forward(
         rng,
         context,
     };
-    forward(x, &projections, heads, causal, dropping, (cos, sin))
+    forward(x, &projections, heads, causal, dropping, (cos, sin), segments)
 }
 
 /// `AttentionArrayLayer.forward_batch`: `x` 2D (`batch, T * d`), each example
-/// `attention_forward`'s bits, masked if `causal`, dropped and rotated as it. Returns `(a, q, k, v, p, h,
+/// `attention_forward`'s bits, masked if `causal` and by `segments` (`N * T` ids, examples then
+/// tokens), dropped and rotated as it. Returns `(a, q, k, v, p, h,
 /// mask)`, the caches over the batch's `(N * T)` rows, examples then tokens; the mask's draws are
 /// the examples' in turn, so one example's are its batch of one's.
 #[allow(clippy::too_many_arguments)]
@@ -617,6 +648,7 @@ pub fn attention_forward_batch(
     rng: Option<&mut Generator>,
     cos: Option<&Array>,
     sin: Option<&Array>,
+    segments: Option<&Array>,
 ) -> Result<ForwardResult, Error> {
     let context = "attention_forward_batch";
     if !matches!(x.shape, Shape::Matrix(_, _)) {
@@ -641,7 +673,7 @@ pub fn attention_forward_batch(
         rng,
         context,
     };
-    forward(x, &projections, heads, causal, dropping, (cos, sin))
+    forward(x, &projections, heads, causal, dropping, (cos, sin), segments)
 }
 
 /// The cache `cache` (`(c, h·d_k)`, oldest first) with `row` (`(1, h·d_k)`) appended, the oldest

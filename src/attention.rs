@@ -41,7 +41,7 @@ pub(crate) use indrajala_math::attention::*;
 /// pass reads, `q`, `k`, `v` and `h` `(T, h·d_k)`, `p` `(T, h·T)` and `mask` as `p`, or `None`.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, heads, *, causal = false, dropout = 0.0, training = false, rng = None, cos = None, sin = None))]
+#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, heads, *, causal = false, dropout = 0.0, training = false, rng = None, cos = None, sin = None, segments = None))]
 pub fn attention_forward<'py>(
     x: &RustArray,
     wq: &RustArray,
@@ -59,6 +59,7 @@ pub fn attention_forward<'py>(
     mut rng: Option<PyRefMut<'py, Generator>>,
     cos: Option<&RustArray>,
     sin: Option<&RustArray>,
+    segments: Option<&RustArray>,
 ) -> PyResult<ForwardResult> {
     indrajala_math::attention::attention_forward(
         x,
@@ -77,6 +78,7 @@ pub fn attention_forward<'py>(
         rng.as_deref_mut().map(|g| &mut g.0),
         cos.map(|a| &a.0),
         sin.map(|a| &a.0),
+        segments.map(|a| &a.0),
     )
     .map(forward_result)
     .map_err(py_err)
@@ -88,7 +90,7 @@ pub fn attention_forward<'py>(
 /// the examples' in turn, so one example's are its batch of one's.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, heads, *, causal = false, dropout = 0.0, training = false, rng = None, cos = None, sin = None))]
+#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, heads, *, causal = false, dropout = 0.0, training = false, rng = None, cos = None, sin = None, segments = None))]
 pub fn attention_forward_batch<'py>(
     x: &RustArray,
     wq: &RustArray,
@@ -106,6 +108,7 @@ pub fn attention_forward_batch<'py>(
     mut rng: Option<PyRefMut<'py, Generator>>,
     cos: Option<&RustArray>,
     sin: Option<&RustArray>,
+    segments: Option<&RustArray>,
 ) -> PyResult<ForwardResult> {
     indrajala_math::attention::attention_forward_batch(
         x,
@@ -124,6 +127,7 @@ pub fn attention_forward_batch<'py>(
         rng.as_deref_mut().map(|g| &mut g.0),
         cos.map(|a| &a.0),
         sin.map(|a| &a.0),
+        segments.map(|a| &a.0),
     )
     .map(forward_result)
     .map_err(py_err)

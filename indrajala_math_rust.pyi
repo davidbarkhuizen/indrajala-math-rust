@@ -297,6 +297,7 @@ def attention_forward(
     rng: Generator | None = None,
     cos: Array | None = None,
     sin: Array | None = None,
+    segments: Array | None = None,
 ) -> tuple[Array, Array, Array, Array, Array, Array, Array | None]: ...
 def attention_forward_batch(
     x: Array,
@@ -316,6 +317,7 @@ def attention_forward_batch(
     rng: Generator | None = None,
     cos: Array | None = None,
     sin: Array | None = None,
+    segments: Array | None = None,
 ) -> tuple[Array, Array, Array, Array, Array, Array, Array | None]: ...
 def attention_step(
     x: Array,
