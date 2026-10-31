@@ -309,7 +309,12 @@ fn adam_update(
     epsilon: f64,
     learning_rate: f64,
     batch_size: f64,
+    weight_decay: f64,
 ) -> (Array, Array, Array) {
+    // decoupled weight decay (AdamW, Loshchilov & Hutter 2019), in PyTorch's AdamW grouping: the
+    // parameter shrinks by learning_rate * weight_decay before the Adam step is taken from it. At
+    // weight_decay 0 the factor is exactly 1.0, so the step is Adam's, bit for bit
+    let decay = 1.0 - learning_rate * weight_decay;
     let bias_correction1 = 1.0 - powi(beta1, t);
     let bias_correction2 = 1.0 - powi(beta2, t);
 
@@ -324,7 +329,7 @@ fn adam_update(
         let new_v = beta2 * v.data[i] + (1.0 - beta2) * g * g;
         let m_hat = new_m / bias_correction1;
         let v_hat = new_v / bias_correction2;
-        new_param_data.push(param.data[i] - learning_rate * m_hat / (v_hat.sqrt() + epsilon));
+        new_param_data.push(param.data[i] * decay - learning_rate * m_hat / (v_hat.sqrt() + epsilon));
         new_m_data.push(new_m);
         new_v_data.push(new_v);
     }
@@ -347,7 +352,9 @@ fn adam_update(
 
 /// `AdamArrayLayer.apply_accumulated_gradient`: the Adam (Kingma & Ba, 2014) update of `W` and `b`
 /// from their accumulated gradients over `batch_size` examples, with step count `t` (after
-/// incrementing, so 1 or more). Returns `(W, b, m_W, v_W, m_b, v_b)`, the new parameters and moments.
+/// incrementing, so 1 or more), and AdamW's decoupled weight decay `weight_decay` on `W` only (`b`
+/// isn't decayed; 0 is Adam): `W * (1 - learning_rate * weight_decay) - learning_rate * m_hat /
+/// (sqrt(v_hat) + epsilon)`. Returns `(W, b, m_W, v_W, m_b, v_b)`, the new parameters and moments.
 #[allow(clippy::too_many_arguments)]
 pub fn layer_adam_apply_accumulated_gradient(
     w: &Array,
@@ -364,6 +371,7 @@ pub fn layer_adam_apply_accumulated_gradient(
     epsilon: f64,
     learning_rate: f64,
     batch_size: usize,
+    weight_decay: f64,
 ) -> Result<(Array, Array, Array, Array, Array, Array), Error> {
     require_same_shape(w, grad_w, "layer_adam_apply_accumulated_gradient (W, grad_W)")?;
     require_same_shape(w, m_w, "layer_adam_apply_accumulated_gradient (W, m_W)")?;
@@ -377,6 +385,11 @@ pub fn layer_adam_apply_accumulated_gradient(
             "layer_adam_apply_accumulated_gradient requires t >= 1 (the step count after incrementing)",
         ));
     }
+    if !(weight_decay.is_finite() && weight_decay >= 0.0) {
+        return Err(Error::invalid(format!(
+            "layer_adam_apply_accumulated_gradient requires a finite weight_decay >= 0; got {weight_decay}"
+        )));
+    }
 
     let (new_w, new_m_w, new_v_w) = adam_update(
         w,
@@ -389,6 +402,7 @@ pub fn layer_adam_apply_accumulated_gradient(
         epsilon,
         learning_rate,
         batch_size as f64,
+        weight_decay,
     );
     let (new_b, new_m_b, new_v_b) = adam_update(
         b,
@@ -401,6 +415,7 @@ pub fn layer_adam_apply_accumulated_gradient(
         epsilon,
         learning_rate,
         batch_size as f64,
+        0.0,
     );
 
     Ok((new_w, new_b, new_m_w, new_v_w, new_m_b, new_v_b))

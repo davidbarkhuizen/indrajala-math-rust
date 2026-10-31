@@ -148,6 +148,7 @@ def layer_adam_apply_accumulated_gradient(
     epsilon: float,
     learning_rate: float,
     batch_size: int,
+    weight_decay: float = 0.0,
 ) -> tuple[Array, Array, Array, Array, Array, Array]: ...
 def layer_l2_apply_accumulated_gradient(
     w: Array, b: Array, grad_w: Array, grad_b: Array, l2_lambda: float, learning_rate: float, batch_size: int

@@ -164,6 +164,7 @@ pub fn layer_sgd_step(
 
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
+#[pyo3(signature = (w, b, grad_w, grad_b, m_w, v_w, m_b, v_b, t, beta1, beta2, epsilon, learning_rate, batch_size, weight_decay=0.0))]
 pub fn layer_adam_apply_accumulated_gradient(
     w: &RustArray,
     b: &RustArray,
@@ -179,6 +180,7 @@ pub fn layer_adam_apply_accumulated_gradient(
     epsilon: f64,
     learning_rate: f64,
     batch_size: usize,
+    weight_decay: f64,
 ) -> PyResult<(RustArray, RustArray, RustArray, RustArray, RustArray, RustArray)> {
     indrajala_math::fused::layer_adam_apply_accumulated_gradient(
         w,
@@ -195,6 +197,7 @@ pub fn layer_adam_apply_accumulated_gradient(
         epsilon,
         learning_rate,
         batch_size,
+        weight_decay,
     )
     .map(|r| {
         let (r0, r1, r2, r3, r4, r5) = r;
