@@ -129,6 +129,51 @@ pub fn attention_forward_batch<'py>(
     .map_err(py_err)
 }
 
+/// `AttentionArrayLayer.step`: one token's decode on a causal layer's cache, `x` 1D, `k_cache` and
+/// `v_cache` `(c, h·d_k)` oldest first, `cos` and `sin` its position's `(1, d_k / 2)` row when
+/// rotary. Returns `(a, k_cache, v_cache)`, the caches with its key and value appended, the oldest
+/// dropped past `window`.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, k_cache, v_cache, heads, *, window, cos = None, sin = None))]
+pub fn attention_step(
+    x: &RustArray,
+    wq: &RustArray,
+    bq: &RustArray,
+    wk: &RustArray,
+    bk: &RustArray,
+    wv: &RustArray,
+    bv: &RustArray,
+    wo: &RustArray,
+    bo: &RustArray,
+    k_cache: &RustArray,
+    v_cache: &RustArray,
+    heads: usize,
+    window: usize,
+    cos: Option<&RustArray>,
+    sin: Option<&RustArray>,
+) -> PyResult<(RustArray, RustArray, RustArray)> {
+    indrajala_math::attention::attention_step(
+        x,
+        wq,
+        bq,
+        wk,
+        bk,
+        wv,
+        bv,
+        wo,
+        bo,
+        k_cache,
+        v_cache,
+        heads,
+        window,
+        cos.map(|a| &a.0),
+        sin.map(|a| &a.0),
+    )
+    .map(|(a, k, v)| (a.into(), k.into(), v.into()))
+    .map_err(py_err)
+}
+
 /// `AttentionArrayLayer._backward`: from `delta_batch` (`dl/dout`, 2D `batch, T * d`, or 1D for
 /// one example, whose caches are `attention_forward`'s) and the forward pass's `q`, `k`, `v` and
 /// `p`, in `heads` heads across `wq`'s rows, returns `(dx, dq, dk, dv)`: `dx`, the downstream, in

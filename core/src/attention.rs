@@ -644,6 +644,100 @@ pub fn attention_forward_batch(
     forward(x, &projections, heads, causal, dropping, (cos, sin))
 }
 
+/// The cache `cache` (`(c, h·d_k)`, oldest first) with `row` (`(1, h·d_k)`) appended, the oldest
+/// rows dropped past `window`.
+fn appended(cache: &Array, row: &Array, window: usize, width: usize) -> Array {
+    let mut data = Vec::with_capacity(cache.data.len() + width);
+    data.extend_from_slice(&cache.data);
+    data.extend_from_slice(&row.data);
+    let rows = (data.len() / width).min(window);
+    let dropped = data.len() / width - rows;
+    Array::from_matrix(data.split_off(dropped * width), rows, width)
+}
+
+/// `AttentionArrayLayer.step` (indrajala-ml's generation workplan, D2, D3, D8): one token's decode
+/// on a causal layer's cache. `x` 1D, the token's `d` features; `k_cache` and `v_cache` `(c,
+/// h·d_k)`, the rotated keys and the values of the `c` tokens before it, oldest first; `cos` and
+/// `sin`, when given, `(1, d_k / 2)`, its position's row of the rotary table. Project's blocks on
+/// the one row give its `q`, `k` and `v`, `q` and `k` rotated; `k` and `v` are appended to the
+/// caches, the oldest dropped past `window` (the window slides); each head attends from `q` to
+/// every cached key, unmasked, since none is later, and combine projects the heads. Returns `(a,
+/// k_cache, v_cache)`, `a` 1D and the updated caches.
+///
+/// Each block is the forward pass's: the projections a dense layer's per row, a score one chain
+/// over `d_k` and a weighted sum one chain over the keys in order, so a step's bits are the full
+/// pass's at that token, whose masked keys add exact zeros after (or, past the window, before) the
+/// ones it reads.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_step(
+    x: &Array,
+    wq: &Array,
+    bq: &Array,
+    wk: &Array,
+    bk: &Array,
+    wv: &Array,
+    bv: &Array,
+    wo: &Array,
+    bo: &Array,
+    k_cache: &Array,
+    v_cache: &Array,
+    heads: usize,
+    window: usize,
+    cos: Option<&Array>,
+    sin: Option<&Array>,
+) -> Result<(Array, Array, Array), Error> {
+    let context = "attention_step";
+    let projections = Projections {
+        wq,
+        bq,
+        wk,
+        bk,
+        wv,
+        bv,
+        wo,
+        bo,
+    };
+    let (d, options) = shapes(&projections, heads, true, 0.0, context)?;
+    require_shape(x, Shape::Vector(d), "x", context)?;
+    if window == 0 {
+        return Err(Error::invalid(format!(
+            "{context} requires a window of at least one token"
+        )));
+    }
+    let width = options.width();
+    let cached = match k_cache.shape {
+        Shape::Matrix(rows, w) if w == width => rows,
+        shape => {
+            return Err(Error::invalid(format!(
+                "{context} requires k_cache of shape (c, {width}), got {shape:?}"
+            )));
+        }
+    };
+    require_shape(v_cache, Shape::Matrix(cached, width), "v_cache", context)?;
+    let rotation = Rotation::new(cos, sin, 1, &options, context)?;
+    let (q, k, v) = project(&token_rows(x, d), &projections, rotation, 1, &options)?;
+    let (k_cache, v_cache) = (
+        appended(k_cache, &k, window, width),
+        appended(v_cache, &v, window, width),
+    );
+    let keys = k_cache.data.len() / width;
+    let (d_k, s) = (options.key_size, options.scale());
+    let mut h_i = Vec::with_capacity(options.heads);
+    for i in 0..options.heads {
+        let (q_i, k_i, v_i) = (
+            head(&q, 0, i, 1, d_k),
+            head(&k_cache, 0, i, keys, d_k),
+            head(&v_cache, 0, i, keys, d_k),
+        );
+        let p_i = array_softmax(&divided(matmul(&q_i, &k_i.transpose())?, s));
+        h_i.push(matmul(&p_i, &v_i)?);
+    }
+    let mut h = Vec::with_capacity(width);
+    extend_side_by_side(&mut h, &h_i);
+    let out = combine(&Array::from_matrix(h, 1, width), &projections)?;
+    Ok((Array::from_vector(out.data), k_cache, v_cache))
+}
+
 /// `AttentionArrayLayer._backward`: from `delta_batch` (`dl/dout`, 2D `batch, T * d`, or 1D for
 /// one example, whose caches are `attention_forward`'s) and the forward pass's `q`, `k`, `v` and
 /// `p`, in `heads` heads across `wq`'s rows, returns `(dx, dq, dk, dv)`: `dx`, the downstream, in
