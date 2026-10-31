@@ -112,7 +112,8 @@ that an invalid operation (`inf - inf`, `0 * inf`) creates, which is the hardwar
 One version names both packages: `[workspace.package] version` in `Cargo.toml` (the PyPI package
 reads it through maturin). `.github/workflows/release.yml` publishes on a tag, after the same
 build-and-test matrix every PR runs; the `crates-io` and `pypi` environments wait for the owner's
-approval.
+approval. Both indexes take the upload by trusted publishing (a token minted for the run from its
+OIDC identity): no token is stored anywhere.
 
 1. Bump the version in `Cargo.toml` by PR, and merge it.
 2. Rehearse on TestPyPI: tag `main` `testpypi-v<version>` and push the tag. Check the run, the

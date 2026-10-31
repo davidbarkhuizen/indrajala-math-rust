@@ -53,13 +53,17 @@ jobs:
     needs: [verify, build-test]
     runs-on: ubuntu-latest
     environment: crates-io
+    permissions:
+      id-token: write # trusted publishing: a token for this run only, none stored
     steps:
       - uses: actions/checkout@v7
       - name: Install pinned Rust toolchain
         run: rustup toolchain install
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
       - name: Publish indrajala-math
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
           status=$(curl -s -o /dev/null -w '%{http_code}' -A "indrajala-math-rust release" \
