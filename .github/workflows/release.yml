@@ -96,7 +96,9 @@ jobs:
           skip-existing: true
 
   # What users get: the published package installed from its index on every platform and tested.
+  # Its own condition: on a rehearsal, crates-io upstream is skipped, which skips this by default.
   verify-pypi:
+    if: ${{ !cancelled() && needs.pypi.result == 'success' }}
     needs: [verify, pypi]
     strategy:
       fail-fast: false
