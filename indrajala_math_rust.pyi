@@ -316,6 +316,24 @@ def attention_forward_batch(
     cos: Array | None = None,
     sin: Array | None = None,
 ) -> tuple[Array, Array, Array, Array, Array, Array, Array | None]: ...
+def attention_step(
+    x: Array,
+    wq: Array,
+    bq: Array,
+    wk: Array,
+    bk: Array,
+    wv: Array,
+    bv: Array,
+    wo: Array,
+    bo: Array,
+    k_cache: Array,
+    v_cache: Array,
+    heads: int,
+    *,
+    window: int,
+    cos: Array | None = None,
+    sin: Array | None = None,
+) -> tuple[Array, Array, Array]: ...
 def attention_downstream_batch(
     delta_batch: Array,
     wq: Array,

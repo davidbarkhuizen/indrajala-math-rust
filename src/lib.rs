@@ -22,6 +22,7 @@ mod ufuncs;
 use array::RustArray;
 use attention::{
     attention_accumulate_gradient_batch, attention_downstream_batch, attention_forward, attention_forward_batch,
+    attention_step,
 };
 use batch_norm::{
     batch_norm_accumulate_gradient_batch, batch_norm_downstream_batch, batch_norm_forward, batch_norm_forward_batch,
@@ -160,6 +161,7 @@ fn indrajala_math_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(layer_norm_accumulate_gradient_batch, m)?)?;
     m.add_function(wrap_pyfunction!(attention_forward, m)?)?;
     m.add_function(wrap_pyfunction!(attention_forward_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(attention_step, m)?)?;
     m.add_function(wrap_pyfunction!(attention_downstream_batch, m)?)?;
     m.add_function(wrap_pyfunction!(attention_accumulate_gradient_batch, m)?)?;
     m.add_function(wrap_pyfunction!(state_input_forward, m)?)?;
