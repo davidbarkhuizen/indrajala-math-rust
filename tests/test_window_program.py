@@ -501,10 +501,10 @@ def _forward_training(window: Window, read_at: list[int], a: Array, C: Array, rn
         elif kind == "attention":
             _, heads, causal, dropout, cos, sin = op
             table = {} if cos is None else {"cos": cos, "sin": sin}
-            a, q, k, v, p, h, mask = attention_forward_batch(
+            a, q, k, v, h, m, l, dropout_rng = attention_forward_batch(
                 a, *parameters, heads=heads, causal=causal, dropout=dropout, training=True, rng=rng, **table
             )
-            cache = (q, k, v, p, h, mask)
+            cache = (q, k, v, h, m, l, dropout_rng)
         else:
             a, cache = token_dropout_forward(a, op[1], rng)
         results.append(a)
@@ -672,11 +672,26 @@ def _learn_per_layer(
             if kind == "token_dense" and ops[i][2] == "relu":
                 d = array_relu_mask(d, results[i])
             elif kind == "attention":
-                _, heads, _, dropout, cos, sin = ops[i]
-                q, kk, v, p, _, mask = caches[i]
+                _, heads, causal, dropout, cos, sin = ops[i]
+                q, kk, v, h, m, l, dropout_rng = caches[i]
                 table = {} if cos is None else {"cos": cos, "sin": sin}
                 attention_back[i] = attention_downstream_batch(
-                    d, ps[0], ps[2], ps[4], ps[6], q, kk, v, p, heads, mask=mask, dropout=dropout, **table
+                    d,
+                    ps[0],
+                    ps[2],
+                    ps[4],
+                    ps[6],
+                    q,
+                    kk,
+                    v,
+                    h,
+                    m,
+                    l,
+                    heads,
+                    causal=causal,
+                    dropout=dropout,
+                    dropout_rng=dropout_rng,
+                    **table,
                 )
             elif kind == "state_input":
                 state_back[i] = state_input_backward(d, states[w], ps[0], grads[i][0], ops[i][1])
@@ -703,7 +718,7 @@ def _learn_per_layer(
                 )
             elif kind == "attention":
                 _, dq, dk, dv = attention_back[i]
-                grads[i] = list(attention_accumulate_gradient_batch(delta, x, caches[i][4], dq, dk, dv, *grads[i]))
+                grads[i] = list(attention_accumulate_gradient_batch(delta, x, caches[i][3], dq, dk, dv, *grads[i]))
         dC = dC_w
         for i in sorted(state_back):
             dC = dC + state_back[i][0]

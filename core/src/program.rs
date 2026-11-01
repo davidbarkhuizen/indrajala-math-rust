@@ -20,7 +20,9 @@
 //! initial state (which the program doesn't read: the caller snaps the initial state).
 
 use crate::array::{Array, Shape};
-use crate::attention::{attention_accumulate_gradient_batch, attention_downstream_batch, attention_forward_batch};
+use crate::attention::{
+    attention_accumulate_gradient_batch, attention_downstream_batch, attention_forward_batch, BLOCK,
+};
 use crate::factored::{step_forward, sum_in_order, Consolidation, StepCore, StepGradients};
 use crate::fused::{
     affine_forward_batch, layer_accumulate_gradient_batch, layer_downstream_batch, layer_relu_forward_batch,
@@ -292,9 +294,10 @@ enum Cache {
         q: Array,
         k: Array,
         v: Array,
-        p: Array,
         h: Array,
-        mask: Option<Array>,
+        m: Array,
+        l: Array,
+        rng: Option<Box<Generator>>,
     },
     Dropout {
         mask: Array,
@@ -322,13 +325,8 @@ impl WindowTape {
             .map(|cache| match cache {
                 Cache::None => 0,
                 Cache::LayerNorm { xhat, std } => xhat.data.len() + std.data.len(),
-                Cache::Attention { q, k, v, p, h, mask } => {
-                    q.data.len()
-                        + k.data.len()
-                        + v.data.len()
-                        + p.data.len()
-                        + h.data.len()
-                        + mask.as_ref().map_or(0, |m| m.data.len())
+                Cache::Attention { q, k, v, h, m, l, .. } => {
+                    q.data.len() + k.data.len() + v.data.len() + h.data.len() + m.data.len() + l.data.len()
                 }
                 Cache::Dropout { mask } => mask.data.len(),
             })
@@ -494,7 +492,7 @@ impl WindowProgram {
                     cos,
                     sin,
                 } => {
-                    let (out, q, k, v, pw, h, mask) = attention_forward_batch(
+                    let (out, q, k, v, h, m, l, dropout_rng) = attention_forward_batch(
                         a,
                         p[0],
                         p[1],
@@ -512,15 +510,17 @@ impl WindowProgram {
                         cos.as_ref(),
                         sin.as_ref(),
                         None, // a window has no segments
+                        BLOCK,
                     )?;
                     if rng.is_some() {
                         cache = Cache::Attention {
                             q,
                             k,
                             v,
-                            p: pw,
                             h,
-                            mask,
+                            m,
+                            l,
+                            rng: dropout_rng.map(Box::new),
                         };
                     }
                     Some(out)
@@ -962,13 +962,13 @@ impl WindowProgram {
                 }
                 Op::Attention {
                     heads,
+                    causal,
                     dropout,
                     cos,
                     sin,
-                    ..
                 } => {
                     let Cache::Attention {
-                        q, k, v, p: pw, mask, ..
+                        q, k, v, h, m, l, rng, ..
                     } = &tape.caches[i]
                     else {
                         unreachable!("an attention's cache in training")
@@ -979,15 +979,15 @@ impl WindowProgram {
                         p[2],
                         p[4],
                         p[6],
-                        q,
-                        k,
-                        v,
-                        pw,
+                        [q, k, v, h, m, l],
                         *heads,
-                        mask.as_ref(),
+                        *causal,
+                        None, // a window has no segments
                         *dropout,
+                        rng.as_deref(),
                         cos.as_ref(),
                         sin.as_ref(),
+                        BLOCK,
                     )?);
                 }
                 Op::StateInput { tokens } => {

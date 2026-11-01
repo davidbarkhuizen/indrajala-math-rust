@@ -15,20 +15,22 @@ type ForwardResult = (
     RustArray,
     RustArray,
     RustArray,
-    Option<RustArray>,
+    RustArray,
+    Option<Generator>,
 );
 
 /// The core's forward result, moved into the bindings' arrays.
 fn forward_result(r: indrajala_math::attention::ForwardResult) -> ForwardResult {
-    let (a, b, c, d, e, f, g) = r;
+    let (a, q, k, v, h, m, l, rng) = r;
     (
         a.into(),
-        b.into(),
-        c.into(),
-        d.into(),
-        e.into(),
-        f.into(),
-        g.map(RustArray::from),
+        q.into(),
+        k.into(),
+        v.into(),
+        h.into(),
+        m.into(),
+        l.into(),
+        rng.map(Generator),
     )
 }
 #[allow(unused_imports)]
@@ -37,11 +39,12 @@ pub(crate) use indrajala_math::attention::*;
 /// `AttentionArrayLayer.forward`: one example, `x` 1D of `T * d` values, `d` `bo`'s length, in
 /// `heads` heads across `bq`'s length, masked if `causal`, its weights dropped from `rng` in
 /// `training` at `dropout > 0`, its queries and keys rotated by `cos` and `sin` when given.
-/// Returns `(a, q, k, v, p, h, mask)`: `a` 1D, and what the backward
-/// pass reads, `q`, `k`, `v` and `h` `(T, h·d_k)`, `p` `(T, h·T)` and `mask` as `p`, or `None`.
+/// Tiled in key blocks of `block` (indrajala-ml's context-length workplan, D3). Returns `(a, q, k,
+/// v, h, m, l, dropout_rng)`: `a` 1D, and what the backward pass reads, `q`, `k`, `v` and `h`
+/// `(T, h·d_k)`, `m` and `l` `(T, heads)`, and a copy of `rng` before the draws, or `None`.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, heads, *, causal = false, dropout = 0.0, training = false, rng = None, cos = None, sin = None, segments = None))]
+#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, heads, *, causal = false, dropout = 0.0, training = false, rng = None, cos = None, sin = None, segments = None, block = 16))]
 pub fn attention_forward<'py>(
     x: &RustArray,
     wq: &RustArray,
@@ -60,6 +63,7 @@ pub fn attention_forward<'py>(
     cos: Option<&RustArray>,
     sin: Option<&RustArray>,
     segments: Option<&RustArray>,
+    block: usize,
 ) -> PyResult<ForwardResult> {
     indrajala_math::attention::attention_forward(
         x,
@@ -79,18 +83,19 @@ pub fn attention_forward<'py>(
         cos.map(|a| &a.0),
         sin.map(|a| &a.0),
         segments.map(|a| &a.0),
+        block,
     )
     .map(forward_result)
     .map_err(py_err)
 }
 
 /// `AttentionArrayLayer.forward_batch`: `x` 2D (`batch, T * d`), each example
-/// `attention_forward`'s bits, masked if `causal`, dropped and rotated as it. Returns `(a, q, k, v, p, h,
-/// mask)`, the caches over the batch's `(N * T)` rows, examples then tokens; the mask's draws are
-/// the examples' in turn, so one example's are its batch of one's.
+/// masked if `causal` and by `segments`, dropped, rotated and tiled as `attention_forward`. Returns
+/// `(a, q, k, v, h, m, l, dropout_rng)`, the caches over the batch's `(N * T)` rows, examples then
+/// tokens; a key block's draws are every example's, head's, query's and key's in turn (D12).
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, heads, *, causal = false, dropout = 0.0, training = false, rng = None, cos = None, sin = None, segments = None))]
+#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, heads, *, causal = false, dropout = 0.0, training = false, rng = None, cos = None, sin = None, segments = None, block = 16))]
 pub fn attention_forward_batch<'py>(
     x: &RustArray,
     wq: &RustArray,
@@ -109,6 +114,7 @@ pub fn attention_forward_batch<'py>(
     cos: Option<&RustArray>,
     sin: Option<&RustArray>,
     segments: Option<&RustArray>,
+    block: usize,
 ) -> PyResult<ForwardResult> {
     indrajala_math::attention::attention_forward_batch(
         x,
@@ -128,6 +134,7 @@ pub fn attention_forward_batch<'py>(
         cos.map(|a| &a.0),
         sin.map(|a| &a.0),
         segments.map(|a| &a.0),
+        block,
     )
     .map(forward_result)
     .map_err(py_err)
@@ -135,11 +142,12 @@ pub fn attention_forward_batch<'py>(
 
 /// `AttentionArrayLayer.step`: one token's decode on a causal layer's cache, `x` 1D, `k_cache` and
 /// `v_cache` `(c, h·d_k)` oldest first, `cos` and `sin` its position's `(1, d_k / 2)` row when
-/// rotary. Returns `(a, k_cache, v_cache)`, the caches with its key and value appended, the oldest
-/// dropped past `window`.
+/// rotary, `origin` the first cached key's column after the append (the key blocks cut at the
+/// columns that are multiples of `block`, as the full pass's). Returns `(a, k_cache, v_cache)`,
+/// the caches with its key and value appended, the oldest dropped past `window`.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, k_cache, v_cache, heads, *, window, cos = None, sin = None))]
+#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, k_cache, v_cache, heads, *, window, cos = None, sin = None, origin = 0, block = 16))]
 pub fn attention_step(
     x: &RustArray,
     wq: &RustArray,
@@ -156,6 +164,8 @@ pub fn attention_step(
     window: usize,
     cos: Option<&RustArray>,
     sin: Option<&RustArray>,
+    origin: usize,
+    block: usize,
 ) -> PyResult<(RustArray, RustArray, RustArray)> {
     indrajala_math::attention::attention_step(
         x,
@@ -173,20 +183,24 @@ pub fn attention_step(
         window,
         cos.map(|a| &a.0),
         sin.map(|a| &a.0),
+        origin,
+        block,
     )
     .map(|(a, k, v)| (a.into(), k.into(), v.into()))
     .map_err(py_err)
 }
 
 /// `AttentionArrayLayer._backward`: from `delta_batch` (`dl/dout`, 2D `batch, T * d`, or 1D for
-/// one example, whose caches are `attention_forward`'s) and the forward pass's `q`, `k`, `v` and
-/// `p`, in `heads` heads across `wq`'s rows, returns `(dx, dq, dk, dv)`: `dx`, the downstream, in
+/// one example, whose caches are `attention_forward`'s) and the forward pass's `q`, `k`, `v`, `h`,
+/// `m` and `l`, in `heads` heads across `wq`'s rows, masked as the forward was (`causal`,
+/// `segments`) in its key blocks of `block`, returns `(dx, dq, dk, dv)`: `dx`, the downstream, in
 /// `delta_batch`'s shape, and `dq`, `dk`, `dv` as `(N * T, h·d_k)` rows, which the gradients read.
-/// A pass that dropped takes its `mask` (the forward op's, shaped as `p`) and its `dropout`; one
-/// that rotated takes its `cos` and `sin`, and returns `dq` and `dk` rotated back.
+/// A pass that dropped takes its `dropout` and the forward op's `dropout_rng`, from a copy of which
+/// it draws the same masks again; one that rotated takes its `cos` and `sin`, and returns `dq` and
+/// `dk` rotated back.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (delta_batch, wq, wk, wv, wo, q, k, v, p, heads, *, mask = None, dropout = 0.0, cos = None, sin = None))]
+#[pyo3(signature = (delta_batch, wq, wk, wv, wo, q, k, v, h, m, l, heads, *, causal = false, segments = None, dropout = 0.0, dropout_rng = None, cos = None, sin = None, block = 16))]
 pub fn attention_downstream_batch(
     delta_batch: &RustArray,
     wq: &RustArray,
@@ -196,12 +210,17 @@ pub fn attention_downstream_batch(
     q: &RustArray,
     k: &RustArray,
     v: &RustArray,
-    p: &RustArray,
+    h: &RustArray,
+    m: &RustArray,
+    l: &RustArray,
     heads: usize,
-    mask: Option<&RustArray>,
+    causal: bool,
+    segments: Option<&RustArray>,
     dropout: f64,
+    dropout_rng: Option<PyRef<'_, Generator>>,
     cos: Option<&RustArray>,
     sin: Option<&RustArray>,
+    block: usize,
 ) -> PyResult<(RustArray, RustArray, RustArray, RustArray)> {
     indrajala_math::attention::attention_downstream_batch(
         delta_batch,
@@ -209,25 +228,17 @@ pub fn attention_downstream_batch(
         wk,
         wv,
         wo,
-        q,
-        k,
-        v,
-        p,
+        [q, k, v, h, m, l],
         heads,
-        mask.map(|a| &a.0),
+        causal,
+        segments.map(|a| &a.0),
         dropout,
+        dropout_rng.as_deref().map(|g| &g.0),
         cos.map(|a| &a.0),
         sin.map(|a| &a.0),
+        block,
     )
-    .map(|r| {
-        let (r0, r1, r2, r3) = r;
-        (
-            RustArray::from(r0),
-            RustArray::from(r1),
-            RustArray::from(r2),
-            RustArray::from(r3),
-        )
-    })
+    .map(|(dx, dq, dk, dv)| (dx.into(), dq.into(), dk.into(), dv.into()))
     .map_err(py_err)
 }
 
