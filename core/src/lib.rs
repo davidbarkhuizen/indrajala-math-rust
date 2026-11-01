@@ -25,6 +25,7 @@ pub mod attention;
 pub mod batch_norm;
 pub mod conv;
 pub mod cr_exp;
+pub mod erf;
 mod error;
 pub mod factored;
 pub mod fused;

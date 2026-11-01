@@ -30,7 +30,8 @@ assert_eq!(y.data(), &[-2.0, -2.0]);
   rotary positions), tokens (patches, embeddings, means, dropout), a GRU cell, attention pooling,
   and vector-quantized codes, plain and factored.
 - **Functions**: a correctly rounded `exp` (a port of
-  [CORE-MATH](https://core-math.gitlabpages.inria.fr/)'s `cr_exp`), softmax, ReLU and their masks.
+  [CORE-MATH](https://core-math.gitlabpages.inria.fr/)'s `cr_exp`), `erf` (fdlibm's, through that `exp`), softmax, ReLU and
+  their masks.
 - **Generators**: numpy's legacy `np.random` (MT19937) and `default_rng`
   (`Generator(PCG64(SeedSequence(seed)))`), bit for bit: after the same seed, the same draws as
   numpy.
@@ -51,4 +52,5 @@ the only panics are the ones documented (`Array::from_matrix` on a buffer of the
 ## License
 
 MIT. `src/cr_exp.rs` is a port of CORE-MATH's `cr_exp` (MIT, Alexei Sibidanov), its copyright and
-permission notice kept in the file.
+permission notice kept in the file. `src/erf.rs` is a port of fdlibm's `s_erf.c` (Sun Microsystems,
+1993, freely granted), its notice kept in the file.

@@ -73,7 +73,7 @@ Each `src/<module>.rs` binds `core/src/<module>.rs`, which holds the module's ar
 | `src/array.rs` | `RustArray`: construction, `zeros`, `shape`, `.T`, indexing and contiguous slicing, `reshape`, `copy`, `tolist` |
 | `src/ops.rs` | elementwise `+ - * /` and in-place `+= -=` |
 | `src/linalg.rs` | `@` (matmul), `outer`; `set_matmul_threading(max_threads, threshold_flops)`, a test/benchmark override of the matmul threading (0 = default); `matmul_threads_for(m, k, n)`, the thread count the policy picks for an `(m, k) @ (k, n)` product |
-| `src/ufuncs.rs` | `exp`, `sum_axis0`, `argmax`, `array_relu`, `array_relu_mask`, `array_sigmoid_mask`, `array_dropout_mask` (a hidden delta from a downstream the layer is handed, before a layer with no `W`), `array_softmax` |
+| `src/ufuncs.rs` | `exp`, `erf`, `sum_axis0`, `argmax`, `array_relu`, `array_relu_mask`, `array_sigmoid_mask`, `array_dropout_mask` (a hidden delta from a downstream the layer is handed, before a layer with no `W`), `array_softmax` |
 | `src/random.rs` | `seed`, `random`, `uniform`, `bernoulli_mask`: numpy's legacy `np.random` (MT19937) in a separate state; after `seed(s)`, bit-identical to numpy's draws after `np.random.seed(s)` |
 | `src/generator.rs` | `SeedSequence`, `Generator`, `default_rng`: numpy's `default_rng` (`Generator(PCG64(SeedSequence(seed)))`), each generator its own state; bit-identical to numpy's draws from the same seed, with numpy's `bit_generator.state` as its `state` |
 | `src/mnist.rs` | `decode_mnist_pixels`: raw MNIST records to normalised pixels |
@@ -84,7 +84,8 @@ Each `src/<module>.rs` binds `core/src/<module>.rs`, which holds the module's ar
 | `src/layer_norm.rs` | `layer_norm_*`: one call per `LayerNormArrayLayer` method (forward, single and batch; downstream, gradient accumulate) |
 | `src/attention.rs` | `attention_*`: one call per pass of `AttentionArrayLayer` (forward, single and batch; downstream, which also returns `dQ, dK, dV`; gradient accumulate), multi-head (`heads`), causal (`causal`), masked by segment (`segments`), tiled in key blocks (`block`, 16: an online softmax, keeping each query's max `m` and sum `l`, never the weights; the step cut at the cache's `origin`), dropping its weights in training (`dropout`, `training`, `rng`: drawn key block by key block; the forward ops return the generator's copy before the draws, which the downstream takes as `dropout_rng` and draws from again), rotary positions (`cos`, `sin`: the forward ops rotate `Q` and `K`, the downstream rotates `dQ` and `dK` back), each a thin wrapper over the crate-internal blocks project, attend and combine, composed of the crate's dense ops, `@` and `cr_exp` |
 | `src/recurrent.rs` | `state_input_*`, `attention_pooling_*`, `gru_*`, `codes_*`: one call per pass of a window-recurrent network's `StateInputArrayLayer`/`AttentionPoolingArrayLayer`/`GRUArrayLayer`/`CodesArrayLayer` (forward, backward), batch-only, composed of the crate's dense ops, `@` and `array_softmax`, with `tanh` through `exp`; `concatenate_columns`, which joins the windows' outputs |
-| `core/src/cr_exp.rs` | (core only) `exp`, correctly rounded: a port of CORE-MATH's `cr_exp`; every `exp` in the crate (the `exp` ufunc, sigmoid, `tanh`, softmax) goes through it |
+| `core/src/cr_exp.rs` | (core only) `exp`, correctly rounded: a port of CORE-MATH's `cr_exp`; every `exp` in the crate (the `exp` ufunc, sigmoid, `tanh`, softmax, `erf`) goes through it |
+| `core/src/erf.rs` | (core only) `erf`: a port of fdlibm's `s_erf.c` through `cr_exp`, within one ulp (not correctly rounded); the `erf` ufunc's |
 | `core/src/scalar.rs` | (core only) the scalar rules below: relu, the softmax row maximum, `powi` |
 
 Each `layer_*` function in `core/src/fused.rs` mirrors a method of indrajala-ml's
@@ -129,4 +130,5 @@ retagged: each publish skips a version its index already has.
 ## License
 
 MIT, see [LICENSE](LICENSE). `core/src/cr_exp.rs` is a port of CORE-MATH's `cr_exp` (MIT, Alexei
-Sibidanov), its copyright and permission notice kept in the file.
+Sibidanov), its copyright and permission notice kept in the file. `core/src/erf.rs` is a port of
+fdlibm's `s_erf.c` (Sun Microsystems, 1993, freely granted), its notice kept in the file.

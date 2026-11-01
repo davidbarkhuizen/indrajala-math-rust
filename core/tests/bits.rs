@@ -14,7 +14,7 @@ use indrajala_math::generator::{Generator, SeedSequence};
 use indrajala_math::layer_norm::layer_norm_forward_batch;
 use indrajala_math::linalg::{matmul, matmul_add, matmul_long_k, matmul_nt, outer};
 use indrajala_math::recurrent::gru_forward;
-use indrajala_math::ufuncs::{array_softmax, exp};
+use indrajala_math::ufuncs::{array_softmax, erf, exp};
 use indrajala_math::{Array, Shape};
 
 /// FNV-1a over the values' bits, and their count.
@@ -118,6 +118,23 @@ fn families() -> BTreeMap<&'static str, String> {
 
     // the generator itself
     out.insert("Generator uniform 1000", hash(&[&vector(&mut rng(7), 1000)]));
+
+    // erf's four ranges and their boundaries, both signs, and the special values
+    let mut values: Vec<f64> = g.uniform(-7.0, 7.0, Shape::Vector(1001)).unwrap().into_data();
+    values.extend([
+        0.0,
+        -0.0,
+        1e-310,
+        -1e-20,
+        0.84375,
+        -1.25,
+        1.0 / 0.35,
+        6.0,
+        -6.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ]);
+    out.insert("erf", hash(&[&erf(&Array::from_vector(values))]));
     out
 }
 

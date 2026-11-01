@@ -37,6 +37,15 @@ pub fn exp_lanes(arr: &Array) -> (Array, usize) {
     (Array { data, shape: arr.shape }, redone)
 }
 
+/// Elementwise `erf` ([`crate::erf::erf`], fdlibm's, through the correctly rounded `exp`): GELU's
+/// `erf(z / sqrt 2)`.
+pub fn erf(arr: &Array) -> Array {
+    Array {
+        data: arr.data.iter().map(|&v| crate::erf::erf(v)).collect(),
+        shape: arr.shape,
+    }
+}
+
 /// Sums a 2D array's rows into a 1D vector - the one fixed-axis (`axis=0`) reduction this core
 /// needs (`accumulate_gradient_batch`'s batched bias gradient,
 /// `self._grad_b += self.delta_batch.sum(axis=0)`), cross-checked directly against that real
