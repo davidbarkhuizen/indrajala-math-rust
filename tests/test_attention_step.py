@@ -1,10 +1,12 @@
 """
-The decode step (`attention_step`, indrajala-ml's generation workplan, D2, D3, D8): one token's
-causal attention on the cache of the tokens before it. Its blocks are the forward pass's, a score one
-chain over `d_k` and a weighted sum one chain over the keys in order, and a causal pass's masked
-keys add exact zeros, so a step at token `t` is the causal forward pass's row `t` by bits, its cache
-the pass's keys and values up to `t`, with the queries and keys rotated by the table's row `t`. Past
-the window the caches keep the last `window` tokens', oldest first.
+The decode step (`attention_step`, indrajala-ml's generation workplan, D2, D3, D8; its context-length
+workplan, D3): one token's causal attention on the cache of the tokens before it. Its blocks are the
+forward pass's tiles, the cache cut into key blocks at the columns that are multiples of the block
+(`origin` the first cached key's column), and a causal pass's masked keys and skipped blocks change
+nothing, so a step at token `t` is the causal forward pass's row `t` by bits, its cache the pass's
+keys and values up to `t`, with the queries and keys rotated by the table's row `t`; and a cache
+from a paragraph's first column is the segmented pass's row. Past the window the caches keep the
+last `window` tokens', oldest first.
 """
 
 import math
@@ -16,9 +18,21 @@ from array_helpers import bits, to_array, to_numpy
 import indrajala_math_rust as pa
 from indrajala_math_rust import Array, attention_forward, attention_step, set_matmul_threading
 
+BLOCK = 16
+
 # (tokens, features, heads, key_size)
-# the sequence study's 64 tokens of 64 in 4 heads among them, past the products' blocking
-SHAPES = [(1, 3, 1, 3), (5, 6, 1, 6), (7, 12, 4, 4), (16, 32, 4, 8), (9, 33, 3, 6), (6, 8, 2, 2), (64, 64, 4, 16)]
+# the sequence study's 64 tokens of 64 in 4 heads among them, past the products' blocking and
+# across several key blocks
+SHAPES = [
+    (1, 3, 1, 3),
+    (5, 6, 1, 6),
+    (7, 12, 4, 4),
+    (16, 32, 4, 8),
+    (9, 33, 3, 6),
+    (6, 8, 2, 2),
+    (64, 64, 4, 16),
+    (37, 8, 2, 4),
+]
 NAMES = ["wq", "bq", "wk", "bk", "wv", "bv", "wo", "bo"]
 
 
@@ -50,12 +64,16 @@ def _table(tokens: int, key_size: int, base: float = 100.0) -> tuple[np.ndarray,
     return cos, sin
 
 
-def _forward(c: dict[str, np.ndarray], heads: int, rotary: bool) -> dict[str, np.ndarray]:
+def _forward(
+    c: dict[str, np.ndarray], heads: int, rotary: bool, segments: np.ndarray | None = None
+) -> dict[str, np.ndarray]:
     tokens = c["x"].shape[0] // c["bo"].shape[0]
-    table = {}
+    table: dict[str, Array] = {}
     if rotary:
         cos, sin = _table(tokens, c["bq"].shape[0] // heads)
         table = {"cos": to_array(cos), "sin": to_array(sin)}
+    if segments is not None:
+        table["segments"] = to_array(segments)
     result = attention_forward(to_array(c["x"]), *_parameters(c), heads=heads, causal=True, **table)
     return {name: to_numpy(array) for name, array in zip(["a", "q", "k", "v"], result[:4])}
 
@@ -70,8 +88,10 @@ def _step(
         table = {"cos": to_array(cos[t : t + 1]), "sin": to_array(sin[t : t + 1])}
     x = to_array(c["x"][t * d : (t + 1) * d])
     caches = (Array.zeros((0, width)), Array.zeros((0, width))) if t == 0 else (to_array(k_cache), to_array(v_cache))
+    # the first cached key's column once this token's is appended
+    origin = t + 1 - min(window, (0 if t == 0 else len(k_cache)) + 1)
     a, k, v = attention_step(
-        x, *_parameters(c), k_cache=caches[0], v_cache=caches[1], heads=heads, window=window, **table
+        x, *_parameters(c), k_cache=caches[0], v_cache=caches[1], heads=heads, window=window, origin=origin, **table
     )
     return to_numpy(a), to_numpy(k).reshape(-1, width), to_numpy(v).reshape(-1, width)
 
@@ -122,6 +142,35 @@ def test_past_the_window_the_oldest_key_and_value_are_dropped(rotary: bool) -> N
     assert bits(a) != bits(f["a"][t * features : (t + 1) * features])
 
 
+@pytest.mark.parametrize("start", [5, 16, 17, 30])
+def test_a_cache_from_a_paragraphs_first_column_is_the_segmented_pass_by_bits(start: int) -> None:
+    # the paragraph from column start: its keys only, cut at the full pass's block bounds
+    tokens, features, heads, key_size = 37, 8, 2, 4
+    c = _case(tokens, features, heads, key_size)
+    segments = np.array([1.0] * start + [2.0] * (tokens - start))
+    f = _forward(c, heads, True, segments)
+    d = features
+    for t in range(start, tokens):
+        width = heads * key_size
+        k_cache, v_cache = f["k"][start:t], f["v"][start:t]
+        cos, sin = _table(t + 1, key_size)
+        caches = (
+            (Array.zeros((0, width)), Array.zeros((0, width))) if t == start else (to_array(k_cache), to_array(v_cache))
+        )
+        a, _k, _v = attention_step(
+            to_array(c["x"][t * d : (t + 1) * d]),
+            *_parameters(c),
+            k_cache=caches[0],
+            v_cache=caches[1],
+            heads=heads,
+            window=tokens,
+            cos=to_array(cos[t : t + 1]),
+            sin=to_array(sin[t : t + 1]),
+            origin=start,
+        )
+        assert bits(to_numpy(a)) == bits(f["a"][t * d : (t + 1) * d]), t
+
+
 def test_the_step_refuses_shapes_that_dont_fit() -> None:
     c = _case(3, 6, 2, 2)
     parameters = _parameters(c)
@@ -134,6 +183,8 @@ def test_the_step_refuses_shapes_that_dont_fit() -> None:
         attention_step(x, *parameters, k_cache=cache, v_cache=Array.zeros((1, 4)), heads=2, window=3)
     with pytest.raises(ValueError, match="attention_step requires a window of at least one token"):
         attention_step(x, *parameters, k_cache=cache, v_cache=cache, heads=2, window=0)
+    with pytest.raises(ValueError, match="attention_step requires key blocks of at least one key"):
+        attention_step(x, *parameters, k_cache=cache, v_cache=cache, heads=2, window=3, block=0)
     cos = to_array(_table(1, 2)[0][:1])
     with pytest.raises(ValueError, match="attention_step requires both cos and sin to rotate, or neither"):
         attention_step(x, *parameters, k_cache=cache, v_cache=cache, heads=2, window=3, cos=cos)

@@ -298,7 +298,8 @@ def attention_forward(
     cos: Array | None = None,
     sin: Array | None = None,
     segments: Array | None = None,
-) -> tuple[Array, Array, Array, Array, Array, Array, Array | None]: ...
+    block: int = 16,
+) -> tuple[Array, Array, Array, Array, Array, Array, Array, Generator | None]: ...
 def attention_forward_batch(
     x: Array,
     wq: Array,
@@ -318,7 +319,8 @@ def attention_forward_batch(
     cos: Array | None = None,
     sin: Array | None = None,
     segments: Array | None = None,
-) -> tuple[Array, Array, Array, Array, Array, Array, Array | None]: ...
+    block: int = 16,
+) -> tuple[Array, Array, Array, Array, Array, Array, Array, Generator | None]: ...
 def attention_step(
     x: Array,
     wq: Array,
@@ -336,6 +338,8 @@ def attention_step(
     window: int,
     cos: Array | None = None,
     sin: Array | None = None,
+    origin: int = 0,
+    block: int = 16,
 ) -> tuple[Array, Array, Array]: ...
 def attention_downstream_batch(
     delta_batch: Array,
@@ -346,13 +350,18 @@ def attention_downstream_batch(
     q: Array,
     k: Array,
     v: Array,
-    p: Array,
+    h: Array,
+    m: Array,
+    l: Array,
     heads: int,
     *,
-    mask: Array | None = None,
+    causal: bool = False,
+    segments: Array | None = None,
     dropout: float = 0.0,
+    dropout_rng: Generator | None = None,
     cos: Array | None = None,
     sin: Array | None = None,
+    block: int = 16,
 ) -> tuple[Array, Array, Array, Array]: ...
 def attention_accumulate_gradient_batch(
     delta_batch: Array,
