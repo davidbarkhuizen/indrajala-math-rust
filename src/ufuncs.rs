@@ -37,6 +37,13 @@ pub fn exp_lanes(arr: &RustArray) -> (RustArray, usize) {
     }
 }
 
+/// Elementwise `erf` (fdlibm's, through the correctly rounded `exp`; the core's `erf.rs`): GELU's
+/// `erf(z / sqrt 2)`.
+#[pyfunction]
+pub fn erf(arr: &RustArray) -> RustArray {
+    RustArray::from(indrajala_math::ufuncs::erf(arr))
+}
+
 /// Sums a 2D array's rows into a 1D vector - the one fixed-axis (`axis=0`) reduction this core
 /// needs (`accumulate_gradient_batch`'s batched bias gradient,
 /// `self._grad_b += self.delta_batch.sum(axis=0)`), cross-checked directly against that real

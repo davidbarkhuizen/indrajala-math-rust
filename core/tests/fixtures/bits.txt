@@ -1,5 +1,6 @@
 Generator uniform 1000	8f5080082b5036d0 1000
 conv_forward_batch 28 x 28, 8 ch	b4abbedea4f28a53 34476
+erf	d4109e9ea058f426 1012
 exp	1ccc2021d0ddd6e2 1009
 gru_forward 4 x 6, state 5	f66e364f4f624391 100
 layer_forward_batch 30 x 784, b5	41a0ffa16f7e9661 150
