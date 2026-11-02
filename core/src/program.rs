@@ -31,7 +31,10 @@ use crate::fused::{
 };
 use crate::generator::Generator;
 use crate::layer_norm::{layer_norm_accumulate_gradient_batch, layer_norm_downstream_batch, layer_norm_forward_batch};
-use crate::recurrent::{columns, join_columns, matrix_shape, state_input_backward, state_input_forward};
+use crate::recurrent::{
+    columns, join_columns, matrix_shape, state_input_backward, state_input_film_backward, state_input_film_forward,
+    state_input_forward,
+};
 use crate::tokens::{
     embedding_accumulate_gradient, embedding_forward, token_dropout_downstream, token_dropout_forward,
 };
@@ -45,10 +48,14 @@ pub enum Op {
     Embedding,
     /// the tokens plus `P` as one row; parameters `P` `(T, d)`
     Position,
-    /// `state_input_forward` with the window's state; parameters `P`
+    /// `state_input_forward` with the window's state; parameters `P`. With `scale`, the FiLM
+    /// state input, `state_input_film_forward` (indrajala-ml's audit-remedies workplan, D9);
+    /// parameters `P`, then `G`
     StateInput {
         /// the window's tokens
         tokens: usize,
+        /// FiLM's scale term, `x_t * (1 + G c)`
+        scale: bool,
     },
     /// a residual block opens: its input kept for its add
     Fork,
@@ -104,6 +111,7 @@ impl Op {
     /// How many parameters the op takes.
     pub fn parameter_count(&self) -> usize {
         match self {
+            Op::StateInput { scale: true, .. } => 2,
             Op::Embedding | Op::Position | Op::StateInput { .. } => 1,
             Op::Fork | Op::Add | Op::Split | Op::Branch | Op::Merge | Op::Dropout { .. } => 0,
             Op::LayerNorm { .. } | Op::TokenDense { .. } | Op::TokenOutput { .. } => 2,
@@ -303,6 +311,10 @@ enum Cache {
     Dropout {
         mask: Array,
     },
+    /// a FiLM state input's `1 + G c`, `(N, d)`
+    Film {
+        gamma: Array,
+    },
 }
 
 /// One window's forward pass, what its backward pass reads: each op's result (as the per-layer
@@ -330,6 +342,7 @@ impl WindowTape {
                     q.data.len() + k.data.len() + v.data.len() + h.data.len() + m.data.len() + l.data.len()
                 }
                 Cache::Dropout { mask } => mask.data.len(),
+                Cache::Film { gamma } => gamma.data.len(),
             })
             .sum();
         self.activations.iter().map(|a| a.data.len()).sum::<usize>() + caches + self.step.floats()
@@ -444,7 +457,12 @@ impl WindowProgram {
                 Op::Position => {
                     Some(a.combine_with_array(&Array::from_vector(p[0].data.clone()), |x, y| x + y, "add")?)
                 }
-                Op::StateInput { tokens } => Some(state_input_forward(a, c, p[0], *tokens)?),
+                Op::StateInput { tokens, scale: false } => Some(state_input_forward(a, c, p[0], *tokens)?),
+                Op::StateInput { tokens, scale: true } => {
+                    let (out, gamma) = state_input_film_forward(a, c, p[0], p[1], *tokens)?;
+                    cache = Cache::Film { gamma };
+                    Some(out)
+                }
                 Op::Fork => {
                     forks.push(current);
                     None
@@ -762,6 +780,10 @@ pub fn window_program_forward(
 }
 
 /// One window's backward pass's gradients: each op's delta and what the ops before read of it.
+/// A StateInput's backward pass: `(state delta, P's gradient)`, then a FiLM one's `(G's gradient,
+/// its input's delta)`.
+type StateInputBackward = (Array, Array, Option<(Array, Array)>);
+
 struct Backward<'t> {
     program: &'t WindowProgram,
     tape: &'t WindowTape,
@@ -770,8 +792,9 @@ struct Backward<'t> {
     deltas: Vec<Option<Array>>,
     /// an attention's `(dx, dq, dk, dv)`, from its backward pass when its delta is set
     attention: Vec<Option<(Array, Array, Array, Array)>>,
-    /// a StateInput's `(state delta, P's gradient)`
-    state_inputs: Vec<Option<(Array, Array)>>,
+    /// a StateInput's `(state delta, P's gradient)`, then a FiLM one's `(G's gradient, its input's
+    /// delta)`
+    state_inputs: Vec<Option<StateInputBackward>>,
 }
 
 impl Backward<'_> {
@@ -795,6 +818,12 @@ impl Backward<'_> {
                     "window program: an embedding is the first op, nothing reads its downstream",
                 ))
             }
+            Op::StateInput { scale: true, .. } => self.state_inputs[j]
+                .as_ref()
+                .and_then(|s| s.2.as_ref())
+                .expect("a FiLM StateInput's backward pass, before its downstream is read")
+                .1
+                .clone(),
             Op::Position | Op::Add | Op::Merge | Op::StateInput { .. } => delta(),
             Op::Fork => {
                 let add = self.program.adds[j];
@@ -1000,9 +1029,28 @@ impl WindowProgram {
                         BLOCK,
                     )?);
                 }
-                Op::StateInput { tokens } => {
+                Op::StateInput { tokens, scale: false } => {
                     let grad_p = &gradients[offsets[i]];
-                    back.state_inputs[i] = Some(state_input_backward(&d, c, p[0], grad_p, *tokens)?);
+                    let (dc, gp) = state_input_backward(&d, c, p[0], grad_p, *tokens)?;
+                    back.state_inputs[i] = Some((dc, gp, None));
+                }
+                Op::StateInput { tokens, scale: true } => {
+                    let Cache::Film { gamma } = &tape.caches[i] else {
+                        unreachable!("a FiLM state input's cache")
+                    };
+                    let x = &tape.activations[tape.inputs[i]];
+                    let (dx, dc, gp, gg) = state_input_film_backward(
+                        &d,
+                        x,
+                        c,
+                        p[0],
+                        p[1],
+                        gamma,
+                        &gradients[offsets[i]],
+                        &gradients[offsets[i] + 1],
+                        *tokens,
+                    )?;
+                    back.state_inputs[i] = Some((dc, gp, Some((gg, dx))));
                 }
                 _ => {}
             }
@@ -1024,12 +1072,12 @@ impl WindowProgram {
                     };
                     gradients[at] = gradients[at].combine_with_array(&shaped, |x, y| x + y, "add")?;
                 }
-                Op::StateInput { .. } => {
-                    gradients[at] = back.state_inputs[i]
-                        .as_ref()
-                        .expect("a StateInput's backward pass")
-                        .1
-                        .clone();
+                Op::StateInput { scale, .. } => {
+                    let (_, grad_p, film) = back.state_inputs[i].as_ref().expect("a StateInput's backward pass");
+                    gradients[at] = grad_p.clone();
+                    if *scale {
+                        gradients[at + 1] = film.as_ref().expect("a FiLM StateInput's G gradient").0.clone();
+                    }
                 }
                 Op::LayerNorm { .. } => {
                     let Cache::LayerNorm { xhat, .. } = &tape.caches[i] else {

@@ -57,7 +57,8 @@ use program::{argmax_token_rows, window_program_forward, window_program_learn, W
 use random::{bernoulli_mask, seed, seed_at_import, uniform};
 use recurrent::{
     attention_pooling_backward, attention_pooling_forward, codes_backward, codes_forward, concatenate_columns,
-    gru_backward, gru_forward, soft_codes_backward, soft_codes_forward, state_input_backward, state_input_forward,
+    gru_backward, gru_forward, soft_codes_backward, soft_codes_forward, state_input_backward,
+    state_input_film_backward, state_input_film_forward, state_input_forward,
 };
 use tokens::{
     embedding_accumulate_gradient, embedding_forward, patches_downstream, patches_forward, token_dropout_downstream,
@@ -170,6 +171,8 @@ fn indrajala_math_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(attention_accumulate_gradient_batch, m)?)?;
     m.add_function(wrap_pyfunction!(state_input_forward, m)?)?;
     m.add_function(wrap_pyfunction!(state_input_backward, m)?)?;
+    m.add_function(wrap_pyfunction!(state_input_film_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(state_input_film_backward, m)?)?;
     m.add_function(wrap_pyfunction!(attention_pooling_forward, m)?)?;
     m.add_function(wrap_pyfunction!(attention_pooling_backward, m)?)?;
     m.add_function(wrap_pyfunction!(gru_forward, m)?)?;

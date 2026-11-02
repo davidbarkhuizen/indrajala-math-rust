@@ -164,6 +164,92 @@ pub fn state_input_backward(
     Ok((matmul(&sums, p)?, matmul_add(grad_p, &sums.transpose(), state)?))
 }
 
+/// The FiLM state input's forward pass (indrajala-ml's audit-remedies workplan, D9; Perez et al.
+/// 2018): `out_t = x_t * (1 + G c) + P c` for each of the `tokens` tokens of each example, `g`
+/// `(d, s)` as `p`; `1 + G c` is `1.0 +` each value of `matmul_nt(state, g)`, and each value
+/// `v * gamma + a` in that order, numpy's. Returns `(out, gamma)`, gamma `(N, d)` what the
+/// backward pass reads.
+pub fn state_input_film_forward(
+    x: &Array,
+    state: &Array,
+    p: &Array,
+    g: &Array,
+    tokens: usize,
+) -> Result<(Array, Array), Error> {
+    let context = "state_input_film_forward";
+    let (rows, width) = matrix_shape(x, "x", context)?;
+    let features = features_per_token(tokens, width, context)?;
+    let (_, state_size) = matrix_shape(p, "p", context)?;
+    require_shape(p, Shape::Matrix(features, state_size), "p", context)?;
+    require_shape(g, p.shape, "g", context)?;
+    require_shape(state, Shape::Matrix(rows, state_size), "state", context)?;
+    let projected = matmul_nt(state, p)?;
+    let scaled = matmul_nt(state, g)?;
+    let gamma = Array::from_matrix(scaled.data.iter().map(|&v| 1.0 + v).collect(), rows, features);
+    let mut data = Vec::with_capacity(x.data.len());
+    for ((example, added), scale) in x
+        .data
+        .chunks_exact(width.max(1))
+        .zip(projected.data.chunks_exact(features.max(1)))
+        .zip(gamma.data.chunks_exact(features.max(1)))
+    {
+        for token in example.chunks_exact(features.max(1)) {
+            data.extend(token.iter().zip(added).zip(scale).map(|((&v, &a), &s)| v * s + a));
+        }
+    }
+    Ok((Array::from_matrix(data, rows, width), gamma))
+}
+
+/// The FiLM state input's backward pass, after `state_input_film_forward` gave `gamma`: with `S`
+/// each example's delta summed over its tokens and `M` its `delta * x` summed likewise (left
+/// folds), the input's delta `delta_t * gamma`, the state's gradient `S @ p + M @ g`, `p`'s
+/// gradient `grad_p + S^T @ state` and `g`'s `grad_g + M^T @ state`. Returns `(dx, state_delta,
+/// grad_p, grad_g)`.
+#[allow(clippy::too_many_arguments)]
+pub fn state_input_film_backward(
+    delta: &Array,
+    x: &Array,
+    state: &Array,
+    p: &Array,
+    g: &Array,
+    gamma: &Array,
+    grad_p: &Array,
+    grad_g: &Array,
+    tokens: usize,
+) -> Result<(Array, Array, Array, Array), Error> {
+    let context = "state_input_film_backward";
+    let (rows, width) = matrix_shape(delta, "delta", context)?;
+    let features = features_per_token(tokens, width, context)?;
+    let (_, state_size) = matrix_shape(p, "p", context)?;
+    require_shape(p, Shape::Matrix(features, state_size), "p", context)?;
+    require_shape(g, p.shape, "g", context)?;
+    require_shape(grad_p, p.shape, "grad_p", context)?;
+    require_shape(grad_g, p.shape, "grad_g", context)?;
+    require_shape(x, delta.shape, "x", context)?;
+    require_shape(gamma, Shape::Matrix(rows, features), "gamma", context)?;
+    require_shape(state, Shape::Matrix(rows, state_size), "state", context)?;
+    let sums = token_sums(delta, tokens, features);
+    let products = delta.combine_with_array(x, |d, v| d * v, "multiply")?;
+    let product_sums = token_sums(&products, tokens, features);
+    let mut dx = Vec::with_capacity(delta.data.len());
+    for (example, scale) in delta
+        .data
+        .chunks_exact(width.max(1))
+        .zip(gamma.data.chunks_exact(features.max(1)))
+    {
+        for token in example.chunks_exact(features.max(1)) {
+            dx.extend(token.iter().zip(scale).map(|(&d, &s)| d * s));
+        }
+    }
+    let state_delta = matmul(&sums, p)?.combine_with_array(&matmul(&product_sums, g)?, |a, b| a + b, "add")?;
+    Ok((
+        Array::from_matrix(dx, rows, width),
+        state_delta,
+        matmul_add(grad_p, &sums.transpose(), state)?,
+        matmul_add(grad_g, &product_sums.transpose(), state)?,
+    ))
+}
+
 /// `(rows, features)` of a pooling's tokens `x`, `(N, T * d)`, and `q` checked to be `(d,)`.
 fn pooling_shape(x: &Array, q: &Array, tokens: usize, context: &str) -> Result<(usize, usize), Error> {
     let (rows, width) = matrix_shape(x, "x", context)?;
