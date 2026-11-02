@@ -37,6 +37,49 @@ pub fn state_input_backward(
         .map_err(py_err)
 }
 
+/// The FiLM state input's forward pass (indrajala-ml's audit-remedies workplan, D9): `out_t = x_t *
+/// (1 + G c) + P c`. Returns `(out, gamma)`, `gamma = 1 + G c` `(N, d)`, what the backward pass reads.
+#[pyfunction]
+pub fn state_input_film_forward(
+    x: &RustArray,
+    state: &RustArray,
+    p: &RustArray,
+    g: &RustArray,
+    tokens: usize,
+) -> PyResult<(RustArray, RustArray)> {
+    indrajala_math::recurrent::state_input_film_forward(x, state, p, g, tokens)
+        .map(|(out, gamma)| (RustArray::from(out), RustArray::from(gamma)))
+        .map_err(py_err)
+}
+
+/// The FiLM state input's backward pass: `(dx, state_delta, grad_p, grad_g)`, `dx_t = delta_t *
+/// gamma`, the state's gradient `S @ p + M @ g` (`S` the delta summed over the tokens, `M` the
+/// delta times x so summed), `grad_p + S^T @ state` and `grad_g + M^T @ state`.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn state_input_film_backward(
+    delta: &RustArray,
+    x: &RustArray,
+    state: &RustArray,
+    p: &RustArray,
+    g: &RustArray,
+    gamma: &RustArray,
+    grad_p: &RustArray,
+    grad_g: &RustArray,
+    tokens: usize,
+) -> PyResult<(RustArray, RustArray, RustArray, RustArray)> {
+    indrajala_math::recurrent::state_input_film_backward(delta, x, state, p, g, gamma, grad_p, grad_g, tokens)
+        .map(|(a, b, c, d)| {
+            (
+                RustArray::from(a),
+                RustArray::from(b),
+                RustArray::from(c),
+                RustArray::from(d),
+            )
+        })
+        .map_err(py_err)
+}
+
 /// `AttentionPoolingArrayLayer.forward_batch`: the scores `s_t = q . x_t` (`x`'s `(N * T, d)` rows
 /// `@ q`), `p` their `array_softmax` per example, and `u = p @ x` per example, `(1, T) @ (T, d)`.
 /// Returns `(u, p)`, `(N, d)` and `(N, T)`.

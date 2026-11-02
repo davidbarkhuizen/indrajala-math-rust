@@ -36,9 +36,14 @@ fn parse_op(descriptor: &Bound<'_, PyTuple>) -> PyResult<Op> {
             Op::Position
         }
         "state_input" => {
-            expect(1)?;
+            // ("state_input", tokens), or with FiLM's scale term ("state_input", tokens, True)
+            // (indrajala-ml's audit-remedies workplan, D9)
+            if settings != 1 && settings != 2 {
+                expect(1)?;
+            }
             Op::StateInput {
                 tokens: item(1)?.extract()?,
+                scale: settings == 2 && item(2)?.extract::<bool>()?,
             }
         }
         "fork" => {
@@ -127,7 +132,7 @@ fn parse_op(descriptor: &Bound<'_, PyTuple>) -> PyResult<Op> {
 /// `window_program_forward` runs.
 ///
 /// `ops` are tuples, a kind then its settings: `("embedding",)`, `("position",)`,
-/// `("state_input", tokens)`, `("fork",)`, `("add",)`, `("layer_norm", epsilon)`,
+/// `("state_input", tokens)` or `("state_input", tokens, scale)` (FiLM's when true), `("fork",)`, `("add",)`, `("layer_norm", epsilon)`,
 /// `("token_dense", tokens, "relu" | "linear")`, `("token_output", tokens)`,
 /// `("attention", heads, causal, dropout, cos, sin)` (`cos`, `sin` the rotary table's arrays, or
 /// None for both), `("dropout", p)`, `("split",)`, `("branch",)`, `("merge",)`. `columns` is a window's width `k`

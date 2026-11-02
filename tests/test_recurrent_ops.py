@@ -34,6 +34,8 @@ from indrajala_math_rust import (
     soft_codes_backward,
     soft_codes_forward,
     state_input_backward,
+    state_input_film_backward,
+    state_input_film_forward,
     state_input_forward,
 )
 
@@ -83,6 +85,53 @@ def test_state_input_backward_is_the_token_sum_through_p(n: int, tokens: int, d:
     assert bits(to_numpy(state_delta)) == bits(to_numpy(layer_downstream_batch(to_array(P), sums)))
     expected = linear_accumulate_gradient_batch(sums, to_array(C), to_array(grad_P))
     assert bits(to_numpy(new_grad_P)) == bits(to_numpy(expected))
+
+
+@pytest.mark.parametrize("n,tokens,d,s", STATE_INPUTS)
+def test_the_film_state_input_scales_each_token_by_1_plus_g_c_and_adds_p_c(n: int, tokens: int, d: int, s: int):
+    # indrajala-ml's audit-remedies workplan, D9
+    rng = np.random.default_rng(n + tokens + d + s + 1)
+    X, C = rng.uniform(-1, 1, (n, tokens * d)), rng.uniform(-1, 1, (n, s))
+    P, G = rng.uniform(-1, 1, (d, s)), rng.uniform(-1, 1, (d, s))
+    out, gamma = state_input_film_forward(to_array(X), to_array(C), to_array(P), to_array(G), tokens)
+    projected = to_numpy(linear_forward_batch(to_array(P), to_array(C)))
+    expected_gamma = 1.0 + to_numpy(linear_forward_batch(to_array(G), to_array(C)))
+    expected = (X.reshape(n, tokens, d) * expected_gamma[:, np.newaxis, :] + projected[:, np.newaxis, :]).reshape(n, -1)
+    assert bits(to_numpy(gamma).reshape(n, d)) == bits(expected_gamma)
+    assert bits(to_numpy(out)) == bits(expected)
+
+
+@pytest.mark.parametrize("n,tokens,d,s", STATE_INPUTS)
+def test_the_film_state_input_backward_is_its_token_sums_through_p_and_g(n: int, tokens: int, d: int, s: int):
+    rng = np.random.default_rng(n * tokens + d + s + 1)
+    X, delta, C = rng.uniform(-1, 1, (n, tokens * d)), rng.uniform(-1, 1, (n, tokens * d)), rng.uniform(-1, 1, (n, s))
+    P, G, grad_P, grad_G = (rng.uniform(-1, 1, (d, s)) for _ in range(4))
+    _, gamma = state_input_film_forward(to_array(X), to_array(C), to_array(P), to_array(G), tokens)
+    dx, state_delta, new_grad_P, new_grad_G = state_input_film_backward(
+        to_array(delta),
+        to_array(X),
+        to_array(C),
+        to_array(P),
+        to_array(G),
+        gamma,
+        to_array(grad_P),
+        to_array(grad_G),
+        tokens,
+    )
+    g = to_numpy(gamma).reshape(n, d)
+    assert bits(to_numpy(dx)) == bits((delta.reshape(n, tokens, d) * g[:, np.newaxis, :]).reshape(n, -1))
+    sums = to_array(_fold(delta.reshape(n, tokens, d), axis=1))
+    products = to_array(_fold((delta * X).reshape(n, tokens, d), axis=1))
+    expected = to_numpy(layer_downstream_batch(to_array(P), sums)) + to_numpy(
+        layer_downstream_batch(to_array(G), products)
+    )
+    assert bits(to_numpy(state_delta)) == bits(expected)
+    assert bits(to_numpy(new_grad_P)) == bits(
+        to_numpy(linear_accumulate_gradient_batch(sums, to_array(C), to_array(grad_P)))
+    )
+    assert bits(to_numpy(new_grad_G)) == bits(
+        to_numpy(linear_accumulate_gradient_batch(products, to_array(C), to_array(grad_G)))
+    )
 
 
 def test_the_large_state_input_and_gru_cases_are_threaded():

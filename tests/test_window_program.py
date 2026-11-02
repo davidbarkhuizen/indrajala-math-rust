@@ -44,6 +44,8 @@ from indrajala_math_rust import (
     recurrence_step_backward,
     recurrence_step_forward,
     state_input_backward,
+    state_input_film_backward,
+    state_input_film_forward,
     state_input_forward,
     sum_axis0,
     token_dropout_downstream,
@@ -66,6 +68,11 @@ type Factors = list[tuple[int, int | None]]
 type Op = tuple[Any, ...]
 # the op whose input the poolings read: one for every factor, or each factor's
 type Reads = int | list[int]
+
+
+def _film(op: Op) -> bool:
+    # a FiLM state input's descriptor, ("state_input", tokens, True)
+    return op[0] == "state_input" and len(op) == 3 and bool(op[2])
 
 
 def _each(reads: Reads, factors: int) -> list[int]:
@@ -118,6 +125,11 @@ class Window:
 
     def state_input(self, state_size: int) -> Window:
         return self.add(("state_input", self.tokens), _random(self.rng, self.features, state_size))
+
+    def film_state_input(self, state_size: int) -> Window:
+        # FiLM's (indrajala-ml's audit-remedies workplan, D9): P, then G
+        P, G = _random(self.rng, self.features, state_size), _random(self.rng, self.features, state_size)
+        return self.add(("state_input", self.tokens, True), P, G)
 
     def layer_norm(self) -> Window:
         d = self.features
@@ -215,7 +227,10 @@ def _per_layer(window: Window, recurrence: Recurrence, reads: Reads, X: Array, C
                 (P,) = parameters
                 a = a + P.reshape(P.shape[0] * P.shape[1])
             elif kind == "state_input":
-                a = state_input_forward(a, C, parameters[0], op[1])
+                if _film(op):
+                    a = state_input_film_forward(a, C, parameters[0], parameters[1], op[1])[0]
+                else:
+                    a = state_input_forward(a, C, parameters[0], op[1])
             elif kind == "fork":
                 forks.append(a)
             elif kind == "add":
@@ -367,6 +382,21 @@ def test_factors_continuous_and_crossed_are_the_per_layer_path(factors: Factors,
     _check(window, Recurrence(16, factors, cross, seed=8), len(window.ops) - 1, 4, 5)
 
 
+def _film_family(tokens: int, state_size: int, seed: int) -> Window:
+    # the family window with FiLM state inputs (indrajala-ml's audit-remedies workplan, D9)
+    w = Window(tokens, 27, 16, seed).position().film_state_input(state_size)
+    w.fork().layer_norm().attention(2, True).join().film_state_input(state_size)
+    return w.fork().layer_norm().dense(32, "relu").dense(16, "linear").join().layer_norm().output(3)
+
+
+@pytest.mark.parametrize("windows", [1, 3])
+def test_a_film_window_is_the_per_layer_path_in_inference_and_training(windows: int):
+    window = _film_family(3, 4, seed=21)
+    recurrence = Recurrence(16, [(4, 6)], False, seed=22)
+    _check(window, recurrence, len(window.ops) - 1, 5, windows)
+    _check_learn(window, recurrence, 5, windows)
+
+
 @pytest.mark.parametrize(
     "build",
     [
@@ -478,7 +508,10 @@ def _forward_training(window: Window, read_at: list[int], a: Array, C: Array, rn
             (P,) = parameters
             a = a + P.reshape(P.shape[0] * P.shape[1])
         elif kind == "state_input":
-            a = state_input_forward(a, C, parameters[0], op[1])
+            if _film(op):
+                a, cache = state_input_film_forward(a, C, parameters[0], parameters[1], op[1])
+            else:
+                a = state_input_forward(a, C, parameters[0], op[1])
         elif kind == "fork":
             forks.append(a)
         elif kind == "add":
@@ -625,10 +658,13 @@ def _learn_per_layer(
         g_codes = gE
         deltas: list[Array | None] = [None] * L
         attention_back: dict[int, tuple[Array, Array, Array, Array]] = {}
-        state_back: dict[int, tuple[Array, Array]] = {}
+        # a StateInput's (state delta, P's gradient), then a FiLM one's G's gradient and input delta
+        state_back: dict[int, tuple[Array, ...]] = {}
         deltas[-1] = ((results[-1] - Y[:, w * width : (w + 1) * width]) / ops[-1][1]) * weight
 
-        def downstream(j: int, deltas=deltas, caches=caches, attention_back=attention_back) -> Array:
+        def downstream(
+            j: int, deltas=deltas, caches=caches, attention_back=attention_back, state_back=state_back
+        ) -> Array:
             kind, ps, delta = ops[j][0], window.parameters[j], deltas[j]
             if kind == "fork":
                 return downstream(j + 1, deltas, caches, attention_back) + deltas[adds[j]]
@@ -639,6 +675,8 @@ def _learn_per_layer(
                 return total
             assert kind != "branch", "a branch's result is read by its poolings and its merge"
             assert delta is not None
+            if kind == "state_input" and _film(ops[j]):
+                return state_back[j][3]
             if kind in ("position", "add", "merge", "state_input"):
                 return delta
             if kind == "layer_norm":
@@ -702,6 +740,11 @@ def _learn_per_layer(
                     dropout_rng=dropout_rng,
                     **table,
                 )
+            elif kind == "state_input" and _film(ops[i]):
+                dx, dc, gp, gg = state_input_film_backward(
+                    d, inputs[i], states[w], ps[0], ps[1], caches[i], grads[i][0], grads[i][1], ops[i][1]
+                )
+                state_back[i] = (dc, gp, gg, dx)
             elif kind == "state_input":
                 state_back[i] = state_input_backward(d, states[w], ps[0], grads[i][0], ops[i][1])
             deltas[i] = d
@@ -716,6 +759,8 @@ def _learn_per_layer(
                 grads[i][0] = grads[i][0] + sum_axis0(delta).reshape((rows, cols))
             elif kind == "state_input":
                 grads[i][0] = state_back[i][1]
+                if _film(op):
+                    grads[i][1] = state_back[i][2]
             elif kind == "layer_norm":
                 grads[i] = list(layer_norm_accumulate_gradient_batch(delta, caches[i][0], *grads[i]))
             elif kind in ("token_dense", "token_output"):
