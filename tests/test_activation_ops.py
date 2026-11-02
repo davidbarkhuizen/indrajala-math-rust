@@ -31,6 +31,8 @@ from indrajala_math_rust import (
     array_activation_mask,
     erf,
     exp,
+    gated_delta_batch,
+    gated_forward_batch,
     layer_activation_forward,
     layer_activation_forward_batch,
     layer_activation_hidden_delta,
@@ -45,10 +47,12 @@ SQRT1_2 = 0.7071067811865476
 INV_SQRT_2PI = 0.3989422804014327
 C = 0.7978845608028654
 K = 0.044715
-type Name = Literal["relu", "gelu", "gelu_tanh"]
+type Name = Literal["relu", "gelu", "gelu_tanh", "silu"]
 
 GELUS: list[Name] = ["gelu", "gelu_tanh"]
-ACTIVATIONS: list[Name] = ["relu", *GELUS]
+# the activations whose derivative reads z
+SMOOTH: list[Name] = [*GELUS, "silu"]
+ACTIVATIONS: list[Name] = ["relu", *SMOOTH]
 PI = Decimal("3.14159265358979323846264338327950288419716939937510582097494459230781640628620899862803")
 
 # (batch, input_size, size): one example up to the threading threshold's (8M flops)
@@ -70,17 +74,28 @@ def _th(z: np.ndarray) -> np.ndarray:
         return 1.0 - 2.0 / (_exp(2.0 * u) + 1.0)
 
 
+def _sigmoid(z: np.ndarray) -> np.ndarray:
+    # the dense layers' sigmoid, 1 / (1 + exp(-z)), through the crate's exp
+    with np.errstate(over="ignore"):
+        return 1.0 / (1.0 + _exp(-z))
+
+
 def _value(activation: Name, z: np.ndarray) -> np.ndarray:
     if activation == "relu":
         return np.where(z > 0.0, z, 0.0)
     if activation == "gelu":
         return (0.5 * z) * (1.0 + _erf(z * SQRT1_2))
+    if activation == "silu":
+        return z * _sigmoid(z)
     return (0.5 * z) * (1.0 + _th(z))
 
 
 def _derivative(activation: Name, z: np.ndarray) -> np.ndarray:
     if activation == "gelu":
         return 0.5 * (1.0 + _erf(z * SQRT1_2)) + z * (_exp(-0.5 * (z * z)) * INV_SQRT_2PI)
+    if activation == "silu":
+        s = _sigmoid(z)
+        return s * (1.0 + z * (1.0 - s))
     th = _th(z)
     return 0.5 * (1.0 + th) + (0.5 * z) * ((1.0 - th * th) * (C * (1.0 + (3.0 * K) * (z * z))))
 
@@ -173,6 +188,9 @@ def _exact(activation: Name, z: float) -> tuple[float, float]:
     with localcontext() as context:
         context.prec = 60
         d = Decimal(z)
+        if activation == "silu":
+            s = 1 / (1 + (-d).exp())
+            return float(d * s), float(s * (1 + d * (1 - s)))
         if activation == "gelu":
             phi = (1 + _decimal_erf(d / Decimal(2).sqrt())) / 2
             density = (-(d * d) / 2).exp() / (2 * PI).sqrt()
@@ -194,14 +212,14 @@ def _inputs() -> list[float]:
     return values
 
 
-@pytest.mark.parametrize("activation", GELUS)
-def test_the_gelus_are_within_a_few_ulps_of_the_exact_functions(activation: Name):
+@pytest.mark.parametrize("activation", SMOOTH)
+def test_the_smooth_activations_are_within_a_few_ulps_of_the_exact_functions(activation: Name):
     values = _inputs()
     got_values = _scalar(activation, values)
     got_derivatives = _scalar_derivative(activation, values)
     for z, value, derivative in zip(values, got_values, got_derivatives, strict=True):
         exact_value, exact_derivative = _exact(activation, z)
-        # a few ulps, plus 1 + erf's (1 + tanh's) cancellation for negative z: an ulp of 1, scaled
+        # a few ulps, plus 1 + erf's (1 + tanh's, 1 + z(1 - s)'s) cancellation for negative z: an ulp of 1, scaled
         assert abs(value - exact_value) <= 4 * math.ulp(exact_value) + abs(z) * 2.0**-52, (z, value, exact_value)
         tolerance = 4 * math.ulp(exact_derivative) + (1.0 + z * z) * 2.0**-52
         assert abs(derivative - exact_derivative) <= tolerance, (z, derivative, exact_derivative)
@@ -213,6 +231,56 @@ def test_the_gelus_at_their_limits(activation: Name):
     values = [0.0, 40.0, -40.0, 1e6, -1e6]
     assert _scalar(activation, values) == [0.0, 40.0, -0.0, 1e6, -0.0]
     assert _scalar_derivative(activation, values) == [0.5, 1.0, 0.0, 1.0, 0.0]
+
+
+def test_silu_at_its_limits():
+    # large z: the identity and derivative 1; past exp's overflow, 0 and derivative 0; z = 0: 0, 1/2
+    values = [0.0, 40.0, 1e6, -1e6]
+    assert _scalar("silu", values) == [0.0, 40.0, 1e6, 0.0]
+    assert _scalar_derivative("silu", values) == [0.5, 1.0, 1.0, 0.0]
+
+
+GLUS: list[Name] = ["silu", "gelu", "gelu_tanh"]
+
+
+@pytest.mark.parametrize("activation", GLUS)
+@pytest.mark.parametrize("rows, input_size, size", [(1, 1, 1), (4, 7, 3), (13, 29, 17), (64, 64, 170)])
+def test_the_gated_forward_is_act_of_the_gate_times_the_value(activation: Name, rows: int, input_size: int, size: int):
+    # z = X @ W.T + b by the crate's own affine product, then act(a) * v in numpy, correctly rounded
+    rng = np.random.default_rng(rows * 1000 + size)
+    w = to_array(rng.uniform(-1.0, 1.0, (2 * size, input_size)))
+    x = to_array(rng.uniform(-1.0, 1.0, (rows, input_size)) * 4.0 / math.sqrt(input_size))
+    b = to_array(rng.uniform(-1.0, 1.0, 2 * size))
+    z = to_numpy(affine_forward_batch(w, x, b)).reshape(rows, 2 * size)
+
+    out, kept = gated_forward_batch(w, x, b, activation)
+
+    assert bits(kept) == bits(z)
+    a, v = z[:, :size], z[:, size:]
+    assert bits(out) == bits(_value(activation, a) * v)
+
+
+@pytest.mark.parametrize("activation", GLUS)
+@pytest.mark.parametrize("rows, size", [(1, 1), (4, 3), (13, 17), (64, 170)])
+def test_the_gated_delta_is_the_gates_then_the_values(activation: Name, rows: int, size: int):
+    rng = np.random.default_rng(rows * 100 + size)
+    z = rng.uniform(-4.0, 4.0, (rows, 2 * size))
+    delta = rng.uniform(-1.0, 1.0, (rows, size))
+    a, v = z[:, :size], z[:, size:]
+
+    got = to_numpy(gated_delta_batch(to_array(delta), to_array(z), activation)).reshape(rows, 2 * size)
+
+    assert bits(got[:, :size]) == bits((delta * v) * _derivative(activation, a))
+    assert bits(got[:, size:]) == bits(delta * _value(activation, a))
+
+
+def test_the_gated_ops_refuse_odd_widths_and_mismatched_deltas():
+    with pytest.raises(ValueError, match="even"):
+        gated_delta_batch(Array.zeros((2, 3)), Array.zeros((2, 3)), "silu")
+    with pytest.raises(ValueError, match="delta of shape"):
+        gated_delta_batch(Array.zeros((2, 3)), Array.zeros((2, 4)), "silu")
+    with pytest.raises(ValueError, match="even"):
+        gated_forward_batch(Array.zeros((3, 2)), Array.zeros((1, 2)), Array.zeros(3), "silu")
 
 
 def test_relu_masks_on_the_output_and_gives_positive_zero():

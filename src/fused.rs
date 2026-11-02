@@ -290,7 +290,7 @@ pub fn layer_momentum_apply_accumulated_gradient(
     .map_err(py_err)
 }
 
-/// The activation by name (`"relu"`, `"gelu"`, `"gelu_tanh"`), a `ValueError` otherwise.
+/// The activation by name (`"relu"`, `"gelu"`, `"gelu_tanh"`, `"silu"`), a `ValueError` otherwise.
 pub(crate) fn activation_named(name: &str) -> PyResult<Activation> {
     Activation::from_name(name).map_err(py_err)
 }
@@ -555,6 +555,34 @@ pub fn layer_hidden_delta_skip_batch(
     a_batch: &RustArray,
 ) -> PyResult<RustArray> {
     indrajala_math::fused::layer_hidden_delta_skip_batch(body_w, body_delta_batch, skip_batch, a_batch)
+        .map(RustArray::from)
+        .map_err(py_err)
+}
+
+/// A gated token-wise layer's forward on its rows (indrajala-ml's FFN activations workplan, D3):
+/// `z = X @ W.T + b`, `W` `(2 * size, input_size)` the gate's rows then the value's, and
+/// `act(a) * v` of each row's gate and value, `activation` `"silu"` (SwiGLU), `"gelu"` or
+/// `"gelu_tanh"` (GEGLU). Returns `(out, z)`, `out` `(rows, size)` and `z` `(rows, 2 * size)`.
+#[pyfunction]
+pub fn gated_forward_batch(
+    w: &RustArray,
+    x: &RustArray,
+    b: &RustArray,
+    activation: &str,
+) -> PyResult<(RustArray, RustArray)> {
+    let activation = activation_named(activation)?;
+    indrajala_math::fused::gated_forward_batch(w, x, b, activation)
+        .map(|(out, z)| (RustArray::from(out), RustArray::from(z)))
+        .map_err(py_err)
+}
+
+/// A gated token-wise layer's delta of its pre-activation from its output's `delta` `(rows,
+/// size)`: each row's gate part `(d * v) * act'(a)` then its value part `d * act(a)`, `(rows, 2 *
+/// size)` as `z`.
+#[pyfunction]
+pub fn gated_delta_batch(delta: &RustArray, z: &RustArray, activation: &str) -> PyResult<RustArray> {
+    let activation = activation_named(activation)?;
+    indrajala_math::fused::gated_delta_batch(delta, z, activation)
         .map(RustArray::from)
         .map_err(py_err)
 }

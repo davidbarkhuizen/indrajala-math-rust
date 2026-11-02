@@ -10,7 +10,10 @@ use std::path::PathBuf;
 
 use indrajala_math::activation::Activation;
 use indrajala_math::conv::{conv_forward_batch, max_pool_forward_batch, ConvGeometry};
-use indrajala_math::fused::{layer_activation_forward_batch, layer_activation_hidden_delta_batch, layer_forward_batch};
+use indrajala_math::fused::{
+    gated_delta_batch, gated_forward_batch, layer_activation_forward_batch, layer_activation_hidden_delta_batch,
+    layer_forward_batch,
+};
 use indrajala_math::generator::{Generator, SeedSequence};
 use indrajala_math::layer_norm::layer_norm_forward_batch;
 use indrajala_math::linalg::{matmul, matmul_add, matmul_long_k, matmul_nt, outer};
@@ -142,7 +145,12 @@ fn families() -> BTreeMap<&'static str, String> {
     let (w, x, b) = (matrix(g, 37, 29), matrix(g, 13, 29), vector(g, 37));
     let x = Array::from_matrix(x.data().iter().map(|v| v * 4.0).collect(), 13, 29);
     let (next_w, next_delta) = (matrix(g, 11, 37), matrix(g, 13, 11));
-    for activation in [Activation::Relu, Activation::Gelu, Activation::GeluTanh] {
+    for activation in [
+        Activation::Relu,
+        Activation::Gelu,
+        Activation::GeluTanh,
+        Activation::Silu,
+    ] {
         let (a, z) = layer_activation_forward_batch(&w, &x, &b, activation).unwrap();
         let cached = z.as_ref().unwrap_or(&a);
         let delta = layer_activation_hidden_delta_batch(&next_w, &next_delta, cached, activation).unwrap();
@@ -153,9 +161,24 @@ fn families() -> BTreeMap<&'static str, String> {
                 Activation::Relu => "activation relu forward and hidden delta 13 x 29 -> 37",
                 Activation::Gelu => "activation gelu forward and hidden delta 13 x 29 -> 37",
                 Activation::GeluTanh => "activation gelu_tanh forward and hidden delta 13 x 29 -> 37",
+                Activation::Silu => "activation silu forward and hidden delta 13 x 29 -> 37",
             },
             hash(&arrays),
         );
+    }
+
+    // the gated FFN's forward (out and z) and delta, SwiGLU and GEGLU, through the tiles' tails
+    let (w, x, b) = (matrix(g, 34, 29), matrix(g, 13, 29), vector(g, 34));
+    let x = Array::from_matrix(x.data().iter().map(|v| v * 4.0).collect(), 13, 29);
+    let delta = matrix(g, 13, 17);
+    for (name, activation) in [("silu", Activation::Silu), ("gelu", Activation::Gelu)] {
+        let (y, z) = gated_forward_batch(&w, &x, &b, activation).unwrap();
+        let dz = gated_delta_batch(&delta, &z, activation).unwrap();
+        let label = match name {
+            "silu" => "gated silu forward and delta 13 x 29 -> 17",
+            _ => "gated gelu forward and delta 13 x 29 -> 17",
+        };
+        out.insert(label, hash(&[&y, &z, &dz]));
     }
     out
 }

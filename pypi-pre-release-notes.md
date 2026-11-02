@@ -50,6 +50,9 @@ they merge, then move them into the release notes at release time and empty this
 - **GELU and GELU-tanh** (`"gelu"`, `"gelu_tanh"`) in the fused family above (#90). GELU is
   exact, through the crate's `erf`. GELU-tanh is GPT-2's approximation. Both go through the
   correctly rounded `exp`, so their bits are the same on every machine.
+- **SiLU and the gated FFN** (`"silu"`; `gated_forward_batch`, `gated_delta_batch`): `act(a) * v`
+  from one `(2 * size, d)` product, the gate's rows then the value's (SwiGLU with `"silu"`, GEGLU
+  with a GELU), and its pre-activation's delta, for indrajala-ml's `GatedDense`.
 - **`erf`** (#89), a port of fdlibm's `s_erf.c` through the correctly rounded `exp`. It is within
   one ulp, but not correctly rounded.
 

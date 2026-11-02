@@ -1,7 +1,8 @@
 //! The hidden layers' activations (indrajala-ml's FFN activations workplan, D9): ReLU, GELU (the
-//! exact, `erf` form; Hendrycks & Gimpel 2016) and GELU-tanh (GPT-2's approximation), one family
-//! the fused dense ops ([`crate::fused`]) and the masks ([`crate::ufuncs::array_activation_mask`])
-//! take as an argument.
+//! exact, `erf` form; Hendrycks & Gimpel 2016), GELU-tanh (GPT-2's approximation) and SiLU
+//! (`z * sigmoid(z)`, Elfwing et al. 2018; the gated FFN's, D3), one family the fused dense ops
+//! ([`crate::fused`]), the gated ops and the masks ([`crate::ufuncs::array_activation_mask`]) take
+//! as an argument.
 //!
 //! The expressions, their grouping fixed (indrajala-ml's pure-Python and numpy layers take the same
 //! steps through their own `exp`, so the three agree by bits wherever `exp` does):
@@ -11,6 +12,8 @@
 //! gelu'(z)      = 0.5 * (1.0 + erf(z * SQRT1_2)) + z * (exp(-0.5 * (z * z)) * INV_SQRT_2PI)
 //! gelu_tanh(z)  = (0.5 * z) * (1.0 + th),  th = tanh(C * (z + K * ((z * z) * z)))
 //! gelu_tanh'(z) = 0.5 * (1.0 + th) + (0.5 * z) * ((1.0 - th * th) * (C * (1.0 + (3.0 * K) * (z * z))))
+//! silu(z)       = z * s,  s = 1.0 / (1.0 + exp(-z))
+//! silu'(z)      = s * (1.0 + z * (1.0 - s))
 //! ```
 //!
 //! `SQRT1_2` is the double nearest `1/sqrt(2)` (a multiply, not a division by `sqrt(2)`),
@@ -20,11 +23,13 @@
 //! Only `+ - * /` besides, and Rust never contracts `a * b + c`, so the bits are the expressions',
 //! the same on every machine.
 //!
-//! ReLU's derivative reads the layer's output (`a > 0`), GELU's its input `z`: what the forward
-//! keeps is [`Activation::keeps_preactivation`]'s answer, and a hidden delta's `cached` operand is
-//! `a` for ReLU and `z` for the GELUs.
+//! `s` is [`crate::cr_exp::sigmoid_in_place`]'s, the dense layers' sigmoid.
+//!
+//! ReLU's derivative reads the layer's output (`a > 0`), the others' their input `z`: what the
+//! forward keeps is [`Activation::keeps_preactivation`]'s answer, and a hidden delta's `cached`
+//! operand is `a` for ReLU and `z` for the rest.
 
-use crate::cr_exp::exp;
+use crate::cr_exp::{exp, sigmoid_in_place};
 use crate::erf::erf;
 use crate::recurrent::tanh_in_place;
 use crate::scalar::relu;
@@ -48,23 +53,26 @@ pub enum Activation {
     Gelu,
     /// GPT-2's `tanh` approximation of GELU.
     GeluTanh,
+    /// `z * sigmoid(z)` (SiLU, or Swish with beta 1): SwiGLU's gate.
+    Silu,
 }
 
 impl Activation {
-    /// By the name indrajala-ml's specs give it: `"relu"`, `"gelu"` or `"gelu_tanh"`.
+    /// By the name indrajala-ml's specs give it: `"relu"`, `"gelu"`, `"gelu_tanh"` or `"silu"`.
     pub fn from_name(name: &str) -> Result<Self, Error> {
         match name {
             "relu" => Ok(Self::Relu),
             "gelu" => Ok(Self::Gelu),
             "gelu_tanh" => Ok(Self::GeluTanh),
+            "silu" => Ok(Self::Silu),
             _ => Err(Error::invalid(format!(
-                "unknown activation {name:?}: expected \"relu\", \"gelu\" or \"gelu_tanh\""
+                "unknown activation {name:?}: expected \"relu\", \"gelu\", \"gelu_tanh\" or \"silu\""
             ))),
         }
     }
 
-    /// Whether the derivative reads the pre-activation `z` (the GELUs), not the output `a` (ReLU):
-    /// the forward returns `z` beside `a` exactly when this is true.
+    /// Whether the derivative reads the pre-activation `z` (all but ReLU), not the output `a`
+    /// (ReLU): the forward returns `z` beside `a` exactly when this is true.
     pub fn keeps_preactivation(self) -> bool {
         !matches!(self, Self::Relu)
     }
@@ -77,6 +85,10 @@ impl Activation {
             Self::GeluTanh => {
                 let th = gelu_tanh_th(z);
                 z.iter().zip(th.iter()).map(|(&v, &t)| (0.5 * v) * (1.0 + t)).collect()
+            }
+            Self::Silu => {
+                let s = sigmoid_of(z);
+                z.iter().zip(s.iter()).map(|(&v, &sv)| v * sv).collect()
             }
         }
     }
@@ -102,6 +114,14 @@ impl Activation {
                     .iter()
                     .zip(cached.iter().zip(th.iter()))
                     .map(|(&d, (&z, &t))| d * gelu_tanh_derivative_from(z, t))
+                    .collect()
+            }
+            Self::Silu => {
+                let s = sigmoid_of(cached);
+                downstream
+                    .iter()
+                    .zip(cached.iter().zip(s.iter()))
+                    .map(|(&d, (&z, &sv))| d * (sv * (1.0 + z * (1.0 - sv))))
                     .collect()
             }
         }
@@ -134,6 +154,13 @@ fn gelu_tanh_th(z: &[f64]) -> Vec<f64> {
 #[inline]
 fn gelu_tanh_derivative_from(z: f64, th: f64) -> f64 {
     0.5 * (1.0 + th) + (0.5 * z) * ((1.0 - th * th) * (SQRT_2_OVER_PI * (1.0 + (3.0 * GELU_TANH_K) * (z * z))))
+}
+
+/// `1 / (1 + exp(-z))` for each of `z`, the dense layers' sigmoid.
+fn sigmoid_of(z: &[f64]) -> Vec<f64> {
+    let mut s = z.to_vec();
+    sigmoid_in_place(&mut s);
+    s
 }
 
 /// `gelu_tanh(z)`, one value.

@@ -36,13 +36,14 @@ use factored::{
     factored_codes_backward, factored_codes_forward, recurrence_step_backward, recurrence_step_forward, RecurrenceStep,
 };
 use fused::{
-    affine_forward, affine_forward_batch, layer_accumulate_gradient, layer_accumulate_gradient_batch,
-    layer_activation_forward, layer_activation_forward_batch, layer_activation_hidden_delta,
-    layer_activation_hidden_delta_batch, layer_activation_hidden_delta_skip, layer_activation_hidden_delta_skip_batch,
-    layer_adam_apply_accumulated_gradient, layer_apply_accumulated_gradient, layer_downstream, layer_downstream_batch,
-    layer_dropout_forward, layer_dropout_forward_batch, layer_dropout_hidden_delta, layer_dropout_hidden_delta_batch,
-    layer_dropout_hidden_delta_skip, layer_dropout_hidden_delta_skip_batch, layer_forward, layer_forward_batch,
-    layer_hidden_delta, layer_hidden_delta_batch, layer_hidden_delta_skip, layer_hidden_delta_skip_batch,
+    affine_forward, affine_forward_batch, gated_delta_batch, gated_forward_batch, layer_accumulate_gradient,
+    layer_accumulate_gradient_batch, layer_activation_forward, layer_activation_forward_batch,
+    layer_activation_hidden_delta, layer_activation_hidden_delta_batch, layer_activation_hidden_delta_skip,
+    layer_activation_hidden_delta_skip_batch, layer_adam_apply_accumulated_gradient, layer_apply_accumulated_gradient,
+    layer_downstream, layer_downstream_batch, layer_dropout_forward, layer_dropout_forward_batch,
+    layer_dropout_hidden_delta, layer_dropout_hidden_delta_batch, layer_dropout_hidden_delta_skip,
+    layer_dropout_hidden_delta_skip_batch, layer_forward, layer_forward_batch, layer_hidden_delta,
+    layer_hidden_delta_batch, layer_hidden_delta_skip, layer_hidden_delta_skip_batch,
     layer_l2_apply_accumulated_gradient, layer_momentum_apply_accumulated_gradient, layer_output_delta, layer_sgd_step,
     layer_softmax_forward, layer_softmax_forward_batch, layer_softmax_output_delta,
 };
@@ -128,6 +129,8 @@ fn indrajala_math_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(layer_downstream_batch, m)?)?;
     m.add_function(wrap_pyfunction!(affine_forward, m)?)?;
     m.add_function(wrap_pyfunction!(affine_forward_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(gated_forward_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(gated_delta_batch, m)?)?;
     m.add_function(wrap_pyfunction!(layer_hidden_delta_skip, m)?)?;
     m.add_function(wrap_pyfunction!(layer_hidden_delta_skip_batch, m)?)?;
     m.add_function(wrap_pyfunction!(layer_activation_hidden_delta_skip, m)?)?;
