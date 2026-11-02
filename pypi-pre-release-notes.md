@@ -53,6 +53,12 @@ they merge, then move them into the release notes at release time and empty this
 - **SiLU and the gated FFN** (`"silu"`; `gated_forward_batch`, `gated_delta_batch`): `act(a) * v`
   from one `(2 * size, d)` product, the gate's rows then the value's (SwiGLU with `"silu"`, GEGLU
   with a GELU), and its pre-activation's delta, for indrajala-ml's `GatedDense`.
+- **Grouped-query attention** (indrajala-ml's grouped-query attention workplan, D4): keyword
+  `key_value_heads=None` on `attention_forward*`, `attention_step` and
+  `attention_downstream_batch`. With `g` key/value heads dividing `heads`, `wk`, `bk`, `wv`, `bv`
+  and the caches `k`, `v` (and `dk`, `dv`, `attention_step`'s `k_cache`, `v_cache`) are `g * d_k`
+  wide, query head `i` reading key/value head `i // (heads / g)`; `g = 1` is multi-query
+  attention. `None` means `heads`: every existing call is unchanged, with the same bits.
 - **`erf`** (#89), a port of fdlibm's `s_erf.c` through the correctly rounded `exp`. It is within
   one ulp, but not correctly rounded.
 

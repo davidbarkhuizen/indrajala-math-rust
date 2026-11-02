@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use indrajala_math::activation::Activation;
+use indrajala_math::attention::{attention_downstream_batch, attention_forward_batch};
 use indrajala_math::conv::{conv_forward_batch, max_pool_forward_batch, ConvGeometry};
 use indrajala_math::fused::{
     gated_delta_batch, gated_forward_batch, layer_activation_forward_batch, layer_activation_hidden_delta_batch,
@@ -179,6 +180,73 @@ fn families() -> BTreeMap<&'static str, String> {
             _ => "gated gelu forward and delta 13 x 29 -> 17",
         };
         out.insert(label, hash(&[&y, &z, &dz]));
+    }
+
+    // attention's forward and downstream, causal and rotary, over three key blocks, at 4 query heads
+    // of 4 with their own key/value heads, two groups and one (indrajala-ml's grouped-query
+    // attention workplan, D4)
+    let (examples, tokens, d, heads, d_k) = (2, 37, 8, 4, 4);
+    let x = matrix(g, examples, tokens * d);
+    let delta = matrix(g, examples, tokens * d);
+    let (cos, sin) = (matrix(g, tokens, d_k / 2), matrix(g, tokens, d_k / 2));
+    for key_value_heads in [4, 2, 1] {
+        let (width, kv_width) = (heads * d_k, key_value_heads * d_k);
+        let (wq, bq) = (matrix(g, width, d), vector(g, width));
+        let (wk, bk, wv, bv) = (
+            matrix(g, kv_width, d),
+            vector(g, kv_width),
+            matrix(g, kv_width, d),
+            vector(g, kv_width),
+        );
+        let (wo, bo) = (matrix(g, d, width), vector(g, d));
+        let (a, q, k, v, h, m, l, _) = attention_forward_batch(
+            &x,
+            &wq,
+            &bq,
+            &wk,
+            &bk,
+            &wv,
+            &bv,
+            &wo,
+            &bo,
+            heads,
+            key_value_heads,
+            true,
+            0.0,
+            false,
+            None,
+            Some(&cos),
+            Some(&sin),
+            None,
+            16,
+        )
+        .unwrap();
+        let (dx, dq, dk, dv) = attention_downstream_batch(
+            &delta,
+            &wq,
+            &wk,
+            &wv,
+            &wo,
+            [&q, &k, &v, &h, &m, &l],
+            heads,
+            key_value_heads,
+            true,
+            None,
+            0.0,
+            None,
+            Some(&cos),
+            Some(&sin),
+            16,
+        )
+        .unwrap();
+        out.insert(
+            match key_value_heads {
+                4 => "attention forward and downstream 2 x 37 x 8, 4 heads",
+                2 => "attention forward and downstream 2 x 37 x 8, 4 heads sharing 2",
+                _ => "attention forward and downstream 2 x 37 x 8, 4 heads sharing 1",
+            },
+            hash(&[&a, &q, &k, &v, &h, &m, &l, &dx, &dq, &dk, &dv]),
+        );
     }
     out
 }

@@ -314,6 +314,7 @@ def attention_forward(
     sin: Array | None = None,
     segments: Array | None = None,
     block: int = 16,
+    key_value_heads: int | None = None,
 ) -> tuple[Array, Array, Array, Array, Array, Array, Array, Generator | None]: ...
 def attention_forward_batch(
     x: Array,
@@ -335,6 +336,7 @@ def attention_forward_batch(
     sin: Array | None = None,
     segments: Array | None = None,
     block: int = 16,
+    key_value_heads: int | None = None,
 ) -> tuple[Array, Array, Array, Array, Array, Array, Array, Generator | None]: ...
 def attention_step(
     x: Array,
@@ -355,6 +357,7 @@ def attention_step(
     sin: Array | None = None,
     origin: int = 0,
     block: int = 16,
+    key_value_heads: int | None = None,
 ) -> tuple[Array, Array, Array]: ...
 def attention_downstream_batch(
     delta_batch: Array,
@@ -377,6 +380,7 @@ def attention_downstream_batch(
     cos: Array | None = None,
     sin: Array | None = None,
     block: int = 16,
+    key_value_heads: int | None = None,
 ) -> tuple[Array, Array, Array, Array]: ...
 def attention_accumulate_gradient_batch(
     delta_batch: Array,

@@ -75,19 +75,23 @@ def _id(shape: tuple[int, ...]) -> str:
     return "x".join(map(str, shape))
 
 
-def _case(examples: int, tokens: int, features: int, heads: int, key_size: int) -> dict[str, np.ndarray]:
+def _case(
+    examples: int, tokens: int, features: int, heads: int, key_size: int, key_value_heads: int | None = None
+) -> dict[str, np.ndarray]:
     # the crate's own PCG64, numpy's `default_rng` stream with `uniform` unfused: the same inputs on
     # every platform, where numpy's own `uniform` contracts to an FMA on some (macOS and Windows on
-    # arm64)
-    rng = pa.default_rng([examples, tokens, features, heads, key_size])
+    # arm64); wk, bk, wv and bv at key_value_heads heads when given (grouped-query attention)
+    seed = [examples, tokens, features, heads, key_size]
+    rng = pa.default_rng(seed if key_value_heads is None else [*seed, key_value_heads])
 
     def uniform(low: float, high: float, shape: Any) -> np.ndarray:
         return to_numpy(rng.uniform(low, high, shape))
 
     d, width = features, heads * key_size
+    kv_width = width if key_value_heads is None else key_value_heads * key_size
     c = {"x": uniform(-2.0, 2.0, (examples, tokens * d))}
     for name in NAMES:
-        rows, fan_in = (d, width) if name[1] == "o" else (width, d)
+        rows, fan_in = (d, width) if name[1] == "o" else (kv_width if name[1] in "kv" else width, d)
         limit = 1.0 / math.sqrt(fan_in)
         c[name] = uniform(-limit, limit, (rows, fan_in) if name[0] == "w" else rows)
     c["delta"] = uniform(-1.0, 1.0, (examples, tokens * d))
@@ -178,12 +182,15 @@ def tiled_forward(
     masks: list[np.ndarray] | None = None,
     keep: float = 1.0,
     skip: bool = True,
+    key_value_heads: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    # (h, m, l) packed as the ops': masking(n) an example's Masking, masks[b] block b's (N, h, T_q, b)
+    # (h, m, l) packed as the ops': masking(n) an example's Masking, masks[b] block b's (N, h, T_q, b);
+    # query head i reads key/value head i // (h / g)
     q, k, v = qkv
     examples, queries, keys = extent
     width = q.shape[1]
     d_k = width // heads
+    group = heads // (heads if key_value_heads is None else key_value_heads)
     m = np.full((examples * queries, heads), -np.inf)
     l = np.zeros((examples * queries, heads))
     h = np.zeros((examples * queries, width))
@@ -196,9 +203,10 @@ def tiled_forward(
             r0, r1 = rows
             for i in range(heads):
                 cols = slice(i * d_k, (i + 1) * d_k)
+                kv_cols = slice(i // group * d_k, (i // group + 1) * d_k)
                 s = _scores(
                     q[n * queries + r0 : n * queries + r1, cols],
-                    k[n * keys + k0 : n * keys + k1, cols],
+                    k[n * keys + k0 : n * keys + k1, kv_cols],
                     mask_n,
                     r0,
                     k0,
@@ -218,7 +226,7 @@ def tiled_forward(
                     alphas.append(alpha)
                     if masks is not None:
                         e[r] = e[r] * masks[b][n, i, r0 + r] / keep
-                ev = to_numpy(to_array(e) @ to_array(v[n * keys + k0 : n * keys + k1, cols]))
+                ev = to_numpy(to_array(e) @ to_array(v[n * keys + k0 : n * keys + k1, kv_cols]))
                 for r in range(r1 - r0):
                     at = n * queries + r0 + r
                     h[at, cols] = h[at, cols] * alphas[r] + ev[r]
@@ -237,11 +245,15 @@ def tiled_backward(
     masks: list[np.ndarray] | None = None,
     keep: float = 1.0,
     skip: bool = True,
+    key_value_heads: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    # a group's dk and dv per key block: its first head's assigned, each later head's added, in
+    # head order; dk divided by the scale once, after
     q, k, v, h, m, l = saved
     examples, queries, keys = extent
     width = q.shape[1]
     d_k = width // heads
+    group = heads // (heads if key_value_heads is None else key_value_heads)
     s_k = math.sqrt(d_k)
     term = np.array(
         [
@@ -260,9 +272,10 @@ def tiled_backward(
             ra, ka = slice(n * queries + r0, n * queries + r1), slice(n * keys + k0, n * keys + k1)
             for i in range(heads):
                 cols = slice(i * d_k, (i + 1) * d_k)
-                s = _scores(q[ra, cols], k[ka, cols], mask_n, r0, k0, d_k)
+                kv_cols = slice(i // group * d_k, (i // group + 1) * d_k)
+                s = _scores(q[ra, cols], k[ka, kv_cols], mask_n, r0, k0, d_k)
                 p = _exp(s - m[ra, i : i + 1]) / l[ra, i : i + 1]
-                dp = to_numpy(to_array(dh[ra, cols]) @ to_array(v[ka, cols]).T)
+                dp = to_numpy(to_array(dh[ra, cols]) @ to_array(v[ka, kv_cols]).T)
                 if masks is None:
                     dv_t = to_numpy(to_array(p).T @ to_array(dh[ra, cols]))
                 else:
@@ -270,9 +283,13 @@ def tiled_backward(
                     dv_t = to_numpy(to_array(p * kept).T @ to_array(dh[ra, cols]))
                     dp = dp * kept
                 ds = p * (dp - term[ra, i : i + 1])
-                dq[ra, cols] += to_numpy(to_array(ds) @ to_array(k[ka, cols]))
-                dk[ka, cols] = to_numpy(to_array(ds).T @ to_array(q[ra, cols]))
-                dv[ka, cols] = dv_t
+                dq[ra, cols] += to_numpy(to_array(ds) @ to_array(k[ka, kv_cols]))
+                dk_t = to_numpy(to_array(ds).T @ to_array(q[ra, cols]))
+                if i % group == 0:
+                    dk[ka, kv_cols], dv[ka, kv_cols] = dk_t, dv_t
+                else:
+                    dk[ka, kv_cols] += dk_t
+                    dv[ka, kv_cols] += dv_t
     return dq / s_k, dk / s_k, dv
 
 

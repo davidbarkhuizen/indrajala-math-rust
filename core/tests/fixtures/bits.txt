@@ -3,6 +3,9 @@ activation gelu forward and hidden delta 13 x 29 -> 37	daaf470398bed5d0 1443
 activation gelu_tanh forward and hidden delta 13 x 29 -> 37	e79492e2122ea20a 1443
 activation relu forward and hidden delta 13 x 29 -> 37	3e3420ea7a936cae 962
 activation silu forward and hidden delta 13 x 29 -> 37	7b90b4404654b0c3 1443
+attention forward and downstream 2 x 37 x 8, 4 heads	3e8fb83079d7cec5 10064
+attention forward and downstream 2 x 37 x 8, 4 heads sharing 1	99680e99e104b7af 6512
+attention forward and downstream 2 x 37 x 8, 4 heads sharing 2	1f0fb246b8aa05d3 7696
 conv_forward_batch 28 x 28, 8 ch	b4abbedea4f28a53 34476
 erf	d4109e9ea058f426 1012
 exp	1ccc2021d0ddd6e2 1009
