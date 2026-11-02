@@ -6,7 +6,7 @@
 //! features and `[i]` head `i`'s block:
 //!
 //! ```text
-//! project   Q = X Wq^T + bq;  K = X Wk^T + bk;  V = X Wv^T + bv           (T, h·d_k) each
+//! project   Q = X Wq^T + bq;  K = X Wk^T + bk;  V = X Wv^T + bv     (T, h·d_k); K, V (T, g·d_k)
 //! attend    per key block of b, in order, per example the rows reaching it, per head and row:
 //!           S = (Q[i] K[i]^T) / s, masked -inf;  m' = max(m, max S);  e = exp(S - m')
 //!           l = l exp(m - m') + fold(e);  H = H exp(m - m') + e V[i];  m = m';  at the end H / l
@@ -29,7 +29,7 @@
 //!
 //! The products between activations are `@` (`matmul`) per example, head and tile, a transpose
 //! copied first; `exp` is the crate's correctly rounded `cr_exp`; project, combine and the
-//! parameter gradients are a dense layer's on the `(N * T, d)` and `(N * T, h·d_k)` rows
+//! parameter gradients are a dense layer's on the `(N * T, d)` and `(N * T, h·d_k)` (`g·d_k`) rows
 //! (`affine_forward_batch`, `layer_downstream_batch`, `layer_accumulate_gradient_batch`), one
 //! product over all heads.
 //!
@@ -56,8 +56,16 @@
 //! `dK` back before project's products and returns them so, the gradients of the unrotated `Q` and
 //! `K`. `V` isn't rotated.
 //!
-//! The caches are packed: `Q`, `K`, `V`, `H` and their gradients `(N * T, h·d_k)`, head `i` in
-//! columns `i·d_k..`, and `m`, `l` `(N * T, heads)`.
+//! Grouped-query attention (indrajala-ml's grouped-query attention workplan, D2-D4): with
+//! `key_value_heads` `g` dividing `h`, `K` and `V` hold `g` heads, and query head `i` reads
+//! key/value head `i / (h / g)` in place, no copy; within a key block a group's heads run in
+//! order, its tiles cut once. The backward pass adds a group's heads' `dK` and `dV` per key block,
+//! the first head's assigned and each later one's added (a left fold in head order, numpy's
+//! `fold`), and divides `dK` by the scale once, after. `g = h`, the default, is plain multi-head
+//! attention, the same operations as before.
+//!
+//! The caches are packed: `Q`, `H` and their gradients `(N * T, h·d_k)`, head `i` in columns
+//! `i·d_k..`; `K`, `V` and theirs `(N * T, g·d_k)`; and `m`, `l` `(N * T, heads)`.
 
 use crate::array::{Array, Shape};
 use crate::cr_exp::{exp, exp_in_place};
@@ -66,21 +74,29 @@ use crate::generator::Generator;
 use crate::linalg::matmul;
 use crate::Error;
 
-/// What attend reads besides `Q`, `K` and `V`: the head count, each head's width and the drop
-/// probability of each weight in training (the masks are each pass's `Masking`).
+/// What attend reads besides `Q`, `K` and `V`: the query and key/value head counts, each head's
+/// width and the drop probability of each weight in training (the masks are each pass's
+/// `Masking`).
 #[derive(Clone, Copy)]
 struct AttentionOptions {
     heads: usize,
+    key_value_heads: usize,
     key_size: usize,
     dropout: f64,
 }
 
 impl AttentionOptions {
-    /// `heads` heads across the projections' `width = h·d_k` columns, `dropout` in `[0, 1)`.
-    fn new(heads: usize, width: usize, dropout: f64, context: &str) -> Result<Self, Error> {
+    /// `heads` heads across the query projection's `width = h·d_k` columns, sharing
+    /// `key_value_heads` key/value heads, which divide them; `dropout` in `[0, 1)`.
+    fn new(heads: usize, key_value_heads: usize, width: usize, dropout: f64, context: &str) -> Result<Self, Error> {
         if heads == 0 || width == 0 || !width.is_multiple_of(heads) {
             return Err(Error::invalid(format!(
                 "{context} requires heads >= 1 dividing the projections' width {width}, got heads={heads}"
+            )));
+        }
+        if key_value_heads == 0 || !heads.is_multiple_of(key_value_heads) {
+            return Err(Error::invalid(format!(
+                "{context} requires key_value_heads >= 1 dividing heads={heads}, got key_value_heads={key_value_heads}"
             )));
         }
         if !(0.0..1.0).contains(&dropout) {
@@ -90,9 +106,25 @@ impl AttentionOptions {
         }
         Ok(AttentionOptions {
             heads,
+            key_value_heads,
             key_size: width / heads,
             dropout,
         })
+    }
+
+    /// `g·d_k`, the key and value projections' width.
+    fn kv_width(&self) -> usize {
+        self.key_value_heads * self.key_size
+    }
+
+    /// Query head `i`'s key/value head, `i / (h / g)`.
+    fn group(&self, i: usize) -> usize {
+        i / (self.heads / self.key_value_heads)
+    }
+
+    /// Whether query head `i` is its group's first, which assigns the group's gradients.
+    fn first_in_group(&self, i: usize) -> bool {
+        i.is_multiple_of(self.heads / self.key_value_heads)
     }
 
     /// `1 - dropout`, each kept weight's divisor.
@@ -100,7 +132,7 @@ impl AttentionOptions {
         1.0 - self.dropout
     }
 
-    /// `h·d_k`, the projections' width.
+    /// `h·d_k`, the query and output projections' width.
     fn width(&self) -> usize {
         self.heads * self.key_size
     }
@@ -162,12 +194,12 @@ impl<'a> Rotation<'a> {
         Ok(Some(Rotation { cos, sin }))
     }
 
-    /// The packed `(N * T, h·d_k)` rows `m`, each head's features `j` and `j + d_k / 2` rotated by
-    /// the row's token's angles: `(a c - b s, a s + b c)`; or back, `inverse`, by the transpose:
-    /// `(a c + b s, b c - a s)`. Each entry two products and a sum, as numpy's elementwise
-    /// expressions, so the same bits.
+    /// The packed `(N * T, n·d_k)` rows `m`, `n` query or key/value heads, each head's features `j`
+    /// and `j + d_k / 2` rotated by the row's token's angles: `(a c - b s, a s + b c)`; or back,
+    /// `inverse`, by the transpose: `(a c + b s, b c - a s)`. Each entry two products and a sum, as
+    /// numpy's elementwise expressions, so the same bits.
     fn rotated(&self, m: &Array, tokens: usize, options: &AttentionOptions, inverse: bool) -> Array {
-        let (d_k, width) = (options.key_size, options.width());
+        let (d_k, width) = (options.key_size, columns(m));
         let half = d_k / 2;
         let mut data = m.data.clone();
         for (r, (row, out)) in m.data.chunks_exact(width).zip(data.chunks_exact_mut(width)).enumerate() {
@@ -176,7 +208,7 @@ impl<'a> Rotation<'a> {
                 &self.cos.data[t * half..(t + 1) * half],
                 &self.sin.data[t * half..(t + 1) * half],
             );
-            for i in 0..options.heads {
+            for i in 0..width / d_k {
                 let (first, second) = out[i * d_k..(i + 1) * d_k].split_at_mut(half);
                 let (a_row, b_row) = row[i * d_k..(i + 1) * d_k].split_at(half);
                 for j in 0..half {
@@ -205,11 +237,13 @@ fn require_shape(array: &Array, shape: Shape, name: &str, context: &str) -> Resu
     Ok(())
 }
 
-/// `wq`, `wk`, `wv` `(h·d_k, d)` and `wo` `(d, h·d_k)`, `d` and `width` given.
-fn require_weights(weights: [&Array; 4], d: usize, width: usize, context: &str) -> Result<(), Error> {
+/// `wq` `(h·d_k, d)`, `wk`, `wv` `(g·d_k, d)` and `wo` `(d, h·d_k)`, `d` and the options given.
+fn require_weights(weights: [&Array; 4], d: usize, options: &AttentionOptions, context: &str) -> Result<(), Error> {
     let [wq, wk, wv, wo] = weights;
-    for (w, name) in [(wq, "wq"), (wk, "wk"), (wv, "wv")] {
-        require_shape(w, Shape::Matrix(width, d), name, context)?;
+    let (width, kv_width) = (options.width(), options.kv_width());
+    require_shape(wq, Shape::Matrix(width, d), "wq", context)?;
+    for (w, name) in [(wk, "wk"), (wv, "wv")] {
+        require_shape(w, Shape::Matrix(kv_width, d), name, context)?;
     }
     require_shape(wo, Shape::Matrix(d, width), "wo", context)
 }
@@ -218,7 +252,7 @@ fn require_weights(weights: [&Array; 4], d: usize, width: usize, context: &str) 
 /// projection's weight and bias shaped to them.
 fn shapes(
     projections: &Projections,
-    heads: usize,
+    heads: (usize, usize),
     dropout: f64,
     context: &str,
 ) -> Result<(usize, AttentionOptions), Error> {
@@ -226,11 +260,12 @@ fn shapes(
     if d == 0 {
         return Err(Error::invalid(format!("{context} requires a non-empty bo")));
     }
-    let options = AttentionOptions::new(heads, width, dropout, context)?;
+    let options = AttentionOptions::new(heads.0, heads.1, width, dropout, context)?;
     let weights = [projections.wq, projections.wk, projections.wv, projections.wo];
-    require_weights(weights, d, width, context)?;
-    for (b, name) in [(projections.bq, "bq"), (projections.bk, "bk"), (projections.bv, "bv")] {
-        require_shape(b, Shape::Vector(width), name, context)?;
+    require_weights(weights, d, &options, context)?;
+    require_shape(projections.bq, Shape::Vector(width), "bq", context)?;
+    for (b, name) in [(projections.bk, "bk"), (projections.bv, "bv")] {
+        require_shape(b, Shape::Vector(options.kv_width()), name, context)?;
     }
     require_shape(projections.bo, Shape::Vector(d), "bo", context)?;
     Ok((d, options))
@@ -362,11 +397,16 @@ struct Extent {
     origin: usize,
 }
 
-/// One key block's scores against rows `r0..r1` of example `n`'s head `i`: `(Q K^T) / s`, masked
-/// scores `-inf`.
+/// Example `n`'s key/value head `group`'s tile of keys or values `k0..k1`, `(k1 - k0, d_k)`.
+fn group_tile(m: &Array, n: usize, group: usize, k0: usize, k1: usize, extent: Extent, d_k: usize) -> Array {
+    tile(m, n * extent.keys + k0, n * extent.keys + k1, group * d_k, d_k)
+}
+
+/// One key block's scores against rows `r0..r1` of example `n`'s head `i`, `k_t` its key/value
+/// head's keys `k0..k1` transposed: `(Q K^T) / s`, masked scores `-inf`.
 fn scores(
     q: &Array,
-    k: &Array,
+    k_t: &Array,
     at: (usize, usize, usize, usize, usize, usize),
     extent: Extent,
     options: &AttentionOptions,
@@ -375,8 +415,7 @@ fn scores(
     let (n, i, r0, r1, k0, k1) = at;
     let d_k = options.key_size;
     let q_t = tile(q, n * extent.queries + r0, n * extent.queries + r1, i * d_k, d_k);
-    let k_t = tile(k, n * extent.keys + k0, n * extent.keys + k1, i * d_k, d_k);
-    let mut s = divided(matmul(&q_t, &k_t.transpose())?, options.scale());
+    let mut s = divided(matmul(&q_t, k_t)?, options.scale());
     if masking.masks(r0, r1, k0, k1) {
         let b = k1 - k0;
         for (r, row) in s.data.chunks_exact_mut(b).enumerate() {
@@ -404,9 +443,9 @@ fn block_mask(
 
 /// The tiled forward (indrajala-ml's context-length workplan, D3, D12): `(h, m, l)`, `h` the packed
 /// `(N * T_q, h·d_k)` output and `m` and `l` each query's running max and sum, `(N * T_q, heads)`,
-/// from the packed `q` `(N * T_q, h·d_k)` and `k`, `v` `(N * T_k, h·d_k)`. Per key block, in
+/// from the packed `q` `(N * T_q, h·d_k)` and `k`, `v` `(N * T_k, g·d_k)`. Per key block, in
 /// order, a mask drawn from `rng` for every example, head, query and key; then per example the
-/// rows reaching it, and per head and row, `m' = max(m, the block's row max)`, `e = exp(S - m')` (0
+/// rows reaching it, per key/value head its tiles, and per query head of its group and row, `m' = max(m, the block's row max)`, `e = exp(S - m')` (0
 /// in place of an all-masked row's `m'`), `l = l exp(m - m') + fold(e)`, `H = H exp(m - m') + e V`
 /// (`e` dropped as `e M / keep`); at the end `H / l`. numpy's `tiled_forward`, expression for
 /// expression.
@@ -431,8 +470,14 @@ fn tiled_forward<'s>(
             let Some((r0, r1)) = masking.rows(extent.queries, k0, k1) else {
                 continue;
             };
+            let (mut k_t, mut v_t) = (Array::from_vector(vec![]), Array::from_vector(vec![]));
             for i in 0..heads {
-                let s = scores(q, k, (n, i, r0, r1, k0, k1), extent, options, &masking)?;
+                if options.first_in_group(i) {
+                    let group = options.group(i);
+                    k_t = group_tile(k, n, group, k0, k1, extent, d_k).transpose();
+                    v_t = group_tile(v, n, group, k0, k1, extent, d_k);
+                }
+                let s = scores(q, &k_t, (n, i, r0, r1, k0, k1), extent, options, &masking)?;
                 let mut e = vec![0.0; (r1 - r0) * b];
                 let mut alphas = Vec::with_capacity(r1 - r0);
                 for (r, (row, e_row)) in s.data.chunks_exact(b).zip(e.chunks_exact_mut(b)).enumerate() {
@@ -456,7 +501,6 @@ fn tiled_forward<'s>(
                         }
                     }
                 }
-                let v_t = tile(v, n * extent.keys + k0, n * extent.keys + k1, i * d_k, d_k);
                 let ev = matmul(&Array::from_matrix(e, r1 - r0, b), &v_t)?;
                 for (r, ev_row) in ev.data.chunks_exact(d_k).enumerate() {
                     let start = (n * extent.queries + r0 + r) * width + i * d_k;
@@ -482,7 +526,8 @@ fn tiled_forward<'s>(
     ))
 }
 
-/// The tiled backward: `(dq, dk, dv)`, packed as `q`, `k`, `v`, from `dh` and the forward's `q`,
+/// The tiled backward: `(dq, dk, dv)`, packed as `q`, `k`, `v` (`dk` and `dv` a group's heads'
+/// added per key block in head order, the first's assigned), from `dh` and the forward's `q`,
 /// `k`, `v`, `h`, `m` and `l`. Per key block, its masks drawn again from `rng` (a copy of the
 /// forward's generator before its draws), `P = exp(S - m) / l` recomputed, `dP = dH V^T`, with
 /// `kept = M / keep`: `dV = (P kept)^T dH` and `dP = dP kept`; `dS = P (dP - D)`, `D` the fold of
@@ -498,6 +543,7 @@ fn tiled_backward<'s>(
 ) -> Result<(Array, Array, Array), Error> {
     let [q, k, v, h, m, l] = saved;
     let (heads, d_k, width, s) = (options.heads, options.key_size, options.width(), options.scale());
+    let kv_width = options.kv_width();
     let rows = extent.examples * extent.queries;
     let row_terms: Vec<f64> = dh
         .data
@@ -509,8 +555,8 @@ fn tiled_backward<'s>(
         })
         .collect();
     let mut dq = vec![0.0; rows * width];
-    let mut dk = vec![0.0; extent.examples * extent.keys * width];
-    let mut dv = vec![0.0; extent.examples * extent.keys * width];
+    let mut dk = vec![0.0; extent.examples * extent.keys * kv_width];
+    let mut dv = vec![0.0; extent.examples * extent.keys * kv_width];
     for (k0, k1) in key_blocks(extent.keys, extent.block, extent.origin) {
         let b = k1 - k0;
         let mask = block_mask(&mut rng, extent, options, b);
@@ -519,8 +565,16 @@ fn tiled_backward<'s>(
             let Some((r0, r1)) = masking.rows(extent.queries, k0, k1) else {
                 continue;
             };
+            let empty = || Array::from_vector(vec![]);
+            let (mut k_t, mut k_tt, mut v_t) = (empty(), empty(), empty());
             for i in 0..heads {
-                let mut p = scores(q, k, (n, i, r0, r1, k0, k1), extent, options, &masking)?;
+                let (group, first) = (options.group(i), options.first_in_group(i));
+                if first {
+                    k_t = group_tile(k, n, group, k0, k1, extent, d_k);
+                    k_tt = k_t.transpose();
+                    v_t = group_tile(v, n, group, k0, k1, extent, d_k);
+                }
+                let mut p = scores(q, &k_tt, (n, i, r0, r1, k0, k1), extent, options, &masking)?;
                 for (r, row) in p.data.chunks_exact_mut(b).enumerate() {
                     let at = (n * extent.queries + r0 + r) * heads + i;
                     for x in row.iter_mut() {
@@ -532,7 +586,6 @@ fn tiled_backward<'s>(
                     }
                 }
                 let dh_t = tile(dh, n * extent.queries + r0, n * extent.queries + r1, i * d_k, d_k);
-                let v_t = tile(v, n * extent.keys + k0, n * extent.keys + k1, i * d_k, d_k);
                 let mut dp = matmul(&dh_t, &v_t.transpose())?;
                 let dv_t = match &mask {
                     Some(mask) => {
@@ -561,7 +614,6 @@ fn tiled_backward<'s>(
                     }
                 }
                 let ds = Array::from_matrix(ds, r1 - r0, b);
-                let k_t = tile(k, n * extent.keys + k0, n * extent.keys + k1, i * d_k, d_k);
                 let q_t = tile(q, n * extent.queries + r0, n * extent.queries + r1, i * d_k, d_k);
                 let dq_t = matmul(&ds, &k_t)?;
                 for (r, row) in dq_t.data.chunks_exact(d_k).enumerate() {
@@ -572,9 +624,18 @@ fn tiled_backward<'s>(
                 }
                 let dk_t = matmul(&ds.transpose(), &q_t)?;
                 for (j, (dk_row, dv_row)) in dk_t.data.chunks_exact(d_k).zip(dv_t.data.chunks_exact(d_k)).enumerate() {
-                    let start = (n * extent.keys + k0 + j) * width + i * d_k;
-                    dk[start..start + d_k].copy_from_slice(dk_row);
-                    dv[start..start + d_k].copy_from_slice(dv_row);
+                    let start = (n * extent.keys + k0 + j) * kv_width + group * d_k;
+                    if first {
+                        dk[start..start + d_k].copy_from_slice(dk_row);
+                        dv[start..start + d_k].copy_from_slice(dv_row);
+                    } else {
+                        for (out, &x) in dk[start..start + d_k].iter_mut().zip(dk_row) {
+                            *out += x;
+                        }
+                        for (out, &x) in dv[start..start + d_k].iter_mut().zip(dv_row) {
+                            *out += x;
+                        }
+                    }
                 }
             }
         }
@@ -582,8 +643,8 @@ fn tiled_backward<'s>(
     let keys = extent.examples * extent.keys;
     Ok((
         divided(Array::from_matrix(dq, rows, width), s),
-        divided(Array::from_matrix(dk, keys, width), s),
-        Array::from_matrix(dv, keys, width),
+        divided(Array::from_matrix(dk, keys, kv_width), s),
+        Array::from_matrix(dv, keys, kv_width),
     ))
 }
 
@@ -644,7 +705,7 @@ fn project_backward(gradients: [&Array; 3], weights: [&Array; 3]) -> Result<Arra
 }
 
 /// The forward pass: `(a, q, k, v, h, m, l, dropout_rng)`, `a` in `x`'s shape, `q`, `k`, `v` and
-/// `h` as `(N * T, h·d_k)` rows, `m` and `l` `(N * T, heads)`, and `dropout_rng`, when the pass
+/// `h` as `(N * T, h·d_k)` rows (`k`, `v` `g·d_k`), `m` and `l` `(N * T, heads)`, and `dropout_rng`, when the pass
 /// dropped, a copy of the generator in its state before the pass's draws, which the backward op
 /// draws the same masks from (indrajala-ml's context-length workplan, D12).
 pub type ForwardResult = (Array, Array, Array, Array, Array, Array, Array, Option<Generator>);
@@ -712,7 +773,7 @@ fn example_masking<'a>(causal: bool, segments: Option<&'a Array>, tokens: usize)
 fn forward(
     x: &Array,
     projections: &Projections,
-    heads: usize,
+    heads: (usize, usize),
     causal: bool,
     mut dropping: Dropping,
     table: (Option<&Array>, Option<&Array>),
@@ -751,7 +812,7 @@ fn forward(
 /// with `segments` (its `T` segment ids as floats) a key in another segment than its query, or a
 /// pad's (0), masked but for the diagonal (indrajala-ml's segments workplan, D4); tiled in key
 /// blocks of `block` (indrajala-ml's context-length workplan, D3). Returns `(a, q, k, v, h, m, l,
-/// dropout_rng)`: `a` 1D, and what the backward pass reads, `q`, `k`, `v` and `h` `(T, h·d_k)`, `m`
+/// dropout_rng)`: `a` 1D, and what the backward pass reads, `q` and `h` `(T, h·d_k)`, `k`, `v` `(T, g·d_k)`, `m`
 /// and `l` `(T, heads)`, and the generator's copy before the draws, or `None`.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_forward(
@@ -765,6 +826,7 @@ pub fn attention_forward(
     wo: &Array,
     bo: &Array,
     heads: usize,
+    key_value_heads: usize,
     causal: bool,
     dropout: f64,
     training: bool,
@@ -797,7 +859,16 @@ pub fn attention_forward(
         rng,
         context,
     };
-    forward(x, &projections, heads, causal, dropping, (cos, sin), segments, block)
+    forward(
+        x,
+        &projections,
+        (heads, key_value_heads),
+        causal,
+        dropping,
+        (cos, sin),
+        segments,
+        block,
+    )
 }
 
 /// `AttentionArrayLayer.forward_batch`: `x` 2D (`batch, T * d`), masked if `causal` and by
@@ -817,6 +888,7 @@ pub fn attention_forward_batch(
     wo: &Array,
     bo: &Array,
     heads: usize,
+    key_value_heads: usize,
     causal: bool,
     dropout: f64,
     training: bool,
@@ -849,10 +921,19 @@ pub fn attention_forward_batch(
         rng,
         context,
     };
-    forward(x, &projections, heads, causal, dropping, (cos, sin), segments, block)
+    forward(
+        x,
+        &projections,
+        (heads, key_value_heads),
+        causal,
+        dropping,
+        (cos, sin),
+        segments,
+        block,
+    )
 }
 
-/// The cache `cache` (`(c, h·d_k)`, oldest first) with `row` (`(1, h·d_k)`) appended, the oldest
+/// The cache `cache` (`(c, g·d_k)`, oldest first) with `row` (`(1, g·d_k)`) appended, the oldest
 /// rows dropped past `window`.
 fn appended(cache: &Array, row: &Array, window: usize, width: usize) -> Array {
     let mut data = Vec::with_capacity(cache.data.len() + width);
@@ -865,7 +946,7 @@ fn appended(cache: &Array, row: &Array, window: usize, width: usize) -> Array {
 
 /// `AttentionArrayLayer.step` (indrajala-ml's generation workplan, D2, D3, D8): one token's decode
 /// on a causal layer's cache. `x` 1D, the token's `d` features; `k_cache` and `v_cache` `(c,
-/// h·d_k)`, the rotated keys and the values of the `c` tokens before it, oldest first; `cos` and
+/// g·d_k)`, the rotated keys and the values of the `c` tokens before it, oldest first; `cos` and
 /// `sin`, when given, `(1, d_k / 2)`, its position's row of the rotary table. Project's blocks on
 /// the one row give its `q`, `k` and `v`, `q` and `k` rotated; `k` and `v` are appended to the
 /// caches, the oldest dropped past `window` (the window slides); each head attends from `q` to
@@ -892,6 +973,7 @@ pub fn attention_step(
     k_cache: &Array,
     v_cache: &Array,
     heads: usize,
+    key_value_heads: usize,
     window: usize,
     cos: Option<&Array>,
     sin: Option<&Array>,
@@ -909,7 +991,7 @@ pub fn attention_step(
         wo,
         bo,
     };
-    let (d, options) = shapes(&projections, heads, 0.0, context)?;
+    let (d, options) = shapes(&projections, (heads, key_value_heads), 0.0, context)?;
     require_shape(x, Shape::Vector(d), "x", context)?;
     require_block(block, context)?;
     if window == 0 {
@@ -917,7 +999,7 @@ pub fn attention_step(
             "{context} requires a window of at least one token"
         )));
     }
-    let width = options.width();
+    let width = options.kv_width();
     let cached = match k_cache.shape {
         Shape::Matrix(rows, w) if w == width => rows,
         shape => {
@@ -955,7 +1037,7 @@ pub fn attention_step(
 /// one example, whose caches are `attention_forward`'s) and the forward pass's `q`, `k`, `v`, `h`,
 /// `m` and `l`, in `heads` heads across `wq`'s rows, masked as the forward was (`causal`,
 /// `segments`) and tiled in its key blocks of `block`, returns `(dx, dq, dk, dv)`: `dx`, the
-/// downstream, in `delta_batch`'s shape, and `dq`, `dk`, `dv` as `(N * T, h·d_k)` rows, which the
+/// downstream, in `delta_batch`'s shape, and `dq` `(N * T, h·d_k)` and `dk`, `dv` `(N * T, g·d_k)`, which the
 /// gradients read. A pass that dropped takes its `dropout` and its `dropout_rng` (the forward op's
 /// copy), from a copy of which it draws the same masks again; one that rotated takes its `cos` and
 /// `sin`, and returns `dq` and `dk` rotated back.
@@ -968,6 +1050,7 @@ pub fn attention_downstream_batch(
     wo: &Array,
     caches: [&Array; 6],
     heads: usize,
+    key_value_heads: usize,
     causal: bool,
     segments: Option<&Array>,
     dropout: f64,
@@ -982,13 +1065,16 @@ pub fn attention_downstream_batch(
         Shape::Matrix(width, d) => (width, d),
         Shape::Vector(d) => (d, 1),
     };
-    let options = AttentionOptions::new(heads, width, dropout, context)?;
-    require_weights([wq, wk, wv, wo], d, width, context)?;
+    let options = AttentionOptions::new(heads, key_value_heads, width, dropout, context)?;
+    require_weights([wq, wk, wv, wo], d, &options, context)?;
     require_block(block, context)?;
     let (examples, tokens) = examples_and_tokens(delta_batch, d, "delta_batch", context)?;
     let rows = examples * tokens;
-    for (cache, name) in [(q, "q"), (k, "k"), (v, "v"), (h, "h")] {
+    for (cache, name) in [(q, "q"), (h, "h")] {
         require_shape(cache, Shape::Matrix(rows, width), name, context)?;
+    }
+    for (cache, name) in [(k, "k"), (v, "v")] {
+        require_shape(cache, Shape::Matrix(rows, options.kv_width()), name, context)?;
     }
     for (cache, name) in [(m, "m"), (l, "l")] {
         require_shape(cache, Shape::Matrix(rows, heads), name, context)?;
@@ -1046,12 +1132,15 @@ pub fn attention_accumulate_gradient_batch(
     grad_bo: &Array,
 ) -> Result<(Array, Array, Array, Array, Array, Array, Array, Array), Error> {
     let context = "attention_accumulate_gradient_batch";
-    let (d, width) = (grad_bo.data.len(), grad_bq.data.len());
+    let (d, width, kv_width) = (grad_bo.data.len(), grad_bq.data.len(), grad_bk.data.len());
     let (examples, tokens) = examples_and_tokens(delta_batch, d, "delta_batch", context)?;
     let rows = examples * tokens;
     require_shape(x, delta_batch.shape, "x", context)?;
-    for (cache, name) in [(h, "h"), (dq, "dq"), (dk, "dk"), (dv, "dv")] {
+    for (cache, name) in [(h, "h"), (dq, "dq")] {
         require_shape(cache, Shape::Matrix(rows, width), name, context)?;
+    }
+    for (cache, name) in [(dk, "dk"), (dv, "dv")] {
+        require_shape(cache, Shape::Matrix(rows, kv_width), name, context)?;
     }
     let x_rows = token_rows(x, d);
     let delta = token_rows(delta_batch, d);

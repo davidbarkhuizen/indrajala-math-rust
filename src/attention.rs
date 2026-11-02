@@ -41,10 +41,12 @@ pub(crate) use indrajala_math::attention::*;
 /// `training` at `dropout > 0`, its queries and keys rotated by `cos` and `sin` when given.
 /// Tiled in key blocks of `block` (indrajala-ml's context-length workplan, D3). Returns `(a, q, k,
 /// v, h, m, l, dropout_rng)`: `a` 1D, and what the backward pass reads, `q`, `k`, `v` and `h`
-/// `(T, h·d_k)`, `m` and `l` `(T, heads)`, and a copy of `rng` before the draws, or `None`.
+/// `(T, h·d_k)` (`k`, `v` `(T, g·d_k)`), `m` and `l` `(T, heads)`, and a copy of `rng` before the
+/// draws, or `None`. `key_value_heads` `g` (default `heads`) divides `heads`: query head `i` reads
+/// key/value head `i // (heads / g)` (indrajala-ml's grouped-query attention workplan, D4).
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, heads, *, causal = false, dropout = 0.0, training = false, rng = None, cos = None, sin = None, segments = None, block = 16))]
+#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, heads, *, causal = false, dropout = 0.0, training = false, rng = None, cos = None, sin = None, segments = None, block = 16, key_value_heads = None))]
 pub fn attention_forward<'py>(
     x: &RustArray,
     wq: &RustArray,
@@ -64,6 +66,7 @@ pub fn attention_forward<'py>(
     sin: Option<&RustArray>,
     segments: Option<&RustArray>,
     block: usize,
+    key_value_heads: Option<usize>,
 ) -> PyResult<ForwardResult> {
     indrajala_math::attention::attention_forward(
         x,
@@ -76,6 +79,7 @@ pub fn attention_forward<'py>(
         wo,
         bo,
         heads,
+        key_value_heads.unwrap_or(heads),
         causal,
         dropout,
         training,
@@ -95,7 +99,7 @@ pub fn attention_forward<'py>(
 /// tokens; a key block's draws are every example's, head's, query's and key's in turn (D12).
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, heads, *, causal = false, dropout = 0.0, training = false, rng = None, cos = None, sin = None, segments = None, block = 16))]
+#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, heads, *, causal = false, dropout = 0.0, training = false, rng = None, cos = None, sin = None, segments = None, block = 16, key_value_heads = None))]
 pub fn attention_forward_batch<'py>(
     x: &RustArray,
     wq: &RustArray,
@@ -115,6 +119,7 @@ pub fn attention_forward_batch<'py>(
     sin: Option<&RustArray>,
     segments: Option<&RustArray>,
     block: usize,
+    key_value_heads: Option<usize>,
 ) -> PyResult<ForwardResult> {
     indrajala_math::attention::attention_forward_batch(
         x,
@@ -127,6 +132,7 @@ pub fn attention_forward_batch<'py>(
         wo,
         bo,
         heads,
+        key_value_heads.unwrap_or(heads),
         causal,
         dropout,
         training,
@@ -141,13 +147,13 @@ pub fn attention_forward_batch<'py>(
 }
 
 /// `AttentionArrayLayer.step`: one token's decode on a causal layer's cache, `x` 1D, `k_cache` and
-/// `v_cache` `(c, h·d_k)` oldest first, `cos` and `sin` its position's `(1, d_k / 2)` row when
+/// `v_cache` `(c, g·d_k)` oldest first, `cos` and `sin` its position's `(1, d_k / 2)` row when
 /// rotary, `origin` the first cached key's column after the append (the key blocks cut at the
 /// columns that are multiples of `block`, as the full pass's). Returns `(a, k_cache, v_cache)`,
 /// the caches with its key and value appended, the oldest dropped past `window`.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, k_cache, v_cache, heads, *, window, cos = None, sin = None, origin = 0, block = 16))]
+#[pyo3(signature = (x, wq, bq, wk, bk, wv, bv, wo, bo, k_cache, v_cache, heads, *, window, cos = None, sin = None, origin = 0, block = 16, key_value_heads = None))]
 pub fn attention_step(
     x: &RustArray,
     wq: &RustArray,
@@ -166,6 +172,7 @@ pub fn attention_step(
     sin: Option<&RustArray>,
     origin: usize,
     block: usize,
+    key_value_heads: Option<usize>,
 ) -> PyResult<(RustArray, RustArray, RustArray)> {
     indrajala_math::attention::attention_step(
         x,
@@ -180,6 +187,7 @@ pub fn attention_step(
         k_cache,
         v_cache,
         heads,
+        key_value_heads.unwrap_or(heads),
         window,
         cos.map(|a| &a.0),
         sin.map(|a| &a.0),
@@ -194,13 +202,14 @@ pub fn attention_step(
 /// one example, whose caches are `attention_forward`'s) and the forward pass's `q`, `k`, `v`, `h`,
 /// `m` and `l`, in `heads` heads across `wq`'s rows, masked as the forward was (`causal`,
 /// `segments`) in its key blocks of `block`, returns `(dx, dq, dk, dv)`: `dx`, the downstream, in
-/// `delta_batch`'s shape, and `dq`, `dk`, `dv` as `(N * T, h·d_k)` rows, which the gradients read.
+/// `delta_batch`'s shape, and `dq` `(N * T, h·d_k)` and `dk`, `dv` `(N * T, g·d_k)`, which the
+/// gradients read.
 /// A pass that dropped takes its `dropout` and the forward op's `dropout_rng`, from a copy of which
 /// it draws the same masks again; one that rotated takes its `cos` and `sin`, and returns `dq` and
 /// `dk` rotated back.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (delta_batch, wq, wk, wv, wo, q, k, v, h, m, l, heads, *, causal = false, segments = None, dropout = 0.0, dropout_rng = None, cos = None, sin = None, block = 16))]
+#[pyo3(signature = (delta_batch, wq, wk, wv, wo, q, k, v, h, m, l, heads, *, causal = false, segments = None, dropout = 0.0, dropout_rng = None, cos = None, sin = None, block = 16, key_value_heads = None))]
 pub fn attention_downstream_batch(
     delta_batch: &RustArray,
     wq: &RustArray,
@@ -221,6 +230,7 @@ pub fn attention_downstream_batch(
     cos: Option<&RustArray>,
     sin: Option<&RustArray>,
     block: usize,
+    key_value_heads: Option<usize>,
 ) -> PyResult<(RustArray, RustArray, RustArray, RustArray)> {
     indrajala_math::attention::attention_downstream_batch(
         delta_batch,
@@ -230,6 +240,7 @@ pub fn attention_downstream_batch(
         wo,
         [q, k, v, h, m, l],
         heads,
+        key_value_heads.unwrap_or(heads),
         causal,
         segments.map(|a| &a.0),
         dropout,

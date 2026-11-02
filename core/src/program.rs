@@ -504,6 +504,7 @@ impl WindowProgram {
                         p[6],
                         p[7],
                         *heads,
+                        *heads, // a window's query heads each have their own key/value head (GQA's D10)
                         *causal,
                         *dropout,
                         rng.is_some(),
@@ -988,6 +989,7 @@ impl WindowProgram {
                         p[4],
                         p[6],
                         [q, k, v, h, m, l],
+                        *heads,
                         *heads,
                         *causal,
                         None, // a window has no segments
