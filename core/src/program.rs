@@ -19,13 +19,14 @@
 //! op's in turn, then each factor's pooling query, cell `w`, `u`, `b`, codes (if snapped) and
 //! initial state (which the program doesn't read: the caller snaps the initial state).
 
+use crate::activation::Activation;
 use crate::array::{Array, Shape};
 use crate::attention::{
     attention_accumulate_gradient_batch, attention_downstream_batch, attention_forward_batch, BLOCK,
 };
 use crate::factored::{step_forward, sum_in_order, Consolidation, StepCore, StepGradients};
 use crate::fused::{
-    affine_forward_batch, layer_accumulate_gradient_batch, layer_downstream_batch, layer_relu_forward_batch,
+    affine_forward_batch, layer_accumulate_gradient_batch, layer_activation_forward_batch, layer_downstream_batch,
     layer_softmax_forward_batch,
 };
 use crate::generator::Generator;
@@ -34,7 +35,7 @@ use crate::recurrent::{columns, join_columns, matrix_shape, state_input_backward
 use crate::tokens::{
     embedding_accumulate_gradient, embedding_forward, token_dropout_downstream, token_dropout_forward,
 };
-use crate::ufuncs::{array_relu_mask, sum_axis0};
+use crate::ufuncs::{array_activation_mask, sum_axis0};
 use crate::Error;
 
 /// One layer of a window, as the program runs it.
@@ -478,7 +479,7 @@ impl WindowProgram {
                 }
                 Op::TokenDense { tokens, relu } => {
                     let forward = if *relu {
-                        layer_relu_forward_batch
+                        relu_forward_batch
                     } else {
                         affine_forward_batch
                     };
@@ -647,6 +648,13 @@ impl WindowProgram {
         }
         Ok(width / k)
     }
+}
+
+/// A token-wise ReLU layer's forward, `layer_activation_forward_batch`'s ReLU arm (which keeps no
+/// `z`): the window program's token-wise dense layers are ReLU (indrajala-ml's FFN activations
+/// workplan, D5).
+fn relu_forward_batch(w: &Array, x: &Array, b: &Array) -> Result<Array, Error> {
+    Ok(layer_activation_forward_batch(w, x, b, Activation::Relu)?.0)
 }
 
 /// A token-wise dense layer's pass: `a` `(N, T * in)` as `(N * T, in)` rows, `forward(w, rows, b)`,
@@ -958,7 +966,7 @@ impl WindowProgram {
             let p = &parameters[offsets[i]..];
             match &self.ops[i] {
                 Op::TokenDense { relu: true, .. } => {
-                    d = array_relu_mask(&d, &tape.activations[tape.outputs[i]])?;
+                    d = array_activation_mask(&d, &tape.activations[tape.outputs[i]], Activation::Relu)?;
                 }
                 Op::Attention {
                     heads,

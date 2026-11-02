@@ -8,8 +8,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use indrajala_math::activation::Activation;
 use indrajala_math::conv::{conv_forward_batch, max_pool_forward_batch, ConvGeometry};
-use indrajala_math::fused::layer_forward_batch;
+use indrajala_math::fused::{layer_activation_forward_batch, layer_activation_hidden_delta_batch, layer_forward_batch};
 use indrajala_math::generator::{Generator, SeedSequence};
 use indrajala_math::layer_norm::layer_norm_forward_batch;
 use indrajala_math::linalg::{matmul, matmul_add, matmul_long_k, matmul_nt, outer};
@@ -135,6 +136,27 @@ fn families() -> BTreeMap<&'static str, String> {
         f64::NEG_INFINITY,
     ]);
     out.insert("erf", hash(&[&erf(&Array::from_vector(values))]));
+
+    // each activation's fused forward (a and the kept z) and hidden delta, through the register
+    // tiles' tails, over pre-activations wide enough to reach erf's ranges and tanh's saturation
+    let (w, x, b) = (matrix(g, 37, 29), matrix(g, 13, 29), vector(g, 37));
+    let x = Array::from_matrix(x.data().iter().map(|v| v * 4.0).collect(), 13, 29);
+    let (next_w, next_delta) = (matrix(g, 11, 37), matrix(g, 13, 11));
+    for activation in [Activation::Relu, Activation::Gelu, Activation::GeluTanh] {
+        let (a, z) = layer_activation_forward_batch(&w, &x, &b, activation).unwrap();
+        let cached = z.as_ref().unwrap_or(&a);
+        let delta = layer_activation_hidden_delta_batch(&next_w, &next_delta, cached, activation).unwrap();
+        let mut arrays = vec![&a, &delta];
+        arrays.extend(z.as_ref());
+        out.insert(
+            match activation {
+                Activation::Relu => "activation relu forward and hidden delta 13 x 29 -> 37",
+                Activation::Gelu => "activation gelu forward and hidden delta 13 x 29 -> 37",
+                Activation::GeluTanh => "activation gelu_tanh forward and hidden delta 13 x 29 -> 37",
+            },
+            hash(&arrays),
+        );
+    }
     out
 }
 

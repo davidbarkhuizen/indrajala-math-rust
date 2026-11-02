@@ -76,7 +76,7 @@ pub(crate) fn features_per_token(tokens: usize, width: usize, context: &str) -> 
 /// `sigmoid`, so it agrees where `exp` does. A large `x` overflows `exp(2x)` to infinity and gives
 /// exactly 1; a large negative `x` exactly -1. Doubling is exact, and each pass rounds value by
 /// value, so the bits are the expression's.
-fn tanh_in_place(values: &mut [f64]) {
+pub(crate) fn tanh_in_place(values: &mut [f64]) {
     for v in values.iter_mut() {
         *v *= 2.0;
     }

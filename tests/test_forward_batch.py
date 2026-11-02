@@ -10,17 +10,25 @@ import pytest
 
 from indrajala_math_rust import (
     Array,
+    layer_activation_forward,
+    layer_activation_forward_batch,
     layer_dropout_forward,
     layer_dropout_forward_batch,
     layer_forward,
     layer_forward_batch,
-    layer_relu_forward,
-    layer_relu_forward_batch,
     layer_softmax_forward,
     layer_softmax_forward_batch,
     matmul_threads_for,
     set_matmul_threading,
 )
+
+
+def layer_relu_forward(w: Array, x: Array, b: Array) -> Array:
+    return layer_activation_forward(w, x, b, "relu")[0]
+
+
+def layer_relu_forward_batch(w: Array, x: Array, b: Array) -> Array:
+    return layer_activation_forward_batch(w, x, b, "relu")[0]
 
 
 def _sigmoid(z):

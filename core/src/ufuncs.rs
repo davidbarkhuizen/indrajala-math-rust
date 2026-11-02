@@ -1,8 +1,9 @@
 //! Elementwise functions over one array: `exp` (correctly rounded), ReLU, softmax and the masks
 //! the backward passes apply, `sum_axis0` and `argmax`.
 
+use crate::activation::Activation;
 use crate::array::{Array, Shape};
-use crate::fused::dropout_hidden_delta_from_downstream;
+use crate::fused::{activation_mask, dropout_hidden_delta_from_downstream};
 use crate::ops::same_shape_elementwise;
 use crate::scalar::{max, relu};
 use crate::Error;
@@ -76,28 +77,20 @@ pub fn array_relu(arr: &Array) -> Array {
     }
 }
 
-/// `downstream * (a > 0.0)` - ReLU's derivative mask, zeroing out the downstream gradient
-/// wherever this layer's own cached activation was <= 0 (`ReLUArrayLayer.compute_hidden_delta`/
-/// `compute_hidden_delta_batch`'s shared formula). Shape-agnostic (single-example 1D or batched
-/// 2D), so one function covers both call shapes.
-pub fn array_relu_mask(downstream: &Array, a: &Array) -> Result<Array, Error> {
-    if downstream.shape != a.shape {
-        return Err(Error::invalid(format!(
-            "array_relu_mask requires matching shapes, got {:?} and {:?}",
-            downstream.shape, a.shape
-        )));
-    }
-    Ok(Array {
-        data: same_shape_elementwise(&downstream.data, &a.data, |d, av| if av > 0.0 { d } else { 0.0 }),
-        shape: downstream.shape,
-    })
+/// `downstream * act'(cached)` - a hidden layer's delta from a downstream it was handed (before a
+/// layer with no `W` to read: a `LayerNorm`, a token-wise layer, a conv layer's next), the fused
+/// `layer_activation_hidden_delta*` ops' own elementwise step, so given the same downstream it
+/// computes their bits. `cached` is the layer's `a` for ReLU (the mask `a > 0`), its `z` for the
+/// GELUs ([`Activation::keeps_preactivation`]). Shape-agnostic (single-example 1D or batched 2D).
+pub fn array_activation_mask(downstream: &Array, cached: &Array, activation: Activation) -> Result<Array, Error> {
+    activation_mask(downstream, cached, activation, "array_activation_mask")
 }
 
 /// `downstream * a * (1 - a)` - the sigmoid's derivative applied to a downstream that a dense
 /// layer's fused `layer_hidden_delta*` can't compute, because the next layer has no `W` to read
 /// (a `LayerNorm`, or a residual fork whose body starts with one: indrajala-ml's layer-norm and
 /// attention workplan, D5). The fused ops' elementwise expression, in their grouping, so given the
-/// same downstream it computes their bits. Shape-agnostic, as `array_relu_mask`.
+/// same downstream it computes their bits. Shape-agnostic, as `array_activation_mask`.
 pub fn array_sigmoid_mask(downstream: &Array, a: &Array) -> Result<Array, Error> {
     if downstream.shape != a.shape {
         return Err(Error::invalid(format!(
@@ -139,7 +132,7 @@ pub fn array_dropout_mask(
 
 /// Numerically-stable softmax normalization - `SoftmaxArrayLayer.forward`/`forward_batch`'s own
 /// max-shift-then-exponentiate-then-normalize formula, validated directly against numpy
-/// independently of either array-based softmax class, the same way `array_relu`/`array_relu_mask`
+/// independently of either array-based softmax class, the same way `array_relu`/`array_activation_mask`
 /// are validated for ReLU. A 1D vector is normalized as one whole distribution (`forward`'s
 /// shape); a 2D matrix is normalized row-wise, one independent distribution per row
 /// (`forward_batch`'s shape) - general axis-parameterized reduction stays out of scope; this is

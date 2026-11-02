@@ -11,7 +11,11 @@ import struct
 import numpy as np
 import pytest
 
-from indrajala_math_rust import Array, array_relu, array_relu_mask
+from indrajala_math_rust import Array, array_activation_mask, array_relu
+
+
+def array_relu_mask(downstream: Array, a: Array) -> Array:
+    return array_activation_mask(downstream, a, "relu")
 
 
 def _to_flat_list(arr):

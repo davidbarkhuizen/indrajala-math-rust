@@ -5,12 +5,13 @@
 //! `indrajala_ml/model/layers/numpy/array_layer.py` method's formula exactly - see that file for the
 //! reference this crate is checked against.
 
+use crate::activation::Activation;
 use crate::array::{Array, Shape};
 use crate::generator::Generator;
 use crate::linalg::{matmul, matmul_add, matmul_nt};
 use crate::ops::same_shape_elementwise;
 use crate::random::draw_bernoulli_mask;
-use crate::scalar::{powi, relu};
+use crate::scalar::powi;
 use crate::ufuncs::{array_softmax, sum_axis0};
 use crate::Error;
 
@@ -515,59 +516,87 @@ pub fn layer_momentum_apply_accumulated_gradient(
     Ok((new_w, new_b, new_velocity_w, new_velocity_b))
 }
 
-/// `ReLUArrayLayer.forward`: `max(0, self.W @ x + self.b)`, `x`/`b` both 1D. Inlines
-/// `array_relu`'s own formula (`ufuncs.rs`) rather than calling it as a separate op, the same
-/// "one Rust call per layer method" discipline every other `fused.rs` function follows.
-pub fn layer_relu_forward(w: &Array, x: &Array, b: &Array) -> Result<Array, Error> {
-    let z = linear_preactivation(w, x, b)?;
-    Ok(Array {
-        data: z.data.iter().map(|&v| relu(v)).collect(),
+/// The forward of a hidden dense layer with `activation` (`ReLUArrayLayer.forward` and its GELU
+/// twins): `act(self.W @ x + self.b)`, `x`/`b` both 1D, in one call. Returns `(a, z)`, `z` the
+/// pre-activation when the activation's derivative reads it
+/// ([`Activation::keeps_preactivation`], the GELUs), else `None` (ReLU, whose arithmetic is
+/// `max(0, z)` by [`crate::scalar::relu`] as it always was).
+pub fn layer_activation_forward(
+    w: &Array,
+    x: &Array,
+    b: &Array,
+    activation: Activation,
+) -> Result<(Array, Option<Array>), Error> {
+    Ok(activated(linear_preactivation(w, x, b)?, activation))
+}
+
+/// `layer_activation_forward`, batched: `act(X @ self.W.T + self.b)`, `X` 2D (`batch,
+/// input_size`).
+pub fn layer_activation_forward_batch(
+    w: &Array,
+    x: &Array,
+    b: &Array,
+    activation: Activation,
+) -> Result<(Array, Option<Array>), Error> {
+    Ok(activated(linear_preactivation_batch(w, x, b)?, activation))
+}
+
+/// `(act(z), z)` if the activation keeps `z`, else `(act(z), None)`, moving `z` rather than
+/// copying it.
+fn activated(z: Array, activation: Activation) -> (Array, Option<Array>) {
+    let a = Array {
+        data: activation.apply(&z.data),
         shape: z.shape,
+    };
+    if activation.keeps_preactivation() {
+        (a, Some(z))
+    } else {
+        (a, None)
+    }
+}
+
+/// `downstream * act'(cached)`, shape-checked: the hidden deltas' last step, shared by every
+/// `layer_activation_hidden_delta*` below and `ufuncs.rs`'s `array_activation_mask`. `cached` is
+/// the layer's `a` for ReLU, its `z` for the GELUs.
+pub(crate) fn activation_mask(
+    downstream: &Array,
+    cached: &Array,
+    activation: Activation,
+    context: &str,
+) -> Result<Array, Error> {
+    require_same_shape(downstream, cached, context)?;
+    Ok(Array {
+        data: activation.mask(&downstream.data, &cached.data),
+        shape: cached.shape,
     })
 }
 
-/// `ReLUArrayLayer.forward_batch`: `max(0, X @ self.W.T + self.b)`, `X` 2D (`batch, input_size`).
-pub fn layer_relu_forward_batch(w: &Array, x: &Array, b: &Array) -> Result<Array, Error> {
-    let z = linear_preactivation_batch(w, x, b)?;
-    Ok(Array {
-        data: z.data.iter().map(|&v| relu(v)).collect(),
-        shape: z.shape,
-    })
+/// The hidden delta of a dense layer with `activation`: `(next_layer.W.T @ next_layer.delta) *
+/// act'(cached)`, single-example (`next_delta`/`cached` both 1D); `cached` is what
+/// `layer_activation_forward` kept, `a` for ReLU (its mask `a > 0`), `z` for the GELUs.
+pub fn layer_activation_hidden_delta(
+    next_w: &Array,
+    next_delta: &Array,
+    cached: &Array,
+    activation: Activation,
+) -> Result<Array, Error> {
+    let context = "layer_activation_hidden_delta";
+    let downstream = hidden_downstream(next_w, next_delta, cached, context)?;
+    activation_mask(&downstream, cached, activation, context)
 }
 
-/// `ReLUArrayLayer.compute_hidden_delta`: `(next_layer.W.T @ next_layer.delta) * (self.a > 0.0)` -
-/// inlines `array_relu_mask`'s own formula rather than calling it as a separate op, single-example
-/// (`next_delta`/`a` both 1D).
-pub fn layer_relu_hidden_delta(next_w: &Array, next_delta: &Array, a: &Array) -> Result<Array, Error> {
-    let downstream = hidden_downstream(next_w, next_delta, a, "layer_relu_hidden_delta")?;
-    let data = downstream
-        .data
-        .iter()
-        .zip(a.data.iter())
-        .map(|(&d, &av)| if av > 0.0 { d } else { 0.0 })
-        .collect();
-    Ok(Array { data, shape: a.shape })
-}
-
-/// `ReLUArrayLayer.compute_hidden_delta_batch`: `(next_layer.delta_batch @ next_layer.W) *
-/// (self.A > 0.0)` - batched, no transpose on `next_w` (same shape-of-call-sites distinction
-/// `layer_hidden_delta_batch` itself already documents).
-pub fn layer_relu_hidden_delta_batch(
+/// `layer_activation_hidden_delta`, batched: `(next_layer.delta_batch @ next_layer.W) *
+/// act'(cached_batch)`, no transpose on `next_w` (the shape-of-call-sites distinction
+/// `layer_hidden_delta_batch` documents).
+pub fn layer_activation_hidden_delta_batch(
     next_w: &Array,
     next_delta_batch: &Array,
-    a_batch: &Array,
+    cached_batch: &Array,
+    activation: Activation,
 ) -> Result<Array, Error> {
-    let downstream = hidden_downstream_batch(next_w, next_delta_batch, a_batch, "layer_relu_hidden_delta_batch")?;
-    let data = downstream
-        .data
-        .iter()
-        .zip(a_batch.data.iter())
-        .map(|(&d, &av)| if av > 0.0 { d } else { 0.0 })
-        .collect();
-    Ok(Array {
-        data,
-        shape: a_batch.shape,
-    })
+    let context = "layer_activation_hidden_delta_batch";
+    let downstream = hidden_downstream_batch(next_w, next_delta_batch, cached_batch, context)?;
+    activation_mask(&downstream, cached_batch, activation, context)
 }
 
 /// `SoftmaxArrayLayer.forward`: `array_softmax(self.W @ x + self.b)`, `x`/`b` both 1D. Reuses
@@ -707,7 +736,7 @@ pub fn layer_dropout_hidden_delta(
 }
 
 /// `DropoutArrayLayer.compute_hidden_delta_batch`: batched, no transpose on `next_w` (same
-/// shape-of-call-sites distinction `layer_hidden_delta_batch`/`layer_relu_hidden_delta_batch`
+/// shape-of-call-sites distinction `layer_hidden_delta_batch`/`layer_activation_hidden_delta_batch`
 /// already document).
 pub fn layer_dropout_hidden_delta_batch(
     next_w: &Array,
@@ -816,35 +845,35 @@ pub fn layer_hidden_delta_skip_batch(
     })
 }
 
-/// `ReLUArrayLayer.compute_hidden_delta` when the next layer is a residual block's fork: `(body_w.T
-/// @ body_delta + skip) * (self.a > 0.0)`, `layer_relu_hidden_delta` with the skip term.
-pub fn layer_relu_hidden_delta_skip(
+/// The hidden delta of a dense layer with `activation` when the next layer is a residual block's
+/// fork: `(body_w.T @ body_delta + skip) * act'(cached)`, `layer_activation_hidden_delta` with the
+/// skip term.
+pub fn layer_activation_hidden_delta_skip(
     body_w: &Array,
     body_delta: &Array,
     skip: &Array,
-    a: &Array,
+    cached: &Array,
+    activation: Activation,
 ) -> Result<Array, Error> {
-    let downstream = hidden_downstream(body_w, body_delta, a, "layer_relu_hidden_delta_skip")?;
-    let downstream = with_skip(downstream, skip, "layer_relu_hidden_delta_skip")?;
-    let data = same_shape_elementwise(&downstream.data, &a.data, |d, av| if av > 0.0 { d } else { 0.0 });
-    Ok(Array { data, shape: a.shape })
+    let context = "layer_activation_hidden_delta_skip";
+    let downstream = hidden_downstream(body_w, body_delta, cached, context)?;
+    let downstream = with_skip(downstream, skip, context)?;
+    activation_mask(&downstream, cached, activation, context)
 }
 
-/// `layer_relu_hidden_delta_skip`, batched: `(body_delta_batch @ body_w + skip_batch) * (self.A >
-/// 0.0)`.
-pub fn layer_relu_hidden_delta_skip_batch(
+/// `layer_activation_hidden_delta_skip`, batched: `(body_delta_batch @ body_w + skip_batch) *
+/// act'(cached_batch)`.
+pub fn layer_activation_hidden_delta_skip_batch(
     body_w: &Array,
     body_delta_batch: &Array,
     skip_batch: &Array,
-    a_batch: &Array,
+    cached_batch: &Array,
+    activation: Activation,
 ) -> Result<Array, Error> {
-    let downstream = hidden_downstream_batch(body_w, body_delta_batch, a_batch, "layer_relu_hidden_delta_skip_batch")?;
-    let downstream = with_skip(downstream, skip_batch, "layer_relu_hidden_delta_skip_batch")?;
-    let data = same_shape_elementwise(&downstream.data, &a_batch.data, |d, av| if av > 0.0 { d } else { 0.0 });
-    Ok(Array {
-        data,
-        shape: a_batch.shape,
-    })
+    let context = "layer_activation_hidden_delta_skip_batch";
+    let downstream = hidden_downstream_batch(body_w, body_delta_batch, cached_batch, context)?;
+    let downstream = with_skip(downstream, skip_batch, context)?;
+    activation_mask(&downstream, cached_batch, activation, context)
 }
 
 /// `DropoutArrayLayer.compute_hidden_delta` when the next layer is a residual block's fork:
