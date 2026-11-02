@@ -166,7 +166,7 @@ fn deltas_by_channel(delta: &Array, n: usize, o: usize, p: usize) -> Array {
 /// adding `b` and applying the ReLU as it goes. Returns `(A, cols)`, `A` a vector when `X` is one,
 /// `cols` always `(N*P, C*k*k)`: `cols` is kept by the caller for `conv_accumulate_gradient_batch`,
 /// as `ConvArrayLayer._cols` is. The pre-activation `Z` is never stored: nothing in the backward
-/// pass reads it (`array_relu_mask` masks on `A`).
+/// pass reads it (`array_activation_mask` masks on `A`).
 ///
 /// Per example, not over the whole batch:
 /// at N = 32 the whole-batch `cols`, product and `A` are 1.4-1.6 MB each, past L2, and zeroing

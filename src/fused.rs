@@ -6,6 +6,7 @@ use pyo3::prelude::*;
 use crate::array::RustArray;
 use crate::generator::Generator;
 use crate::linalg::py_err;
+use indrajala_math::activation::Activation;
 #[allow(unused_imports)]
 pub(crate) use indrajala_math::fused::*;
 
@@ -289,44 +290,76 @@ pub fn layer_momentum_apply_accumulated_gradient(
     .map_err(py_err)
 }
 
-/// `ReLUArrayLayer.forward`: `max(0, self.W @ x + self.b)`, `x`/`b` both 1D. Inlines
-/// `array_relu`'s own formula (`ufuncs.rs`) rather than calling it as a separate op, the same
-/// "one Rust call per layer method" discipline every other `fused.rs` function follows.
+/// The activation by name (`"relu"`, `"gelu"`, `"gelu_tanh"`), a `ValueError` otherwise.
+pub(crate) fn activation_named(name: &str) -> PyResult<Activation> {
+    Activation::from_name(name).map_err(py_err)
+}
+
+/// `(a, z | None)` into Python.
+fn with_preactivation(
+    (a, z): (indrajala_math::Array, Option<indrajala_math::Array>),
+) -> (RustArray, Option<RustArray>) {
+    (RustArray::from(a), z.map(RustArray::from))
+}
+
+/// A hidden dense layer's forward with `activation` (`"relu"`, `"gelu"`, `"gelu_tanh"`):
+/// `act(self.W @ x + self.b)`, `x`/`b` both 1D, in one call. Returns `(a, z)`, `z` the
+/// pre-activation for the GELUs (their derivative reads it) and `None` for ReLU.
 #[pyfunction]
-pub fn layer_relu_forward(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
-    indrajala_math::fused::layer_relu_forward(w, x, b)
+pub fn layer_activation_forward(
+    w: &RustArray,
+    x: &RustArray,
+    b: &RustArray,
+    activation: &str,
+) -> PyResult<(RustArray, Option<RustArray>)> {
+    let activation = activation_named(activation)?;
+    indrajala_math::fused::layer_activation_forward(w, x, b, activation)
+        .map(with_preactivation)
+        .map_err(py_err)
+}
+
+/// `layer_activation_forward`, batched: `act(X @ self.W.T + self.b)`, `X` 2D (`batch,
+/// input_size`).
+#[pyfunction]
+pub fn layer_activation_forward_batch(
+    w: &RustArray,
+    x: &RustArray,
+    b: &RustArray,
+    activation: &str,
+) -> PyResult<(RustArray, Option<RustArray>)> {
+    let activation = activation_named(activation)?;
+    indrajala_math::fused::layer_activation_forward_batch(w, x, b, activation)
+        .map(with_preactivation)
+        .map_err(py_err)
+}
+
+/// A hidden dense layer's delta: `(next_layer.W.T @ next_layer.delta) * act'(cached)`,
+/// single-example; `cached` is what the forward kept, `a` for ReLU (its mask `a > 0`), `z` for the
+/// GELUs.
+#[pyfunction]
+pub fn layer_activation_hidden_delta(
+    next_w: &RustArray,
+    next_delta: &RustArray,
+    cached: &RustArray,
+    activation: &str,
+) -> PyResult<RustArray> {
+    let activation = activation_named(activation)?;
+    indrajala_math::fused::layer_activation_hidden_delta(next_w, next_delta, cached, activation)
         .map(RustArray::from)
         .map_err(py_err)
 }
 
-/// `ReLUArrayLayer.forward_batch`: `max(0, X @ self.W.T + self.b)`, `X` 2D (`batch, input_size`).
+/// `layer_activation_hidden_delta`, batched: `(next_layer.delta_batch @ next_layer.W) *
+/// act'(cached_batch)`, no transpose on `next_w`.
 #[pyfunction]
-pub fn layer_relu_forward_batch(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
-    indrajala_math::fused::layer_relu_forward_batch(w, x, b)
-        .map(RustArray::from)
-        .map_err(py_err)
-}
-
-/// `ReLUArrayLayer.compute_hidden_delta`: `(next_layer.W.T @ next_layer.delta) * (self.a > 0.0)` -
-/// inlines `array_relu_mask`'s own formula rather than calling it as a separate op, single-example
-/// (`next_delta`/`a` both 1D).
-#[pyfunction]
-pub fn layer_relu_hidden_delta(next_w: &RustArray, next_delta: &RustArray, a: &RustArray) -> PyResult<RustArray> {
-    indrajala_math::fused::layer_relu_hidden_delta(next_w, next_delta, a)
-        .map(RustArray::from)
-        .map_err(py_err)
-}
-
-/// `ReLUArrayLayer.compute_hidden_delta_batch`: `(next_layer.delta_batch @ next_layer.W) *
-/// (self.A > 0.0)` - batched, no transpose on `next_w` (same shape-of-call-sites distinction
-/// `layer_hidden_delta_batch` itself already documents).
-#[pyfunction]
-pub fn layer_relu_hidden_delta_batch(
+pub fn layer_activation_hidden_delta_batch(
     next_w: &RustArray,
     next_delta_batch: &RustArray,
-    a_batch: &RustArray,
+    cached_batch: &RustArray,
+    activation: &str,
 ) -> PyResult<RustArray> {
-    indrajala_math::fused::layer_relu_hidden_delta_batch(next_w, next_delta_batch, a_batch)
+    let activation = activation_named(activation)?;
+    indrajala_math::fused::layer_activation_hidden_delta_batch(next_w, next_delta_batch, cached_batch, activation)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -454,7 +487,7 @@ pub fn layer_dropout_hidden_delta(
 }
 
 /// `DropoutArrayLayer.compute_hidden_delta_batch`: batched, no transpose on `next_w` (same
-/// shape-of-call-sites distinction `layer_hidden_delta_batch`/`layer_relu_hidden_delta_batch`
+/// shape-of-call-sites distinction `layer_hidden_delta_batch`/`layer_activation_hidden_delta_batch`
 /// already document).
 #[pyfunction]
 pub fn layer_dropout_hidden_delta_batch(
@@ -526,32 +559,42 @@ pub fn layer_hidden_delta_skip_batch(
         .map_err(py_err)
 }
 
-/// `ReLUArrayLayer.compute_hidden_delta` when the next layer is a residual block's fork: `(body_w.T
-/// @ body_delta + skip) * (self.a > 0.0)`, `layer_relu_hidden_delta` with the skip term.
+/// A hidden dense layer's delta when the next layer is a residual block's fork: `(body_w.T @
+/// body_delta + skip) * act'(cached)`, `layer_activation_hidden_delta` with the skip term.
 #[pyfunction]
-pub fn layer_relu_hidden_delta_skip(
+pub fn layer_activation_hidden_delta_skip(
     body_w: &RustArray,
     body_delta: &RustArray,
     skip: &RustArray,
-    a: &RustArray,
+    cached: &RustArray,
+    activation: &str,
 ) -> PyResult<RustArray> {
-    indrajala_math::fused::layer_relu_hidden_delta_skip(body_w, body_delta, skip, a)
+    let activation = activation_named(activation)?;
+    indrajala_math::fused::layer_activation_hidden_delta_skip(body_w, body_delta, skip, cached, activation)
         .map(RustArray::from)
         .map_err(py_err)
 }
 
-/// `layer_relu_hidden_delta_skip`, batched: `(body_delta_batch @ body_w + skip_batch) * (self.A >
-/// 0.0)`.
+/// `layer_activation_hidden_delta_skip`, batched: `(body_delta_batch @ body_w + skip_batch) *
+/// act'(cached_batch)`.
 #[pyfunction]
-pub fn layer_relu_hidden_delta_skip_batch(
+pub fn layer_activation_hidden_delta_skip_batch(
     body_w: &RustArray,
     body_delta_batch: &RustArray,
     skip_batch: &RustArray,
-    a_batch: &RustArray,
+    cached_batch: &RustArray,
+    activation: &str,
 ) -> PyResult<RustArray> {
-    indrajala_math::fused::layer_relu_hidden_delta_skip_batch(body_w, body_delta_batch, skip_batch, a_batch)
-        .map(RustArray::from)
-        .map_err(py_err)
+    let activation = activation_named(activation)?;
+    indrajala_math::fused::layer_activation_hidden_delta_skip_batch(
+        body_w,
+        body_delta_batch,
+        skip_batch,
+        cached_batch,
+        activation,
+    )
+    .map(RustArray::from)
+    .map_err(py_err)
 }
 
 /// `DropoutArrayLayer.compute_hidden_delta` when the next layer is a residual block's fork:

@@ -16,6 +16,10 @@ from indrajala_math_rust import (
     affine_forward,
     affine_forward_batch,
     exp,
+    layer_activation_hidden_delta,
+    layer_activation_hidden_delta_batch,
+    layer_activation_hidden_delta_skip,
+    layer_activation_hidden_delta_skip_batch,
     layer_downstream,
     layer_downstream_batch,
     layer_dropout_hidden_delta,
@@ -28,11 +32,24 @@ from indrajala_math_rust import (
     layer_hidden_delta_batch,
     layer_hidden_delta_skip,
     layer_hidden_delta_skip_batch,
-    layer_relu_hidden_delta,
-    layer_relu_hidden_delta_batch,
-    layer_relu_hidden_delta_skip,
-    layer_relu_hidden_delta_skip_batch,
 )
+
+
+def layer_relu_hidden_delta(w: Array, delta: Array, a: Array) -> Array:
+    return layer_activation_hidden_delta(w, delta, a, "relu")
+
+
+def layer_relu_hidden_delta_batch(w: Array, delta: Array, a: Array) -> Array:
+    return layer_activation_hidden_delta_batch(w, delta, a, "relu")
+
+
+def layer_relu_hidden_delta_skip(w: Array, delta: Array, skip: Array, a: Array) -> Array:
+    return layer_activation_hidden_delta_skip(w, delta, skip, a, "relu")
+
+
+def layer_relu_hidden_delta_skip_batch(w: Array, delta: Array, skip: Array, a: Array) -> Array:
+    return layer_activation_hidden_delta_skip_batch(w, delta, skip, a, "relu")
+
 
 # (body size, size): the body's first layer's size and the block's
 SIZES = [(1, 1), (3, 2), (8, 5), (33, 7)]

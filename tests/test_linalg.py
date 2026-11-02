@@ -21,17 +21,21 @@ from indrajala_math_rust import (
     conv_forward_batch,
     layer_accumulate_gradient,
     layer_accumulate_gradient_batch,
+    layer_activation_forward_batch,
     layer_adam_apply_accumulated_gradient,
     layer_apply_accumulated_gradient,
     layer_l2_apply_accumulated_gradient,
     layer_momentum_apply_accumulated_gradient,
-    layer_relu_forward_batch,
     layer_sgd_step,
     matmul_threads_for,
     outer,
     set_matmul_threading,
     sum_axis0,
 )
+
+
+def layer_relu_forward_batch(w: Array, x: Array, b: Array) -> Array:
+    return layer_activation_forward_batch(w, x, b, "relu")[0]
 
 
 def _to_numpy(arr):

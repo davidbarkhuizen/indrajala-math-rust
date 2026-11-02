@@ -25,7 +25,7 @@ from indrajala_math_rust import (
     WindowProgram,
     affine_forward_batch,
     argmax_token_rows,
-    array_relu_mask,
+    array_activation_mask,
     attention_accumulate_gradient_batch,
     attention_downstream_batch,
     attention_forward_batch,
@@ -34,11 +34,11 @@ from indrajala_math_rust import (
     embedding_accumulate_gradient,
     embedding_forward,
     layer_accumulate_gradient_batch,
+    layer_activation_forward_batch,
     layer_downstream_batch,
     layer_norm_accumulate_gradient_batch,
     layer_norm_downstream_batch,
     layer_norm_forward_batch,
-    layer_relu_forward_batch,
     layer_softmax_forward_batch,
     matmul_threads_for,
     recurrence_step_backward,
@@ -51,6 +51,15 @@ from indrajala_math_rust import (
     window_program_forward,
     window_program_learn,
 )
+
+
+def layer_relu_forward_batch(w: Array, x: Array, b: Array) -> Array:
+    return layer_activation_forward_batch(w, x, b, "relu")[0]
+
+
+def array_relu_mask(downstream: Array, a: Array) -> Array:
+    return array_activation_mask(downstream, a, "relu")
+
 
 # each factor's (state size, codes; None for a continuous factor)
 type Factors = list[tuple[int, int | None]]

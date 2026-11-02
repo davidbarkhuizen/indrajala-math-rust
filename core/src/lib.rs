@@ -20,6 +20,7 @@
 //! # Ok::<(), indrajala_math::Error>(())
 //! ```
 
+pub mod activation;
 mod array;
 pub mod attention;
 pub mod batch_norm;

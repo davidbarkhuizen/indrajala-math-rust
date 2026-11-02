@@ -4,6 +4,7 @@
 use pyo3::prelude::*;
 
 use crate::array::RustArray;
+use crate::fused::activation_named;
 use crate::linalg::py_err;
 #[allow(unused_imports)]
 pub(crate) use indrajala_math::ufuncs::*;
@@ -64,13 +65,14 @@ pub fn array_relu(arr: &RustArray) -> RustArray {
     RustArray::from(indrajala_math::ufuncs::array_relu(arr))
 }
 
-/// `downstream * (a > 0.0)` - ReLU's derivative mask, zeroing out the downstream gradient
-/// wherever this layer's own cached activation was <= 0 (`ReLUArrayLayer.compute_hidden_delta`/
-/// `compute_hidden_delta_batch`'s shared formula). Shape-agnostic (single-example 1D or batched
-/// 2D), so one function covers both call shapes.
+/// `downstream * act'(cached)` - a hidden layer's delta from a downstream it was handed (before a
+/// layer with no `W` to read), the fused `layer_activation_hidden_delta*` ops' own elementwise
+/// step. `cached` is the layer's `a` for ReLU (the mask `a > 0`), its `z` for the GELUs;
+/// `activation` is `"relu"`, `"gelu"` or `"gelu_tanh"`. Shape-agnostic.
 #[pyfunction]
-pub fn array_relu_mask(downstream: &RustArray, a: &RustArray) -> PyResult<RustArray> {
-    indrajala_math::ufuncs::array_relu_mask(downstream, a)
+pub fn array_activation_mask(downstream: &RustArray, cached: &RustArray, activation: &str) -> PyResult<RustArray> {
+    let activation = activation_named(activation)?;
+    indrajala_math::ufuncs::array_activation_mask(downstream, cached, activation)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -79,7 +81,7 @@ pub fn array_relu_mask(downstream: &RustArray, a: &RustArray) -> PyResult<RustAr
 /// layer's fused `layer_hidden_delta*` can't compute, because the next layer has no `W` to read
 /// (a `LayerNorm`, or a residual fork whose body starts with one: indrajala-ml's layer-norm and
 /// attention workplan, D5). The fused ops' elementwise expression, in their grouping, so given the
-/// same downstream it computes their bits. Shape-agnostic, as `array_relu_mask`.
+/// same downstream it computes their bits. Shape-agnostic, as `array_activation_mask`.
 #[pyfunction]
 pub fn array_sigmoid_mask(downstream: &RustArray, a: &RustArray) -> PyResult<RustArray> {
     indrajala_math::ufuncs::array_sigmoid_mask(downstream, a)
@@ -106,7 +108,7 @@ pub fn array_dropout_mask(
 
 /// Numerically-stable softmax normalization - `SoftmaxArrayLayer.forward`/`forward_batch`'s own
 /// max-shift-then-exponentiate-then-normalize formula, validated directly against numpy
-/// independently of either array-based softmax class, the same way `array_relu`/`array_relu_mask`
+/// independently of either array-based softmax class, the same way `array_relu`/`array_activation_mask`
 /// are validated for ReLU. A 1D vector is normalized as one whole distribution (`forward`'s
 /// shape); a 2D matrix is normalized row-wise, one independent distribution per row
 /// (`forward_batch`'s shape) - general axis-parameterized reduction stays out of scope; this is
