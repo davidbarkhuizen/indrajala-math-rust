@@ -555,8 +555,7 @@ fn activated(z: Array, activation: Activation) -> (Array, Option<Array>) {
     }
 }
 
-/// `downstream * act'(cached)`, shape-checked: the hidden deltas' last step, shared by every
-/// `layer_activation_hidden_delta*` below and `ufuncs.rs`'s `array_activation_mask`. `cached` is
+/// `downstream * act'(cached)`, shape-checked: `ufuncs.rs`'s `array_activation_mask`. `cached` is
 /// the layer's `a` for ReLU, its `z` for the GELUs.
 pub(crate) fn activation_mask(
     downstream: &Array,
@@ -565,10 +564,16 @@ pub(crate) fn activation_mask(
     context: &str,
 ) -> Result<Array, Error> {
     require_same_shape(downstream, cached, context)?;
-    Ok(Array {
+    Ok(masked(downstream, cached, activation))
+}
+
+/// `downstream * act'(cached)` for a downstream whose shape `hidden_downstream*` (and `with_skip`)
+/// already checked against `cached`: the hidden deltas' last step, no second check.
+fn masked(downstream: &Array, cached: &Array, activation: Activation) -> Array {
+    Array {
         data: activation.mask(&downstream.data, &cached.data),
         shape: cached.shape,
-    })
+    }
 }
 
 /// The hidden delta of a dense layer with `activation`: `(next_layer.W.T @ next_layer.delta) *
@@ -582,7 +587,7 @@ pub fn layer_activation_hidden_delta(
 ) -> Result<Array, Error> {
     let context = "layer_activation_hidden_delta";
     let downstream = hidden_downstream(next_w, next_delta, cached, context)?;
-    activation_mask(&downstream, cached, activation, context)
+    Ok(masked(&downstream, cached, activation))
 }
 
 /// `layer_activation_hidden_delta`, batched: `(next_layer.delta_batch @ next_layer.W) *
@@ -596,7 +601,7 @@ pub fn layer_activation_hidden_delta_batch(
 ) -> Result<Array, Error> {
     let context = "layer_activation_hidden_delta_batch";
     let downstream = hidden_downstream_batch(next_w, next_delta_batch, cached_batch, context)?;
-    activation_mask(&downstream, cached_batch, activation, context)
+    Ok(masked(&downstream, cached_batch, activation))
 }
 
 /// `SoftmaxArrayLayer.forward`: `array_softmax(self.W @ x + self.b)`, `x`/`b` both 1D. Reuses
@@ -858,7 +863,7 @@ pub fn layer_activation_hidden_delta_skip(
     let context = "layer_activation_hidden_delta_skip";
     let downstream = hidden_downstream(body_w, body_delta, cached, context)?;
     let downstream = with_skip(downstream, skip, context)?;
-    activation_mask(&downstream, cached, activation, context)
+    Ok(masked(&downstream, cached, activation))
 }
 
 /// `layer_activation_hidden_delta_skip`, batched: `(body_delta_batch @ body_w + skip_batch) *
@@ -873,7 +878,7 @@ pub fn layer_activation_hidden_delta_skip_batch(
     let context = "layer_activation_hidden_delta_skip_batch";
     let downstream = hidden_downstream_batch(body_w, body_delta_batch, cached_batch, context)?;
     let downstream = with_skip(downstream, skip_batch, context)?;
-    activation_mask(&downstream, cached_batch, activation, context)
+    Ok(masked(&downstream, cached_batch, activation))
 }
 
 /// `DropoutArrayLayer.compute_hidden_delta` when the next layer is a residual block's fork:
