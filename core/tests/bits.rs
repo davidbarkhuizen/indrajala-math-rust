@@ -9,7 +9,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use indrajala_math::activation::Activation;
-use indrajala_math::attention::{attention_downstream_batch, attention_forward_batch};
+use indrajala_math::attention::{
+    attention_downstream_batch, attention_forward_batch, cross_attention_downstream_batch,
+    cross_attention_forward_batch,
+};
 use indrajala_math::conv::{conv_forward_batch, max_pool_forward_batch, ConvGeometry};
 use indrajala_math::fused::{
     gated_delta_batch, gated_forward_batch, layer_activation_forward_batch, layer_activation_hidden_delta_batch,
@@ -248,6 +251,76 @@ fn families() -> BTreeMap<&'static str, String> {
             hash(&[&a, &q, &k, &v, &h, &m, &l, &dx, &dq, &dk, &dv]),
         );
     }
+
+    // cross-attention's forward and downstream (indrajala-ml's cross-attention workplan, D3, D13):
+    // 29 queries of 8 features on a memory of 37 tokens of 12, over three key blocks, 4 query heads
+    // sharing 2, with packed pairs' segments on both sides and pads, so some queries read no key
+    let (memory_tokens, d_m, key_value_heads, queries) = (37, 12, 2, 29);
+    let x = matrix(g, examples, queries * d);
+    let memory = matrix(g, examples, memory_tokens * d_m);
+    let delta = matrix(g, examples, queries * d);
+    let (width, kv_width) = (heads * d_k, key_value_heads * d_k);
+    let (wq, bq) = (matrix(g, width, d), vector(g, width));
+    let (wk, bk) = (matrix(g, kv_width, d_m), vector(g, kv_width));
+    let (wv, bv) = (matrix(g, kv_width, d_m), vector(g, kv_width));
+    let (wo, bo) = (matrix(g, d, width), vector(g, d));
+    let ids = |pads: usize, lengths: &[usize], tokens: usize| {
+        let mut row = vec![0.0; pads];
+        for (k, &n) in lengths.iter().enumerate() {
+            row.extend(std::iter::repeat_n((k + 1) as f64, n));
+        }
+        row.resize(tokens, 0.0);
+        row
+    };
+    let mut segments = ids(3, &[10, 6, 10], queries);
+    segments.extend(ids(0, &[20, 9], queries));
+    let mut memory_segments = ids(0, &[12, 15, 10], memory_tokens);
+    memory_segments.extend(ids(5, &[14, 18], memory_tokens));
+    let (segments, memory_segments) = (
+        Array::from_matrix(segments, examples, queries),
+        Array::from_matrix(memory_segments, examples, memory_tokens),
+    );
+    let (a, q, k, v, h, m, l, _) = cross_attention_forward_batch(
+        &x,
+        &memory,
+        &wq,
+        &bq,
+        &wk,
+        &bk,
+        &wv,
+        &bv,
+        &wo,
+        &bo,
+        heads,
+        key_value_heads,
+        0.0,
+        false,
+        None,
+        Some(&segments),
+        Some(&memory_segments),
+        16,
+    )
+    .unwrap();
+    let (dx, dm, dq, dk, dv) = cross_attention_downstream_batch(
+        &delta,
+        &wq,
+        &wk,
+        &wv,
+        &wo,
+        [&q, &k, &v, &h, &m, &l],
+        heads,
+        key_value_heads,
+        Some(&segments),
+        Some(&memory_segments),
+        0.0,
+        None,
+        16,
+    )
+    .unwrap();
+    out.insert(
+        "cross-attention forward and downstream 2 x 29 x 8 on 37 x 12, 4 heads sharing 2",
+        hash(&[&a, &q, &k, &v, &h, &m, &l, &dx, &dm, &dq, &dk, &dv]),
+    );
     out
 }
 

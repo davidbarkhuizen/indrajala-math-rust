@@ -59,6 +59,15 @@ they merge, then move them into the release notes at release time and empty this
   and the caches `k`, `v` (and `dk`, `dv`, `attention_step`'s `k_cache`, `v_cache`) are `g * d_k`
   wide, query head `i` reading key/value head `i // (heads / g)`; `g = 1` is multi-query
   attention. `None` means `heads`: every existing call is unchanged, with the same bits.
+- **Cross-attention** (indrajala-ml's cross-attention workplan, D3, D11, D13):
+  `cross_attention_forward_batch`, `cross_attention_downstream_batch` and
+  `cross_attention_accumulate_gradient_batch`. The queries come from `x`, `(N, T * d)`, and the keys
+  and values from `memory`, `(N, S * d_m)`, so `wk` and `wv` are `(g * d_k, d_m)`. The ops are never
+  causal and never rotary. With `segments` and `memory_segments` (both or neither), a query reads
+  only its own segment's keys, with no own-column exception, so a pad's query reads no key: its `h`
+  is 0 and its output is `bo`. The downstream returns `(dx, dm, dq, dk, dv)`, where
+  `dm = dK Wk + dV Wv` is the memory's gradient as `(N * S, d_m)` rows. Self-attention's bits are
+  unchanged.
 - **`erf`** (#89), a port of fdlibm's `s_erf.c` through the correctly rounded `exp`. It is within
   one ulp, but not correctly rounded.
 

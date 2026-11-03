@@ -7,6 +7,7 @@ attention forward and downstream 2 x 37 x 8, 4 heads	3e8fb83079d7cec5 10064
 attention forward and downstream 2 x 37 x 8, 4 heads sharing 1	99680e99e104b7af 6512
 attention forward and downstream 2 x 37 x 8, 4 heads sharing 2	1f0fb246b8aa05d3 7696
 conv_forward_batch 28 x 28, 8 ch	b4abbedea4f28a53 34476
+cross-attention forward and downstream 2 x 29 x 8 on 37 x 12, 4 heads sharing 2	04e6d502c86b6b78 7432
 erf	d4109e9ea058f426 1012
 exp	1ccc2021d0ddd6e2 1009
 gated gelu forward and delta 13 x 29 -> 17	18836c99f1a25c70 1105

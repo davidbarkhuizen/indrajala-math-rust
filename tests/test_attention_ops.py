@@ -126,10 +126,19 @@ def key_blocks(keys: int, block: int, origin: int = 0) -> list[tuple[int, int]]:
 
 
 class Masking:
-    """One example's: causal (key u at most query t's column t + offset) and by segment ids."""
+    """
+    One example's: causal (key u at most query t's column t + offset) and by segment ids, the own
+    column always allowed unless not own_column (cross-attention's two sequences).
+    """
 
-    def __init__(self, causal: bool, offset: int = 0, segments: tuple[np.ndarray, np.ndarray] | None = None):
-        self.causal, self.offset, self.segments = causal, offset, segments
+    def __init__(
+        self,
+        causal: bool,
+        offset: int = 0,
+        segments: tuple[np.ndarray, np.ndarray] | None = None,
+        own_column: bool = True,
+    ):
+        self.causal, self.offset, self.segments, self.own_column = causal, offset, segments, own_column
 
     def allowed(self, t: int, u: int) -> bool:
         column = t + self.offset
@@ -138,7 +147,7 @@ class Masking:
         if self.segments is None:
             return True
         queries, keys = self.segments
-        return u == column or (keys[u] == queries[t] and keys[u] != 0.0)
+        return (self.own_column and u == column) or (keys[u] == queries[t] and keys[u] != 0.0)
 
     def rows(self, queries: int, k0: int, k1: int, skip: bool = True) -> tuple[int, int] | None:
         if not skip:
@@ -230,8 +239,10 @@ def tiled_forward(
                 for r in range(r1 - r0):
                     at = n * queries + r0 + r
                     h[at, cols] = h[at, cols] * alphas[r] + ev[r]
+    # a row no key is allowed to (a cross-attention pad's query) keeps l = 0 and h = 0, divided by 1
+    sums = np.where(l == 0.0, 1.0, l)
     for i in range(heads):
-        h[:, i * d_k : (i + 1) * d_k] /= l[:, i : i + 1]
+        h[:, i * d_k : (i + 1) * d_k] /= sums[:, i : i + 1]
     return h, m, l
 
 
@@ -250,6 +261,8 @@ def tiled_backward(
     # a group's dk and dv per key block: its first head's assigned, each later head's added, in
     # head order; dk divided by the scale once, after
     q, k, v, h, m, l = saved
+    # a row no key is allowed to (m = -inf, l = 0) reads m as 0 and l as 1: its p is 0
+    m, l = np.where(m == -np.inf, 0.0, m), np.where(l == 0.0, 1.0, l)
     examples, queries, keys = extent
     width = q.shape[1]
     d_k = width // heads

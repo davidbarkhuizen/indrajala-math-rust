@@ -66,6 +66,18 @@
 //!
 //! The caches are packed: `Q`, `H` and their gradients `(N * T, h·d_k)`, head `i` in columns
 //! `i·d_k..`; `K`, `V` and theirs `(N * T, g·d_k)`; and `m`, `l` `(N * T, heads)`.
+//!
+//! Cross-attention (indrajala-ml's cross-attention workplan, D3, D11, D13; numpy's
+//! `CrossAttentionArrayLayer`): the `cross_attention_*` ops take the queries from the decoder's `T`
+//! tokens of `d` features and the keys and values from the encoder's output, a memory of `S` tokens
+//! of `d_m` features: `Q = X Wq^T + bq`, `K = M Wk^T + bk`, `V = M Wv^T + bv`, `Wk` and `Wv` `(g·d_k,
+//! d_m)`. Attend and combine are self-attention's blocks over `T` queries and `S` keys, with the same
+//! dropout draws per key block. Never causal, never rotary. The mask is by the queries' and the
+//! keys' segments alone, with no own-column exception (`Masking::own_column`), so a pad's query may
+//! reach no key: its row keeps `l = 0` and `H = 0`, and is divided by 1, so its output is `bo`. The
+//! backward reads such a row's `m` as 0 and its `l` as 1, so its `P` is 0. Every self-attention row
+//! has its own key, so these guards change none of its bits. The backward gives `dX = dQ Wq` and the
+//! memory's gradient `dM = dK Wk + dV Wv`. The caches `K`, `V` and their gradients are `(N * S, g·d_k)`.
 
 use crate::array::{Array, Shape};
 use crate::cr_exp::{exp, exp_in_place};
@@ -237,23 +249,31 @@ fn require_shape(array: &Array, shape: Shape, name: &str, context: &str) -> Resu
     Ok(())
 }
 
-/// `wq` `(h·d_k, d)`, `wk`, `wv` `(g·d_k, d)` and `wo` `(d, h·d_k)`, `d` and the options given.
-fn require_weights(weights: [&Array; 4], d: usize, options: &AttentionOptions, context: &str) -> Result<(), Error> {
+/// `wq` `(h·d_k, d)`, `wk`, `wv` `(g·d_k, d_m)` and `wo` `(d, h·d_k)`, `(d, d_m)` and the options
+/// given: `d_m` the keys' and values' input width, `d` in self-attention.
+fn require_weights(
+    weights: [&Array; 4],
+    (d, d_m): (usize, usize),
+    options: &AttentionOptions,
+    context: &str,
+) -> Result<(), Error> {
     let [wq, wk, wv, wo] = weights;
     let (width, kv_width) = (options.width(), options.kv_width());
     require_shape(wq, Shape::Matrix(width, d), "wq", context)?;
     for (w, name) in [(wk, "wk"), (wv, "wv")] {
-        require_shape(w, Shape::Matrix(kv_width, d), name, context)?;
+        require_shape(w, Shape::Matrix(kv_width, d_m), name, context)?;
     }
     require_shape(wo, Shape::Matrix(d, width), "wo", context)
 }
 
 /// `(d, options)`, `d` the token width (`bo`'s length) and the projections' width `bq`'s: every
-/// projection's weight and bias shaped to them.
+/// projection's weight and bias shaped to them, `wk` and `wv` reading `memory_width` features (`d`
+/// when `None`, self-attention).
 fn shapes(
     projections: &Projections,
     heads: (usize, usize),
     dropout: f64,
+    memory_width: Option<usize>,
     context: &str,
 ) -> Result<(usize, AttentionOptions), Error> {
     let (d, width) = (projections.bo.data.len(), projections.bq.data.len());
@@ -262,7 +282,7 @@ fn shapes(
     }
     let options = AttentionOptions::new(heads.0, heads.1, width, dropout, context)?;
     let weights = [projections.wq, projections.wk, projections.wv, projections.wo];
-    require_weights(weights, d, &options, context)?;
+    require_weights(weights, (d, memory_width.unwrap_or(d)), &options, context)?;
     require_shape(projections.bq, Shape::Vector(width), "bq", context)?;
     for (b, name) in [(projections.bk, "bk"), (projections.bv, "bv")] {
         require_shape(b, Shape::Vector(options.kv_width()), name, context)?;
@@ -312,12 +332,15 @@ pub const BLOCK: usize = 16;
 /// Which keys one example's queries may attend to (indrajala-ml's context-length workplan, D3):
 /// causal, key `u` at most query `t`'s column `t + offset` (a decode's one query is the keys' last,
 /// `offset = keys - 1`); and with segment ids, the queries' and the keys', another segment's key or
-/// a pad's (0) masked, but never the query's own column (indrajala-ml's segments workplan, D4).
+/// a pad's (0) masked, but never the query's own column when `own_column` (indrajala-ml's segments
+/// workplan, D4). Cross-attention's queries and keys are two sequences (its cross-attention
+/// workplan, D3): `own_column` false masks by segment alone, so a pad's query may reach no key.
 #[derive(Clone, Copy)]
 struct Masking<'a> {
     causal: bool,
     offset: usize,
     segments: Option<(&'a [f64], &'a [f64])>,
+    own_column: bool,
 }
 
 impl Masking<'_> {
@@ -327,7 +350,7 @@ impl Masking<'_> {
             return false;
         }
         match self.segments {
-            Some((queries, keys)) => u == column || (keys[u] == queries[t] && keys[u] != 0.0),
+            Some((queries, keys)) => (self.own_column && u == column) || (keys[u] == queries[t] && keys[u] != 0.0),
             None => true,
         }
     }
@@ -513,7 +536,9 @@ fn tiled_forward<'s>(
     }
     for (r, row) in h.chunks_exact_mut(width).enumerate() {
         for i in 0..heads {
-            let sum = l[r * heads + i];
+            // a row no key is allowed to (a cross-attention pad's query) keeps l = 0 and H = 0,
+            // divided by 1; every self-attention row has its own key, so l > 0 there
+            let sum = if l[r * heads + i] == 0.0 { 1.0 } else { l[r * heads + i] };
             for x in &mut row[i * d_k..(i + 1) * d_k] {
                 *x /= sum;
             }
@@ -577,12 +602,17 @@ fn tiled_backward<'s>(
                 let mut p = scores(q, &k_tt, (n, i, r0, r1, k0, k1), extent, options, &masking)?;
                 for (r, row) in p.data.chunks_exact_mut(b).enumerate() {
                     let at = (n * extent.queries + r0 + r) * heads + i;
+                    // a row no key is allowed to (m = -inf, l = 0) reads m as 0 and l as 1, so its P
+                    // is exp(-inf) / 1 = 0, as the forward divides its H; a no-op for every other row
+                    let (m_at, l_at) = (m.data[at], l.data[at]);
+                    let shift = if m_at == f64::NEG_INFINITY { 0.0 } else { m_at };
+                    let sum = if l_at == 0.0 { 1.0 } else { l_at };
                     for x in row.iter_mut() {
-                        *x -= m.data[at];
+                        *x -= shift;
                     }
                     exp_in_place(row);
                     for x in row.iter_mut() {
-                        *x /= l.data[at];
+                        *x /= sum;
                     }
                 }
                 let dh_t = tile(dh, n * extent.queries + r0, n * extent.queries + r1, i * d_k, d_k);
@@ -650,18 +680,20 @@ fn tiled_backward<'s>(
 
 // project, attend, combine: the forward pass's blocks
 
-/// `Q`, `K`, `V` from the `(N * T, d)` input rows: each the product, then the bias, over all heads;
-/// with a `rotation`, `Q` and `K` then rotated.
+/// `Q` from the `(N * T, d)` input rows and `K`, `V` from `kv_rows`, the same rows in self-attention
+/// and the memory's `(N * S, d_m)` in cross-attention: each the product, then the bias, over all
+/// heads; with a `rotation`, `Q` and `K` then rotated.
 fn project(
     rows: &Array,
+    kv_rows: &Array,
     projections: &Projections,
     rotation: Option<Rotation>,
     tokens: usize,
     options: &AttentionOptions,
 ) -> Result<(Array, Array, Array), Error> {
     let q = affine_forward_batch(projections.wq, rows, projections.bq)?;
-    let k = affine_forward_batch(projections.wk, rows, projections.bk)?;
-    let v = affine_forward_batch(projections.wv, rows, projections.bv)?;
+    let k = affine_forward_batch(projections.wk, kv_rows, projections.bk)?;
+    let v = affine_forward_batch(projections.wv, kv_rows, projections.bv)?;
     Ok(match rotation {
         Some(rotation) => (
             rotation.rotated(&q, tokens, options, false),
@@ -766,6 +798,27 @@ fn example_masking<'a>(causal: bool, segments: Option<&'a Array>, tokens: usize)
             let ids = &s.data[n * tokens..(n + 1) * tokens];
             (ids, ids)
         }),
+        own_column: true,
+    }
+}
+
+/// Example `n`'s cross-attention masking, `queries` and `keys` tokens a side: never causal, by its
+/// queries' and its keys' segment ids if given, without the own-column exception.
+fn cross_masking<'a>(
+    segments: Option<(&'a Array, &'a Array)>,
+    queries: usize,
+    keys: usize,
+) -> impl Fn(usize) -> Masking<'a> + 'a {
+    move |n| Masking {
+        causal: false,
+        offset: 0,
+        segments: segments.map(|(q, k)| {
+            (
+                &q.data[n * queries..(n + 1) * queries],
+                &k.data[n * keys..(n + 1) * keys],
+            )
+        }),
+        own_column: false,
     }
 }
 
@@ -781,12 +834,13 @@ fn forward(
     block: usize,
 ) -> Result<ForwardResult, Error> {
     let context = dropping.context;
-    let (d, options) = shapes(projections, heads, dropping.dropout, context)?;
+    let (d, options) = shapes(projections, heads, dropping.dropout, None, context)?;
     require_block(block, context)?;
     let (examples, tokens) = examples_and_tokens(x, d, "x", context)?;
     require_segments(segments, examples, tokens, context)?;
     let rotation = Rotation::new(table.0, table.1, tokens, &options, context)?;
-    let (q, k, v) = project(&token_rows(x, d), projections, rotation, tokens, &options)?;
+    let rows = token_rows(x, d);
+    let (q, k, v) = project(&rows, &rows, projections, rotation, tokens, &options)?;
     // a copy in the state before the draws, for the backward op (D12); the tiles draw from the caller's
     let saved = dropping.generator()?.map(|rng| rng.clone());
     let extent = Extent {
@@ -991,7 +1045,7 @@ pub fn attention_step(
         wo,
         bo,
     };
-    let (d, options) = shapes(&projections, (heads, key_value_heads), 0.0, context)?;
+    let (d, options) = shapes(&projections, (heads, key_value_heads), 0.0, None, context)?;
     require_shape(x, Shape::Vector(d), "x", context)?;
     require_block(block, context)?;
     if window == 0 {
@@ -1010,7 +1064,8 @@ pub fn attention_step(
     };
     require_shape(v_cache, Shape::Matrix(cached, width), "v_cache", context)?;
     let rotation = Rotation::new(cos, sin, 1, &options, context)?;
-    let (q, k, v) = project(&token_rows(x, d), &projections, rotation, 1, &options)?;
+    let rows = token_rows(x, d);
+    let (q, k, v) = project(&rows, &rows, &projections, rotation, 1, &options)?;
     let (k_cache, v_cache) = (
         appended(k_cache, &k, window, width),
         appended(v_cache, &v, window, width),
@@ -1027,6 +1082,7 @@ pub fn attention_step(
         causal: true,
         offset: keys - 1,
         segments: None,
+        own_column: true,
     };
     let (h, _m, _l) = tiled_forward([&q, &k_cache, &v_cache], extent, &options, masking, None)?;
     let out = combine(&h, &projections)?;
@@ -1066,7 +1122,7 @@ pub fn attention_downstream_batch(
         Shape::Vector(d) => (d, 1),
     };
     let options = AttentionOptions::new(heads, key_value_heads, width, dropout, context)?;
-    require_weights([wq, wk, wv, wo], d, &options, context)?;
+    require_weights([wq, wk, wv, wo], (d, d), &options, context)?;
     require_block(block, context)?;
     let (examples, tokens) = examples_and_tokens(delta_batch, d, "delta_batch", context)?;
     let rows = examples * tokens;
@@ -1144,9 +1200,295 @@ pub fn attention_accumulate_gradient_batch(
     }
     let x_rows = token_rows(x, d);
     let delta = token_rows(delta_batch, d);
-    let (grad_wq, grad_bq) = layer_accumulate_gradient_batch(dq, &x_rows, grad_wq, grad_bq)?;
-    let (grad_wk, grad_bk) = layer_accumulate_gradient_batch(dk, &x_rows, grad_wk, grad_bk)?;
-    let (grad_wv, grad_bv) = layer_accumulate_gradient_batch(dv, &x_rows, grad_wv, grad_bv)?;
-    let (grad_wo, grad_bo) = layer_accumulate_gradient_batch(&delta, h, grad_wo, grad_bo)?;
+    accumulate(
+        [&delta, &x_rows, &x_rows, h],
+        [dq, dk, dv],
+        [grad_wq, grad_bq, grad_wk, grad_bk, grad_wv, grad_bv, grad_wo, grad_bo],
+    )
+}
+
+/// The eight gradients after one batch's: `grad_wq`, `grad_bq` from `dq` against `x_rows`; `grad_wk`
+/// ... `grad_bv` from `dk`, `dv` against `kv_rows`; `grad_wo`, `grad_bo` from `delta` against `h`.
+#[allow(clippy::type_complexity)]
+fn accumulate(
+    rows: [&Array; 4],
+    gradients: [&Array; 3],
+    grads: [&Array; 8],
+) -> Result<(Array, Array, Array, Array, Array, Array, Array, Array), Error> {
+    let [delta, x_rows, kv_rows, h] = rows;
+    let [dq, dk, dv] = gradients;
+    let [grad_wq, grad_bq, grad_wk, grad_bk, grad_wv, grad_bv, grad_wo, grad_bo] = grads;
+    let (grad_wq, grad_bq) = layer_accumulate_gradient_batch(dq, x_rows, grad_wq, grad_bq)?;
+    let (grad_wk, grad_bk) = layer_accumulate_gradient_batch(dk, kv_rows, grad_wk, grad_bk)?;
+    let (grad_wv, grad_bv) = layer_accumulate_gradient_batch(dv, kv_rows, grad_wv, grad_bv)?;
+    let (grad_wo, grad_bo) = layer_accumulate_gradient_batch(delta, h, grad_wo, grad_bo)?;
     Ok((grad_wq, grad_bq, grad_wk, grad_bk, grad_wv, grad_bv, grad_wo, grad_bo))
+}
+
+// cross-attention (indrajala-ml's cross-attention workplan, D3, D11, D13): the queries from the
+// decoder's tokens, the keys and values from the encoder's output, its memory
+
+/// `d_m`, the memory's width, `wk`'s columns.
+fn memory_width(wk: &Array, context: &str) -> Result<usize, Error> {
+    match wk.shape {
+        Shape::Matrix(_, d_m) if d_m > 0 => Ok(d_m),
+        shape => Err(Error::invalid(format!(
+            "{context} requires a 2D wk of the memory's width, got shape {shape:?}"
+        ))),
+    }
+}
+
+/// `x` and `memory` 2D, one row an example in each: `(examples, tokens, memory_tokens)`.
+fn cross_extent(
+    x: &Array,
+    memory: &Array,
+    (d, d_m): (usize, usize),
+    context: &str,
+) -> Result<(usize, usize, usize), Error> {
+    for (array, name) in [(x, "x"), (memory, "memory")] {
+        if !matches!(array.shape, Shape::Matrix(_, _)) {
+            return Err(Error::invalid(format!(
+                "{context} requires a 2D {name}, got shape {:?}",
+                array.shape
+            )));
+        }
+    }
+    let (examples, tokens) = examples_and_tokens(x, d, "x", context)?;
+    let (memory_examples, memory_tokens) = examples_and_tokens(memory, d_m, "memory", context)?;
+    if memory_examples != examples {
+        return Err(Error::invalid(format!(
+            "{context} requires one memory row per example, {examples}; got {memory_examples}"
+        )));
+    }
+    Ok((examples, tokens, memory_tokens))
+}
+
+/// The queries' and the keys' segment ids, both or neither, one per token of each side.
+fn cross_segments<'a>(
+    segments: Option<&'a Array>,
+    memory_segments: Option<&'a Array>,
+    (examples, tokens, memory_tokens): (usize, usize, usize),
+    context: &str,
+) -> Result<Option<(&'a Array, &'a Array)>, Error> {
+    require_segments(segments, examples, tokens, context)?;
+    require_segments(memory_segments, examples, memory_tokens, context)?;
+    match (segments, memory_segments) {
+        (None, None) => Ok(None),
+        (Some(q), Some(k)) => Ok(Some((q, k))),
+        _ => Err(Error::invalid(format!(
+            "{context} requires both segments and memory_segments, or neither"
+        ))),
+    }
+}
+
+/// `CrossAttentionArrayLayer.forward_batch`: `x` 2D (`batch, T * d`), the decoder's tokens, `d`
+/// `bo`'s length, attending to `memory` 2D (`batch, S * d_m`), the encoder's output, `d_m` `wk`'s
+/// columns: `Q = X Wq^T + bq`, `K = M Wk^T + bk`, `V = M Wv^T + bv`, then attend and combine as
+/// self-attention's, over `T` queries and `S` keys. Never causal, never rotary. With `segments`
+/// (`N * T` ids) and `memory_segments` (`N * S`), both or neither, a query reads only the keys of
+/// its own segment and never a pad's (0), with no own-column exception: a pad's query reads no key,
+/// its `H` 0 and its output `bo`. Dropped from `rng` in `training` at `dropout > 0` as
+/// self-attention is (per key block, every example's, head's, query's and key's draw, numpy's `(N,
+/// h, T, b)`), tiled in key blocks of `block`. Returns `(a, q, k, v, h, m, l, dropout_rng)`: `q`,
+/// `h`, `m`, `l` over the `(N * T)` query rows and `k`, `v` over the `(N * S)` memory rows.
+#[allow(clippy::too_many_arguments)]
+pub fn cross_attention_forward_batch(
+    x: &Array,
+    memory: &Array,
+    wq: &Array,
+    bq: &Array,
+    wk: &Array,
+    bk: &Array,
+    wv: &Array,
+    bv: &Array,
+    wo: &Array,
+    bo: &Array,
+    heads: usize,
+    key_value_heads: usize,
+    dropout: f64,
+    training: bool,
+    rng: Option<&mut Generator>,
+    segments: Option<&Array>,
+    memory_segments: Option<&Array>,
+    block: usize,
+) -> Result<ForwardResult, Error> {
+    let context = "cross_attention_forward_batch";
+    let projections = Projections {
+        wq,
+        bq,
+        wk,
+        bk,
+        wv,
+        bv,
+        wo,
+        bo,
+    };
+    let mut dropping = Dropping {
+        dropout,
+        training,
+        rng,
+        context,
+    };
+    let d_m = memory_width(wk, context)?;
+    let (d, options) = shapes(&projections, (heads, key_value_heads), dropout, Some(d_m), context)?;
+    require_block(block, context)?;
+    let sides = cross_extent(x, memory, (d, d_m), context)?;
+    let (examples, tokens, memory_tokens) = sides;
+    let segments = cross_segments(segments, memory_segments, sides, context)?;
+    let (q, k, v) = project(
+        &token_rows(x, d),
+        &token_rows(memory, d_m),
+        &projections,
+        None,
+        tokens,
+        &options,
+    )?;
+    // a copy in the state before the draws, for the backward op (D12); the tiles draw from the caller's
+    let saved = dropping.generator()?.map(|rng| rng.clone());
+    let extent = Extent {
+        examples,
+        queries: tokens,
+        keys: memory_tokens,
+        block,
+        origin: 0,
+    };
+    let masking = cross_masking(segments, tokens, memory_tokens);
+    let (h, m, l) = tiled_forward([&q, &k, &v], extent, &options, masking, dropping.generator()?)?;
+    let out = combine(&h, &projections)?;
+    let a = Array {
+        data: out.data,
+        shape: x.shape,
+    };
+    Ok((a, q, k, v, h, m, l, saved))
+}
+
+/// `CrossAttentionArrayLayer._backward`: from `delta_batch` (`dl/dout`, 2D `batch, T * d`) and the
+/// forward pass's `q`, `k`, `v`, `h`, `m` and `l` (`cross_attention_forward_batch`'s), masked as the
+/// forward was (`segments`, `memory_segments`) in its key blocks of `block`, its dropout drawn again
+/// from a copy of `dropout_rng`, returns `(dx, dm, dq, dk, dv)`: `dx = dQ Wq` in `delta_batch`'s
+/// shape; `dm = dK Wk + dV Wv`, the memory's gradient, `(N * S, d_m)` rows, as numpy's
+/// `memory_downstream_batch`; and `dq` `(N * T, h·d_k)`, `dk`, `dv` `(N * S, g·d_k)`, which the
+/// gradients read.
+#[allow(clippy::too_many_arguments)]
+pub fn cross_attention_downstream_batch(
+    delta_batch: &Array,
+    wq: &Array,
+    wk: &Array,
+    wv: &Array,
+    wo: &Array,
+    caches: [&Array; 6],
+    heads: usize,
+    key_value_heads: usize,
+    segments: Option<&Array>,
+    memory_segments: Option<&Array>,
+    dropout: f64,
+    dropout_rng: Option<&Generator>,
+    block: usize,
+) -> Result<(Array, Array, Array, Array, Array), Error> {
+    let context = "cross_attention_downstream_batch";
+    let [q, k, v, h, m, l] = caches;
+    let width = match wq.shape {
+        Shape::Matrix(width, _) => width,
+        Shape::Vector(_) => 0,
+    };
+    let options = AttentionOptions::new(heads, key_value_heads, width, dropout, context)?;
+    let d = columns(wq);
+    let d_m = memory_width(wk, context)?;
+    require_weights([wq, wk, wv, wo], (d, d_m), &options, context)?;
+    require_block(block, context)?;
+    if !matches!(delta_batch.shape, Shape::Matrix(_, _)) {
+        return Err(Error::invalid(format!(
+            "{context} requires a 2D delta_batch, got shape {:?}",
+            delta_batch.shape
+        )));
+    }
+    let (examples, tokens) = examples_and_tokens(delta_batch, d, "delta_batch", context)?;
+    let rows = examples * tokens;
+    let memory_rows = match k.shape {
+        Shape::Matrix(memory_rows, _) if memory_rows > 0 && memory_rows.is_multiple_of(examples) => memory_rows,
+        shape => {
+            return Err(Error::invalid(format!(
+                "{context} requires k of whole memories, S rows per example of {examples}; got shape {shape:?}"
+            )));
+        }
+    };
+    let memory_tokens = memory_rows / examples;
+    for (cache, name) in [(q, "q"), (h, "h")] {
+        require_shape(cache, Shape::Matrix(rows, width), name, context)?;
+    }
+    for (cache, name) in [(k, "k"), (v, "v")] {
+        require_shape(cache, Shape::Matrix(memory_rows, options.kv_width()), name, context)?;
+    }
+    for (cache, name) in [(m, "m"), (l, "l")] {
+        require_shape(cache, Shape::Matrix(rows, heads), name, context)?;
+    }
+    let segments = cross_segments(segments, memory_segments, (examples, tokens, memory_tokens), context)?;
+
+    let dh = combine_backward(&token_rows(delta_batch, d), wo)?;
+    let extent = Extent {
+        examples,
+        queries: tokens,
+        keys: memory_tokens,
+        block,
+        origin: 0,
+    };
+    let masking = cross_masking(segments, tokens, memory_tokens);
+    let mut rng = if dropout > 0.0 { dropout_rng.cloned() } else { None };
+    let (dq, dk, dv) = tiled_backward(&dh, [q, k, v, h, m, l], extent, &options, masking, rng.as_mut())?;
+    let dx = layer_downstream_batch(wq, &dq)?;
+    let dx = Array {
+        data: dx.data,
+        shape: delta_batch.shape,
+    };
+    let dm_k = layer_downstream_batch(wk, &dk)?;
+    let dm_v = layer_downstream_batch(wv, &dv)?;
+    let dm = Array {
+        data: dm_k.data.iter().zip(&dm_v.data).map(|(&a, &b)| a + b).collect(),
+        shape: dm_k.shape,
+    };
+    Ok((dx, dm, dq, dk, dv))
+}
+
+/// `CrossAttentionArrayLayer.accumulate_gradient_batch`: each projection's `(grad_W, grad_b)` as a
+/// dense layer's, `grad_W += delta^T X` and `grad_b += sum(delta)`: `dq` against `x`'s `(N * T, d)`
+/// rows, `dk` and `dv` against `memory`'s `(N * S, d_m)` rows, and `delta_batch` against `h` (the
+/// forward pass's), `delta_batch`, `x` and `memory` 2D. Returns the eight updated gradients in the
+/// parameters' order.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn cross_attention_accumulate_gradient_batch(
+    delta_batch: &Array,
+    x: &Array,
+    memory: &Array,
+    h: &Array,
+    dq: &Array,
+    dk: &Array,
+    dv: &Array,
+    grad_wq: &Array,
+    grad_bq: &Array,
+    grad_wk: &Array,
+    grad_bk: &Array,
+    grad_wv: &Array,
+    grad_bv: &Array,
+    grad_wo: &Array,
+    grad_bo: &Array,
+) -> Result<(Array, Array, Array, Array, Array, Array, Array, Array), Error> {
+    let context = "cross_attention_accumulate_gradient_batch";
+    let (d, width, kv_width) = (grad_bo.data.len(), grad_bq.data.len(), grad_bk.data.len());
+    let d_m = memory_width(grad_wk, context)?;
+    let (examples, tokens, memory_tokens) = cross_extent(x, memory, (d, d_m), context)?;
+    require_shape(delta_batch, x.shape, "delta_batch", context)?;
+    let (rows, memory_rows) = (examples * tokens, examples * memory_tokens);
+    for (cache, name) in [(h, "h"), (dq, "dq")] {
+        require_shape(cache, Shape::Matrix(rows, width), name, context)?;
+    }
+    for (cache, name) in [(dk, "dk"), (dv, "dv")] {
+        require_shape(cache, Shape::Matrix(memory_rows, kv_width), name, context)?;
+    }
+    let (x_rows, memory_rows) = (token_rows(x, d), token_rows(memory, d_m));
+    let delta = token_rows(delta_batch, d);
+    accumulate(
+        [&delta, &x_rows, &memory_rows, h],
+        [dq, dk, dv],
+        [grad_wq, grad_bq, grad_wk, grad_bk, grad_wv, grad_bv, grad_wo, grad_bo],
+    )
 }
