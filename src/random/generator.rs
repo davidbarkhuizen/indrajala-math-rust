@@ -8,7 +8,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 
 use crate::array::{parse_shape, RustArray};
-use crate::linalg::py_err;
+use crate::error::py_err;
 use indrajala_math::random::generator::{GeneratorState, POOL_SIZE};
 
 /// `_int_to_uint32_array`: a non-negative integer as 32-bit words, lowest first (`[0]` for 0).
@@ -382,4 +382,12 @@ pub fn default_rng<'py>(py: Python<'py>, seed: Option<Bound<'py, PyAny>>) -> PyR
         return Ok(generator.clone());
     }
     Ok(Bound::new(py, Generator::new(py, seed)?)?.into_any())
+}
+
+/// Adds this module's functions and classes to the Python module, then its children's.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(default_rng, m)?)?;
+    m.add_class::<SeedSequence>()?;
+    m.add_class::<Generator>()?;
+    Ok(())
 }

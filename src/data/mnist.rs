@@ -1,10 +1,10 @@
-//! The bindings of the core's `mnist` (`indrajala_math::data::mnist`): each `#[pyfunction]` lends its
-//! arrays to the core's and moves the results in.
+//! The bindings of the core's `data::mnist`: each `#[pyfunction]` lends its arrays to the core's
+//! and moves the results in.
 
 use pyo3::prelude::*;
 
 use crate::array::RustArray;
-use crate::linalg::py_err;
+use crate::error::py_err;
 
 /// A direct port of `load_mnist_dataset_as_array`'s own decode
 /// (`np.frombuffer(data, dtype=np.uint8).reshape(n, RECORD_SIZE)[:, :-1].astype(np.float64) / 255.0`),
@@ -20,4 +20,10 @@ pub fn decode_mnist_pixels(data: &[u8], record_size: usize) -> PyResult<RustArra
     indrajala_math::data::mnist::decode_pixels(data, record_size)
         .map(RustArray::from)
         .map_err(py_err)
+}
+
+/// Adds this module's functions and classes to the Python module, then its children's.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(decode_mnist_pixels, m)?)?;
+    Ok(())
 }

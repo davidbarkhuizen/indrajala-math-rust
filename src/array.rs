@@ -2,7 +2,7 @@ use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PySlice, PyTuple};
 
-use crate::linalg::py_err;
+use crate::error::py_err;
 use indrajala_math::Array;
 pub use indrajala_math::Shape;
 
@@ -297,4 +297,10 @@ impl RustArray {
         let stop = indices.stop.max(indices.start) as usize;
         Ok((start, stop))
     }
+}
+
+/// Adds this module's functions and classes to the Python module, then its children's.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<RustArray>()?;
+    Ok(())
 }

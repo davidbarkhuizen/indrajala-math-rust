@@ -1,11 +1,11 @@
-//! The bindings of the core's `tokens` (`indrajala_math::nn::tokens`): each `#[pyfunction]` lends its
-//! arrays to the core's and moves the results in.
+//! The bindings of the core's `nn::tokens`: each `#[pyfunction]` lends its arrays to the core's and
+//! moves the results in.
 
 use pyo3::prelude::*;
 
 use crate::array::RustArray;
-use crate::generator::Generator;
-use crate::linalg::py_err;
+use crate::error::py_err;
+use crate::random::generator::Generator;
 
 /// `PatchesArrayLayer.forward_batch` (and `forward`, one example): each channel-major `(H, W, C)`
 /// image as `H/p * W/p` tokens of `p * p * C` features, a fixed permutation.
@@ -100,4 +100,17 @@ pub fn token_dropout_downstream(delta: &RustArray, mask: &RustArray, drop_probab
     indrajala_math::nn::tokens::dropout_downstream(delta, mask, drop_probability)
         .map(RustArray::from)
         .map_err(py_err)
+}
+
+/// Adds this module's functions and classes to the Python module, then its children's.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(patches_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(patches_downstream, m)?)?;
+    m.add_function(wrap_pyfunction!(token_mean_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(token_mean_downstream, m)?)?;
+    m.add_function(wrap_pyfunction!(embedding_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(embedding_accumulate_gradient, m)?)?;
+    m.add_function(wrap_pyfunction!(token_dropout_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(token_dropout_downstream, m)?)?;
+    Ok(())
 }

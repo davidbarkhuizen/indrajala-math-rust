@@ -5,7 +5,7 @@
 use pyo3::prelude::*;
 
 use crate::array::RustArray;
-use crate::linalg::py_err;
+use crate::error::py_err;
 use indrajala_math::nn::recurrent::factored::{step_forward, sum_in_order, StepCore, StepGradients};
 use indrajala_math::Array;
 
@@ -283,4 +283,14 @@ pub fn recurrence_step_backward(
         arrays(gb),
         ge.into_iter().map(|e| e.map(RustArray::from)).collect(),
     ))
+}
+
+/// Adds this module's functions and classes to the Python module, then its children's.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(factored_codes_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(factored_codes_backward, m)?)?;
+    m.add_function(wrap_pyfunction!(recurrence_step_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(recurrence_step_backward, m)?)?;
+    m.add_class::<RecurrenceStep>()?;
+    Ok(())
 }

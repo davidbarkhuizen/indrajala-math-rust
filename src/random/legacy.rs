@@ -5,7 +5,7 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 
 use crate::array::{parse_shape, RustArray};
-use crate::linalg::py_err;
+use crate::error::py_err;
 use indrajala_math::random::legacy as core_random;
 #[allow(unused_imports)]
 pub(crate) use indrajala_math::random::legacy::{
@@ -177,4 +177,13 @@ pub fn uniform(low: f64, high: f64, shape: &Bound<'_, PyAny>) -> PyResult<RustAr
 #[pyfunction]
 pub fn bernoulli_mask(drop_probability: f64, shape: &Bound<'_, PyAny>) -> PyResult<RustArray> {
     Ok(core_random::bernoulli_mask(drop_probability, parse_shape(shape)?).into())
+}
+
+/// Adds this module's functions and classes to the Python module, then its children's.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(seed, m)?)?;
+    m.add_function(wrap_pyfunction!(random, m)?)?;
+    m.add_function(wrap_pyfunction!(uniform, m)?)?;
+    m.add_function(wrap_pyfunction!(bernoulli_mask, m)?)?;
+    Ok(())
 }

@@ -1,40 +1,10 @@
-//! The bindings of the core's `batch_norm` (`indrajala_math::nn::norm::batch_norm`): each `#[pyfunction]` lends its
-//! arrays to the core's and moves the results in.
+//! The bindings of the core's `nn::norm::batch_norm`: each `#[pyfunction]` lends its arrays to the
+//! core's and moves the results in.
 
 use pyo3::prelude::*;
 
 use crate::array::RustArray;
-use crate::linalg::py_err;
-
-/// `LinearArrayLayer.forward`: `self.W @ x`, `x` 1D, `linear_preactivation` without the bias.
-#[pyfunction]
-pub fn linear_forward(w: &RustArray, x: &RustArray) -> PyResult<RustArray> {
-    indrajala_math::nn::dense::linear_forward(w, x)
-        .map(RustArray::from)
-        .map_err(py_err)
-}
-
-/// `LinearArrayLayer.forward_batch`: `X @ self.W.T`, `linear_preactivation_batch` without the
-/// bias, so row `i` is bit-identical to `linear_forward(w, X[i])`.
-#[pyfunction]
-pub fn linear_forward_batch(w: &RustArray, x: &RustArray) -> PyResult<RustArray> {
-    indrajala_math::nn::dense::linear_forward_batch(w, x)
-        .map(RustArray::from)
-        .map_err(py_err)
-}
-
-/// `LinearArrayLayer.accumulate_gradient_batch`: `self.grad_W += self.delta_batch.T @
-/// input_activation_batch`, `layer_accumulate_gradient_batch`'s `grad_W` without its `grad_b`.
-#[pyfunction]
-pub fn linear_accumulate_gradient_batch(
-    delta_batch: &RustArray,
-    input_activation_batch: &RustArray,
-    grad_w: &RustArray,
-) -> PyResult<RustArray> {
-    indrajala_math::nn::dense::linear_accumulate_gradient_batch(delta_batch, input_activation_batch, grad_w)
-        .map(RustArray::from)
-        .map_err(py_err)
-}
+use crate::error::py_err;
 
 /// `BatchNormArrayLayer._inference`, a single example (`x` 1D) or a batch (`x` 2D), each
 /// `channels * positions` values: `xhat = (x - running_mean) / sqrt(running_var + eps)`, then
@@ -177,4 +147,13 @@ pub fn batch_norm_accumulate_gradient_batch(
             (RustArray::from(r0), RustArray::from(r1))
         })
         .map_err(py_err)
+}
+
+/// Adds this module's functions and classes to the Python module, then its children's.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(batch_norm_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(batch_norm_forward_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(batch_norm_downstream_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(batch_norm_accumulate_gradient_batch, m)?)?;
+    Ok(())
 }

@@ -2,7 +2,7 @@ use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 
 use crate::array::RustArray;
-use crate::linalg::py_err;
+use crate::error::py_err;
 use indrajala_math::Array;
 
 /// Accepts a Python int or float as a scalar operand (`grad_W / batch_size` passes a Python
