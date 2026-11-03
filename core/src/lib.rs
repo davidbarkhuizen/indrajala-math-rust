@@ -23,6 +23,9 @@
 pub mod activation;
 mod array;
 pub mod attention;
+/// A layout probe (not for merge): the cross-attention commit's attention module, unused by self-attention.
+#[allow(dead_code)]
+pub mod attention_probe;
 pub mod batch_norm;
 pub mod conv;
 pub mod cr_exp;
