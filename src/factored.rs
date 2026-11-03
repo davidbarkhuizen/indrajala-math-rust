@@ -1,4 +1,4 @@
-//! The bindings of the core's factored recurrence (`indrajala_math::factored`): list arguments
+//! The bindings of the core's factored recurrence (`indrajala_math::nn::recurrent::factored`): list arguments
 //! lent to the core as plain references, and `RecurrenceStep`, which keeps the tokens a step read
 //! for its backward pass.
 
@@ -7,7 +7,7 @@ use pyo3::prelude::*;
 use crate::array::RustArray;
 use crate::linalg::py_err;
 #[allow(unused_imports)]
-pub(crate) use indrajala_math::factored::*;
+pub(crate) use indrajala_math::nn::recurrent::factored::*;
 use indrajala_math::Array;
 
 /// Each row of `h`, `(N, S)`, snapped factor by factor: factor `g`'s `sizes[g]` columns to the
@@ -19,7 +19,7 @@ pub fn factored_codes_forward(
     sizes: Vec<usize>,
     codes: Vec<Option<PyRef<'_, RustArray>>>,
 ) -> PyResult<(RustArray, Vec<Option<Vec<usize>>>)> {
-    indrajala_math::factored::factored_codes_forward(h, sizes, &option_refs(&codes))
+    indrajala_math::nn::recurrent::factored::factored_codes_forward(h, sizes, &option_refs(&codes))
         .map(|(q, indices)| (q.into(), indices))
         .map_err(py_err)
 }
@@ -43,7 +43,7 @@ pub fn factored_codes_backward(
     targets: Option<Vec<Option<PyRef<'_, RustArray>>>>,
 ) -> PyResult<(RustArray, Vec<Option<RustArray>>)> {
     let targets = targets.as_deref().map(option_refs);
-    indrajala_math::factored::factored_codes_backward(
+    indrajala_math::nn::recurrent::factored::factored_codes_backward(
         dq,
         h,
         q,

@@ -1,7 +1,7 @@
 //! The hidden layers' activations (indrajala-ml's FFN activations workplan, D9): ReLU, GELU (the
 //! exact, `erf` form; Hendrycks & Gimpel 2016), GELU-tanh (GPT-2's approximation) and SiLU
 //! (`z * sigmoid(z)`, Elfwing et al. 2018; the gated FFN's, D3), one family the fused dense ops
-//! ([`crate::fused`]), the gated ops and the masks ([`crate::ufuncs::array_activation_mask`]) take
+//! ([`crate::nn::dense`]), the gated ops and the masks ([`crate::ops::unary::array_activation_mask`]) take
 //! as an argument.
 //!
 //! The expressions, their grouping fixed (indrajala-ml's pure-Python and numpy layers take the same
@@ -18,21 +18,21 @@
 //!
 //! `SQRT1_2` is the double nearest `1/sqrt(2)` (a multiply, not a division by `sqrt(2)`),
 //! `INV_SQRT_2PI` the double nearest `1/sqrt(2 pi)`, `C` the double nearest `sqrt(2/pi)` and
-//! `K = 0.044715`; `erf` is [`crate::erf::erf`] and `tanh` the window-recurrent cell's
-//! `1 - 2 / (exp(2x) + 1)` (its W15), both through the correctly rounded [`crate::cr_exp::exp`].
+//! `K = 0.044715`; `erf` is [`crate::num::erf::erf`] and `tanh` the window-recurrent cell's
+//! `1 - 2 / (exp(2x) + 1)` (its W15), both through the correctly rounded [`crate::num::exp::exp`].
 //! Only `+ - * /` besides, and Rust never contracts `a * b + c`, so the bits are the expressions',
 //! the same on every machine.
 //!
-//! `s` is [`crate::cr_exp::sigmoid_in_place`]'s, the dense layers' sigmoid.
+//! `s` is [`crate::num::exp::sigmoid_in_place`]'s, the dense layers' sigmoid.
 //!
 //! ReLU's derivative reads the layer's output (`a > 0`), the others' their input `z`: what the
 //! forward keeps is [`Activation::keeps_preactivation`]'s answer, and a hidden delta's `cached`
 //! operand is `a` for ReLU and `z` for the rest.
 
-use crate::cr_exp::{exp, sigmoid_in_place};
-use crate::erf::erf;
-use crate::recurrent::tanh_in_place;
-use crate::scalar::relu;
+use crate::num::exp::{exp, sigmoid_in_place};
+use crate::num::erf::erf;
+use crate::num::exp::tanh_in_place;
+use crate::num::scalar::relu;
 use crate::Error;
 
 /// The double nearest `1/sqrt(2)`.

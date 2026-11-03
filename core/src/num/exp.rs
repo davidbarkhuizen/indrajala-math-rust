@@ -690,3 +690,17 @@ const T1: [[f64; 2]; 64] = [
     [f64::from_bits(0x3c94a47a505b3a46), f64::from_bits(0x3ff02b338c811703)], // 0x1.4a47a505b3a46p-54, 0x1.02b338c811703p+0
     [f64::from_bits(0x3c9e47120223467f), f64::from_bits(0x3ff02be6e199c811)], // 0x1.e47120223467fp-54, 0x1.02be6e199c811p+0
 ];
+
+/// `1 - 2 / (exp(2x) + 1)` for each of `values`, in place. The workplan's W15: through `exp`, as
+/// `sigmoid`, so it agrees where `exp` does. A large `x` overflows `exp(2x)` to infinity and gives
+/// exactly 1; a large negative `x` exactly -1. Doubling is exact, and each pass rounds value by
+/// value, so the bits are the expression's.
+pub(crate) fn tanh_in_place(values: &mut [f64]) {
+    for v in values.iter_mut() {
+        *v *= 2.0;
+    }
+    exp_in_place(values);
+    for v in values.iter_mut() {
+        *v = 1.0 - 2.0 / (*v + 1.0);
+    }
+}

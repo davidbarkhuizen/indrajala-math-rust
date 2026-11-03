@@ -1,4 +1,4 @@
-//! The bindings of the core's `batch_norm` (`indrajala_math::batch_norm`): each `#[pyfunction]` lends its
+//! The bindings of the core's `batch_norm` (`indrajala_math::nn::norm::batch_norm`): each `#[pyfunction]` lends its
 //! arrays to the core's and moves the results in.
 
 use pyo3::prelude::*;
@@ -6,12 +6,12 @@ use pyo3::prelude::*;
 use crate::array::RustArray;
 use crate::linalg::py_err;
 #[allow(unused_imports)]
-pub(crate) use indrajala_math::batch_norm::*;
+pub(crate) use indrajala_math::nn::norm::batch_norm::*;
 
 /// `LinearArrayLayer.forward`: `self.W @ x`, `x` 1D, `linear_preactivation` without the bias.
 #[pyfunction]
 pub fn linear_forward(w: &RustArray, x: &RustArray) -> PyResult<RustArray> {
-    indrajala_math::batch_norm::linear_forward(w, x)
+    indrajala_math::nn::norm::batch_norm::linear_forward(w, x)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -20,7 +20,7 @@ pub fn linear_forward(w: &RustArray, x: &RustArray) -> PyResult<RustArray> {
 /// bias, so row `i` is bit-identical to `linear_forward(w, X[i])`.
 #[pyfunction]
 pub fn linear_forward_batch(w: &RustArray, x: &RustArray) -> PyResult<RustArray> {
-    indrajala_math::batch_norm::linear_forward_batch(w, x)
+    indrajala_math::nn::norm::batch_norm::linear_forward_batch(w, x)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -33,7 +33,7 @@ pub fn linear_accumulate_gradient_batch(
     input_activation_batch: &RustArray,
     grad_w: &RustArray,
 ) -> PyResult<RustArray> {
-    indrajala_math::batch_norm::linear_accumulate_gradient_batch(delta_batch, input_activation_batch, grad_w)
+    indrajala_math::nn::norm::batch_norm::linear_accumulate_gradient_batch(delta_batch, input_activation_batch, grad_w)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -54,7 +54,7 @@ pub fn batch_norm_forward(
     activation: &str,
     positions: usize,
 ) -> PyResult<RustArray> {
-    indrajala_math::batch_norm::batch_norm_forward(
+    indrajala_math::nn::norm::batch_norm::batch_norm_forward(
         x,
         gamma,
         beta,
@@ -103,7 +103,7 @@ pub fn batch_norm_forward_batch(
     RustArray,
     RustArray,
 )> {
-    indrajala_math::batch_norm::batch_norm_forward_batch(
+    indrajala_math::nn::norm::batch_norm::batch_norm_forward_batch(
         x,
         gamma,
         beta,
@@ -147,7 +147,7 @@ pub fn batch_norm_downstream_batch(
     positions: usize,
     group_size: Option<usize>,
 ) -> PyResult<RustArray> {
-    indrajala_math::batch_norm::batch_norm_downstream_batch(
+    indrajala_math::nn::norm::batch_norm::batch_norm_downstream_batch(
         delta_batch,
         gamma,
         d,
@@ -173,7 +173,7 @@ pub fn batch_norm_accumulate_gradient_batch(
     grad_beta: &RustArray,
     positions: usize,
 ) -> PyResult<(RustArray, RustArray)> {
-    indrajala_math::batch_norm::batch_norm_accumulate_gradient_batch(
+    indrajala_math::nn::norm::batch_norm::batch_norm_accumulate_gradient_batch(
         delta_batch,
         xhat,
         grad_gamma,

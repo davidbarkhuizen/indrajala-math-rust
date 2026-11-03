@@ -6,7 +6,7 @@
 //! and writes as numpy's `bit_generator.state`, so a state moves between numpy and the crate.
 
 use crate::array::{Array, Shape};
-use crate::random::{bernoulli_values, shaped, DoubleSource};
+use crate::random::legacy::{bernoulli_values, shaped, DoubleSource};
 use crate::Error;
 
 /// numpy's default pool: four 32-bit words.

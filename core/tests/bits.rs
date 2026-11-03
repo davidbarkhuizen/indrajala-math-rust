@@ -8,21 +8,21 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use indrajala_math::activation::Activation;
-use indrajala_math::attention::{
+use indrajala_math::num::activation::Activation;
+use indrajala_math::nn::attention::{
     attention_downstream_batch, attention_forward_batch, cross_attention_downstream_batch,
     cross_attention_forward_batch,
 };
-use indrajala_math::conv::{conv_forward_batch, max_pool_forward_batch, ConvGeometry};
-use indrajala_math::fused::{
+use indrajala_math::nn::conv::{conv_forward_batch, max_pool_forward_batch, ConvGeometry};
+use indrajala_math::nn::dense::{
     gated_delta_batch, gated_forward_batch, layer_activation_forward_batch, layer_activation_hidden_delta_batch,
     layer_forward_batch,
 };
-use indrajala_math::generator::{Generator, SeedSequence};
-use indrajala_math::layer_norm::layer_norm_forward_batch;
+use indrajala_math::random::generator::{Generator, SeedSequence};
+use indrajala_math::nn::norm::layer_norm::layer_norm_forward_batch;
 use indrajala_math::linalg::{matmul, matmul_add, matmul_long_k, matmul_nt, outer};
-use indrajala_math::recurrent::gru_forward;
-use indrajala_math::ufuncs::{array_softmax, erf, exp};
+use indrajala_math::nn::recurrent::gru_forward;
+use indrajala_math::ops::unary::{array_softmax, erf, exp};
 use indrajala_math::{Array, Shape};
 
 /// FNV-1a over the values' bits, and their count.

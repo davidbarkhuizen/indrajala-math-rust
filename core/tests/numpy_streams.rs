@@ -2,7 +2,7 @@
 //! np.random.random(3)` and `np.random.default_rng(42).random(3)`. Its own test binary: the global
 //! generator is process-wide.
 
-use indrajala_math::generator::{Generator, SeedSequence};
+use indrajala_math::random::generator::{Generator, SeedSequence};
 use indrajala_math::{random, Shape};
 
 #[test]

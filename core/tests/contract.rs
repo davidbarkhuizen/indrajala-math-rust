@@ -1,8 +1,8 @@
 //! The API's contract: bad arguments come back as `Err`, with the message the Python bindings
 //! raise; only the constructors documented to panic do.
 
-use indrajala_math::conv::ConvGeometry;
-use indrajala_math::generator::{Generator, SeedSequence};
+use indrajala_math::nn::conv::ConvGeometry;
+use indrajala_math::random::generator::{Generator, SeedSequence};
 use indrajala_math::linalg::{matmul, matmul_nt};
 use indrajala_math::{random, Array, Error, Shape};
 
@@ -65,11 +65,11 @@ fn a_range_out_of_bounds_is_an_overflow() {
 fn exp_into_and_in_place_give_exps_bits() {
     let values: Vec<f64> = (0..11).map(|i| f64::from(i) * 0.7 - 3.0).collect();
     let mut out = vec![0.0; values.len()];
-    indrajala_math::cr_exp::exp_into(&values, &mut out);
+    indrajala_math::num::exp::exp_into(&values, &mut out);
     let mut in_place = values.clone();
-    indrajala_math::cr_exp::exp_in_place(&mut in_place);
+    indrajala_math::num::exp::exp_in_place(&mut in_place);
     for ((&x, &a), &b) in values.iter().zip(&out).zip(&in_place) {
-        let e = indrajala_math::cr_exp::exp(x);
+        let e = indrajala_math::num::exp::exp(x);
         assert_eq!((a.to_bits(), b.to_bits()), (e.to_bits(), e.to_bits()));
     }
 }

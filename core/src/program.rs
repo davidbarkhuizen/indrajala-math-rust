@@ -19,26 +19,27 @@
 //! op's in turn, then each factor's pooling query, cell `w`, `u`, `b`, codes (if snapped) and
 //! initial state (which the program doesn't read: the caller snaps the initial state).
 
-use crate::activation::Activation;
+use crate::num::activation::Activation;
 use crate::array::{Array, Shape};
-use crate::attention::{
+use crate::nn::attention::{
     attention_accumulate_gradient_batch, attention_downstream_batch, attention_forward_batch, BLOCK,
 };
-use crate::factored::{step_forward, sum_in_order, Consolidation, StepCore, StepGradients};
-use crate::fused::{
+use crate::nn::recurrent::factored::{step_forward, sum_in_order, Consolidation, StepCore, StepGradients};
+use crate::nn::dense::{
     affine_forward_batch, layer_accumulate_gradient_batch, layer_activation_forward_batch, layer_downstream_batch,
-    layer_softmax_forward_batch,
 };
-use crate::generator::Generator;
-use crate::layer_norm::{layer_norm_accumulate_gradient_batch, layer_norm_downstream_batch, layer_norm_forward_batch};
-use crate::recurrent::{
+use crate::nn::softmax::layer_softmax_forward_batch;
+use crate::random::generator::Generator;
+use crate::nn::norm::layer_norm::{layer_norm_accumulate_gradient_batch, layer_norm_downstream_batch, layer_norm_forward_batch};
+use crate::nn::recurrent::{
     columns, join_columns, matrix_shape, state_input_backward, state_input_film_backward, state_input_film_forward,
     state_input_forward,
 };
-use crate::tokens::{
+use crate::nn::tokens::{
     embedding_accumulate_gradient, embedding_forward, token_dropout_downstream, token_dropout_forward,
 };
-use crate::ufuncs::{array_activation_mask, sum_axis0};
+use crate::ops::mask::array_activation_mask;
+use crate::ops::unary::sum_axis0;
 use crate::Error;
 
 /// One layer of a window, as the program runs it.

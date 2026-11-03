@@ -18,9 +18,8 @@
 //! `sum_axis0` is for a dense batch. So given the same inputs they compute numpy's bits.
 
 use crate::array::{Array, Shape};
-use crate::cr_exp::sigmoid_in_place;
-use crate::linalg::{matmul, matmul_add, matmul_nt};
-use crate::scalar::relu;
+use crate::num::exp::sigmoid_in_place;
+use crate::num::scalar::relu;
 use crate::Error;
 
 /// A batch-norm layer's activation, fused into it as into a dense layer.
@@ -155,33 +154,6 @@ fn zip_channels(
         }
     }
     out
-}
-
-/// `LinearArrayLayer.forward`: `self.W @ x`, `x` 1D, `linear_preactivation` without the bias.
-pub fn linear_forward(w: &Array, x: &Array) -> Result<Array, Error> {
-    if !matches!(x.shape, Shape::Vector(_)) {
-        return Err(Error::invalid(format!(
-            "linear_forward requires a 1D x, got shape {:?}",
-            x.shape
-        )));
-    }
-    matmul(w, x)
-}
-
-/// `LinearArrayLayer.forward_batch`: `X @ self.W.T`, `linear_preactivation_batch` without the
-/// bias, so row `i` is bit-identical to `linear_forward(w, X[i])`.
-pub fn linear_forward_batch(w: &Array, x: &Array) -> Result<Array, Error> {
-    matmul_nt(x, w)
-}
-
-/// `LinearArrayLayer.accumulate_gradient_batch`: `self.grad_W += self.delta_batch.T @
-/// input_activation_batch`, `layer_accumulate_gradient_batch`'s `grad_W` without its `grad_b`.
-pub fn linear_accumulate_gradient_batch(
-    delta_batch: &Array,
-    input_activation_batch: &Array,
-    grad_w: &Array,
-) -> Result<Array, Error> {
-    matmul_add(grad_w, &delta_batch.transpose(), input_activation_batch)
 }
 
 /// `BatchNormArrayLayer._inference`, a single example (`x` 1D) or a batch (`x` 2D), each

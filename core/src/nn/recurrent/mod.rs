@@ -33,12 +33,14 @@
 //! grouped as written above, so the steps between products are numpy's by bits. The codes' search
 //! and their backward pass have no product: they are numpy's by bits.
 
+pub mod factored;
+
 use crate::array::{Array, Shape};
-use crate::cr_exp::{exp_in_place, sigmoid_in_place};
-use crate::fused::{affine_forward_batch, layer_accumulate_gradient_batch};
+use crate::num::exp::{exp_in_place, sigmoid_in_place, tanh_in_place};
+use crate::nn::dense::{affine_forward_batch, layer_accumulate_gradient_batch};
 use crate::linalg::{matmul, matmul_add, matmul_nt};
-use crate::ops::same_shape_elementwise;
-use crate::ufuncs::array_softmax;
+use crate::ops::arith::same_shape_elementwise;
+use crate::ops::unary::array_softmax;
 use crate::Error;
 
 /// `(rows, cols)` of a matrix, refused for a vector.
@@ -70,20 +72,6 @@ pub(crate) fn features_per_token(tokens: usize, width: usize, context: &str) -> 
         )));
     }
     Ok(width / tokens)
-}
-
-/// `1 - 2 / (exp(2x) + 1)` for each of `values`, in place. The workplan's W15: through `exp`, as
-/// `sigmoid`, so it agrees where `exp` does. A large `x` overflows `exp(2x)` to infinity and gives
-/// exactly 1; a large negative `x` exactly -1. Doubling is exact, and each pass rounds value by
-/// value, so the bits are the expression's.
-pub(crate) fn tanh_in_place(values: &mut [f64]) {
-    for v in values.iter_mut() {
-        *v *= 2.0;
-    }
-    exp_in_place(values);
-    for v in values.iter_mut() {
-        *v = 1.0 - 2.0 / (*v + 1.0);
-    }
 }
 
 /// Columns `start..end` of a `cols`-wide matrix, a copy.

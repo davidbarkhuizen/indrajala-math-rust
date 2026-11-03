@@ -1,4 +1,4 @@
-//! The bindings of the core's global generator (`indrajala_math::random`): the seed's Python
+//! The bindings of the core's global generator (`indrajala_math::random::legacy`): the seed's Python
 //! forms read as numpy's `np.random.seed` reads them, and the draws in a shape from Python.
 
 use pyo3::exceptions::{PyTypeError, PyValueError};
@@ -6,9 +6,9 @@ use pyo3::prelude::*;
 
 use crate::array::{parse_shape, RustArray};
 use crate::linalg::py_err;
-use indrajala_math::random as core_random;
+use indrajala_math::random::legacy as core_random;
 #[allow(unused_imports)]
-pub(crate) use indrajala_math::random::{bernoulli_values, draw_bernoulli_mask, seed_at_import, shaped, DoubleSource};
+pub(crate) use indrajala_math::random::legacy::{bernoulli_values, draw_bernoulli_mask, seed_at_import, shaped, DoubleSource};
 
 const SEED_RANGE_MESSAGE: &str = "Seed must be between 0 and 2**32 - 1";
 

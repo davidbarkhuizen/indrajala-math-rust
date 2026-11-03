@@ -27,9 +27,10 @@
 use std::collections::HashMap;
 
 use crate::array::{Array, Shape};
-use crate::ops::same_shape_elementwise;
-use crate::recurrent::{
-    attention_pooling_backward, attention_pooling_forward, codes_backward, codes_forward, columns, features_per_token,
+use crate::ops::arith::same_shape_elementwise;
+use crate::nn::recurrent;
+use crate::nn::recurrent::{
+    attention_pooling_backward, attention_pooling_forward, columns, features_per_token,
     gru_backward, gru_forward, matrix_shape, require_shape, require_temperature, soft_codes_backward,
     soft_codes_forward,
 };
@@ -104,7 +105,7 @@ fn snap(
 ) -> Result<(Array, Option<Vec<usize>>, Option<Soft>), Error> {
     match (codes, temperature) {
         (Some(e), None) => {
-            let (q, indices) = codes_forward(h, e)?;
+            let (q, indices) = recurrent::codes_forward(h, e)?;
             Ok((q, Some(indices), None))
         }
         (Some(e), Some(temperature)) => {
@@ -162,7 +163,7 @@ fn snap_backward(
     }
     match (indices, grad_e) {
         (Some(indices), Some(grad_e)) => {
-            let (dh, grad_e) = codes_backward(&dq, h, q, indices.clone(), grad_e, weight, commitment, target)?;
+            let (dh, grad_e) = recurrent::codes_backward(&dq, h, q, indices.clone(), grad_e, weight, commitment, target)?;
             Ok((dh, Some(grad_e)))
         }
         (None, None) => match target {

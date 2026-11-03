@@ -20,27 +20,17 @@
 //! # Ok::<(), indrajala_math::Error>(())
 //! ```
 
-pub mod activation;
+// The layers, each using only those listed above it (indrajala-ml's crate structure workplan, D1;
+// tests/layers.rs checks it).
 mod array;
-pub mod attention;
-pub mod batch_norm;
-pub mod conv;
-pub mod cr_exp;
-pub mod erf;
 mod error;
-pub mod factored;
-pub mod fused;
-pub mod generator;
-pub mod layer_norm;
-pub mod linalg;
-pub mod mnist;
+pub mod num;
 pub mod ops;
-pub mod program;
+pub mod linalg;
 pub mod random;
-pub mod recurrent;
-pub mod scalar;
-pub mod tokens;
-pub mod ufuncs;
+pub mod nn;
+pub mod program;
+pub mod data;
 
 pub use array::{Array, Shape};
 pub use error::Error;

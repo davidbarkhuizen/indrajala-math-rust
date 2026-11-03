@@ -9,7 +9,7 @@
 //! `Position` needs none: it is `Array`'s `+` and `sum_axis0`.
 
 use crate::array::{Array, Shape};
-use crate::generator::Generator;
+use crate::random::generator::Generator;
 use crate::Error;
 
 /// `(rows, width)` of one example (1 row) or a batch.

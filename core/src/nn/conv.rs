@@ -20,7 +20,7 @@
 
 use crate::array::{Array, Shape};
 use crate::linalg::{matmul_long_k, matmul_thread_count, narrow_rows_per_block, tiled_row_range, Panel, OVERWRITE};
-use crate::scalar::relu;
+use crate::num::scalar::relu;
 use crate::Error;
 
 /// The shape arithmetic for one conv or pool layer, built once by the Python layer and passed to

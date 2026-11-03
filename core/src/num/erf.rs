@@ -4,7 +4,7 @@
 //! A port of fdlibm's `s_erf.c` (Sun, 1993; netlib's fdlibm 5.3, `@(#)s_erf.c 1.3 95/01/18`), its
 //! `erf` half, step for step: four ranges of `|x|`, each a rational approximation, the last two
 //! through `exp` twice. Its operations are `+ - * /`, `abs`, one exact truncation (the low 32 bits
-//! of `|x|` cleared) and the crate's correctly rounded [`crate::cr_exp::exp`] where fdlibm calls
+//! of `|x|` cleared) and the crate's correctly rounded [`crate::num::exp::exp`] where fdlibm calls
 //! `__ieee754_exp`; Rust never contracts `a * b + c`, so the bits are the expression's, the same on
 //! every machine. indrajala-ml's pure-Python and numpy ports take the same steps through their own
 //! `exp`, so the three agree by bits wherever their `exp` does (the tests give them the crate's).
@@ -20,7 +20,7 @@
 //! software is freely granted, provided that this notice
 //! is preserved.
 
-use crate::cr_exp::exp;
+use crate::num::exp::exp;
 
 const TINY: f64 = 1e-300;
 /// `c = (float)0.84506291151`, erf(1) rounded to single precision.

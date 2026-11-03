@@ -1,4 +1,4 @@
-//! The bindings of the core's `conv` (`indrajala_math::conv`): each `#[pyfunction]` lends its
+//! The bindings of the core's `conv` (`indrajala_math::nn::conv`): each `#[pyfunction]` lends its
 //! arrays to the core's and moves the results in.
 
 use pyo3::prelude::*;
@@ -6,16 +6,16 @@ use pyo3::prelude::*;
 use crate::array::RustArray;
 use crate::linalg::py_err;
 #[allow(unused_imports)]
-pub(crate) use indrajala_math::conv::*;
+pub(crate) use indrajala_math::nn::conv::*;
 
-/// The shape arithmetic for one conv or pool layer (`indrajala_math::conv::ConvGeometry`), built
+/// The shape arithmetic for one conv or pool layer (`indrajala_math::nn::conv::ConvGeometry`), built
 /// once by the Python layer and passed to every call.
 #[pyclass(frozen, skip_from_py_object, name = "ConvGeometry")]
 #[derive(Clone, Copy, Debug)]
-pub struct ConvGeometry(pub indrajala_math::conv::ConvGeometry);
+pub struct ConvGeometry(pub indrajala_math::nn::conv::ConvGeometry);
 
 impl std::ops::Deref for ConvGeometry {
-    type Target = indrajala_math::conv::ConvGeometry;
+    type Target = indrajala_math::nn::conv::ConvGeometry;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -33,7 +33,7 @@ impl ConvGeometry {
         kernel_size: usize,
         stride: usize,
     ) -> PyResult<Self> {
-        indrajala_math::conv::ConvGeometry::new(input_height, input_width, input_channels, kernel_size, stride)
+        indrajala_math::nn::conv::ConvGeometry::new(input_height, input_width, input_channels, kernel_size, stride)
             .map(ConvGeometry)
             .map_err(py_err)
     }
@@ -117,7 +117,7 @@ pub fn conv_forward_batch(
     b: &RustArray,
     geometry: &ConvGeometry,
 ) -> PyResult<(RustArray, RustArray)> {
-    indrajala_math::conv::conv_forward_batch(w, x, b, geometry)
+    indrajala_math::nn::conv::conv_forward_batch(w, x, b, geometry)
         .map(|r| {
             let (r0, r1) = r;
             (RustArray::from(r0), RustArray::from(r1))
@@ -136,7 +136,7 @@ pub fn conv_linear_forward_batch(
     x: &RustArray,
     geometry: &ConvGeometry,
 ) -> PyResult<(RustArray, RustArray)> {
-    indrajala_math::conv::conv_linear_forward_batch(w, x, geometry)
+    indrajala_math::nn::conv::conv_linear_forward_batch(w, x, geometry)
         .map(|r| {
             let (r0, r1) = r;
             (RustArray::from(r0), RustArray::from(r1))
@@ -157,7 +157,7 @@ pub fn conv_linear_forward_batch(
 /// and `dX` rows, so no output's value depends on the split.
 #[pyfunction]
 pub fn conv_downstream_batch(w: &RustArray, delta_batch: &RustArray, geometry: &ConvGeometry) -> PyResult<RustArray> {
-    indrajala_math::conv::conv_downstream_batch(w, delta_batch, geometry)
+    indrajala_math::nn::conv::conv_downstream_batch(w, delta_batch, geometry)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -174,7 +174,7 @@ pub fn conv_accumulate_gradient_batch(
     grad_b: &RustArray,
     geometry: &ConvGeometry,
 ) -> PyResult<(RustArray, RustArray)> {
-    indrajala_math::conv::conv_accumulate_gradient_batch(delta_batch, cols, grad_w, grad_b, geometry)
+    indrajala_math::nn::conv::conv_accumulate_gradient_batch(delta_batch, cols, grad_w, grad_b, geometry)
         .map(|r| {
             let (r0, r1) = r;
             (RustArray::from(r0), RustArray::from(r1))
@@ -191,7 +191,7 @@ pub fn conv_linear_accumulate_gradient_batch(
     grad_w: &RustArray,
     geometry: &ConvGeometry,
 ) -> PyResult<RustArray> {
-    indrajala_math::conv::conv_linear_accumulate_gradient_batch(delta_batch, cols, grad_w, geometry)
+    indrajala_math::nn::conv::conv_linear_accumulate_gradient_batch(delta_batch, cols, grad_w, geometry)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -205,7 +205,7 @@ pub fn conv_linear_accumulate_gradient_batch(
 /// order; 2x2 windows at stride 2 take a fixed-size one, which runs in about a third of the time.
 #[pyfunction]
 pub fn max_pool_forward_batch(x: &RustArray, geometry: &ConvGeometry) -> PyResult<(RustArray, RustArray)> {
-    indrajala_math::conv::max_pool_forward_batch(x, geometry)
+    indrajala_math::nn::conv::max_pool_forward_batch(x, geometry)
         .map(|r| {
             let (r0, r1) = r;
             (RustArray::from(r0), RustArray::from(r1))
@@ -226,7 +226,7 @@ pub fn max_pool_downstream_batch(
     argmax: &RustArray,
     geometry: &ConvGeometry,
 ) -> PyResult<RustArray> {
-    indrajala_math::conv::max_pool_downstream_batch(delta_batch, argmax, geometry)
+    indrajala_math::nn::conv::max_pool_downstream_batch(delta_batch, argmax, geometry)
         .map(RustArray::from)
         .map_err(py_err)
 }
