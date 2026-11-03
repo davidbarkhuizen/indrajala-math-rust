@@ -6,8 +6,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
 use crate::array::RustArray;
-use crate::generator::Generator;
-use crate::linalg::py_err;
+use crate::error::py_err;
+use crate::random::generator::Generator;
 use indrajala_math::program::{Op, ProgramForward, Reads, MEMORY_BUDGET};
 use indrajala_math::Array;
 
@@ -297,4 +297,13 @@ pub fn argmax_token_rows<'py>(
         .into_iter()
         .map(|row| PyTuple::new(py, row))
         .collect()
+}
+
+/// Adds this module's functions and classes to the Python module, then its children's.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(window_program_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(window_program_learn, m)?)?;
+    m.add_function(wrap_pyfunction!(argmax_token_rows, m)?)?;
+    m.add_class::<WindowProgram>()?;
+    Ok(())
 }

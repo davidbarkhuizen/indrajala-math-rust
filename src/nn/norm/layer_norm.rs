@@ -1,10 +1,10 @@
-//! The bindings of the core's `layer_norm` (`indrajala_math::nn::norm::layer_norm`): each `#[pyfunction]` lends its
-//! arrays to the core's and moves the results in.
+//! The bindings of the core's `nn::norm::layer_norm`: each `#[pyfunction]` lends its arrays to the
+//! core's and moves the results in.
 
 use pyo3::prelude::*;
 
 use crate::array::RustArray;
-use crate::linalg::py_err;
+use crate::error::py_err;
 
 /// `LayerNormArrayLayer.forward`: one example, `x` 1D of `T * d` values. Returns `(a, xhat, std)`,
 /// what the backward pass reads: `xhat` in `x`'s layout and `std = sqrt(var + eps)` per token.
@@ -73,4 +73,13 @@ pub fn layer_norm_accumulate_gradient_batch(
             (RustArray::from(r0), RustArray::from(r1))
         })
         .map_err(py_err)
+}
+
+/// Adds this module's functions and classes to the Python module, then its children's.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(layer_norm_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(layer_norm_forward_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(layer_norm_downstream_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(layer_norm_accumulate_gradient_batch, m)?)?;
+    Ok(())
 }

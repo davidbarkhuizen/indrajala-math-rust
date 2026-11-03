@@ -1,21 +1,12 @@
 //! The core's products (`indrajala_math::linalg`) for the bindings: each wrapper lends the core
 //! array inside each `Array` and moves the result in, so nothing is copied at the boundary.
 
-use pyo3::exceptions::{PyOverflowError, PyValueError};
 use pyo3::prelude::*;
 
 use indrajala_math::linalg;
 
 use crate::array::RustArray;
-
-/// The core's error as the Python exception its kind names.
-pub(crate) fn py_err(error: indrajala_math::Error) -> PyErr {
-    match error {
-        indrajala_math::Error::InvalidArgument(message) => PyValueError::new_err(message),
-        indrajala_math::Error::Overflow(message) => PyOverflowError::new_err(message),
-        _ => PyValueError::new_err(error.to_string()),
-    }
-}
+use crate::error::py_err;
 
 /// `a @ b` (`indrajala_math::linalg::matmul`).
 pub(crate) fn matmul(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
@@ -58,4 +49,13 @@ impl RustArray {
 #[pyfunction]
 pub fn outer(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
     linalg::outer(a, b).map(RustArray::from).map_err(py_err)
+}
+
+/// Adds this module's functions and classes to the Python module, then its children's.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(set_matmul_threading, m)?)?;
+    m.add_function(wrap_pyfunction!(matmul_threads_for, m)?)?;
+    m.add_function(wrap_pyfunction!(set_kernel_overrides, m)?)?;
+    m.add_function(wrap_pyfunction!(outer, m)?)?;
+    Ok(())
 }

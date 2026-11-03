@@ -1,10 +1,12 @@
-//! The bindings of the core's `recurrent` (`indrajala_math::nn::recurrent`): each `#[pyfunction]` lends its
-//! arrays to the core's and moves the results in.
+//! The bindings of the core's `nn::recurrent`: each `#[pyfunction]` lends its arrays to the core's
+//! and moves the results in.
+
+mod factored;
 
 use pyo3::prelude::*;
 
 use crate::array::RustArray;
-use crate::linalg::py_err;
+use crate::error::py_err;
 
 /// `StateInputArrayLayer.forward_batch`: `out_t = x_t + P c` for each of the `tokens` tokens of
 /// each example, `x` `(N, T * d)`, `state` `(N, s)`, `p` `(d, s)`; `P c` is
@@ -281,4 +283,23 @@ pub fn concatenate_columns(arrays: Vec<PyRef<'_, RustArray>>) -> PyResult<RustAr
     indrajala_math::nn::recurrent::concatenate_columns(&arrays.iter().map(|a| &a.0).collect::<Vec<_>>())
         .map(RustArray::from)
         .map_err(py_err)
+}
+
+/// Adds this module's functions and classes to the Python module, then its children's.
+pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(state_input_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(state_input_backward, m)?)?;
+    m.add_function(wrap_pyfunction!(state_input_film_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(state_input_film_backward, m)?)?;
+    m.add_function(wrap_pyfunction!(attention_pooling_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(attention_pooling_backward, m)?)?;
+    m.add_function(wrap_pyfunction!(gru_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(gru_backward, m)?)?;
+    m.add_function(wrap_pyfunction!(codes_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(codes_backward, m)?)?;
+    m.add_function(wrap_pyfunction!(soft_codes_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(soft_codes_backward, m)?)?;
+    m.add_function(wrap_pyfunction!(concatenate_columns, m)?)?;
+    factored::register(m)?;
+    Ok(())
 }
