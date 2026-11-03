@@ -479,3 +479,42 @@ pub fn cross_attention_accumulate_gradient_batch(
     })
     .map_err(py_err)
 }
+
+/// `CrossAttentionArrayLayer`'s decoding (indrajala-ml's cross-attention workplan, D7): the queries
+/// `x` (2D) against keys `k` and values `v` computed once per source, `(N * S, g·d_k)` each, masked
+/// by `segments` and `memory_segments` (both or neither), never dropped. Returns `a` in `x`'s shape,
+/// each query's bits the full pass's at that token.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (x, k, v, wq, bq, wo, bo, heads, *, segments = None, memory_segments = None, block = 16, key_value_heads = None))]
+pub fn cross_attention_attend_batch(
+    x: &RustArray,
+    k: &RustArray,
+    v: &RustArray,
+    wq: &RustArray,
+    bq: &RustArray,
+    wo: &RustArray,
+    bo: &RustArray,
+    heads: usize,
+    segments: Option<&RustArray>,
+    memory_segments: Option<&RustArray>,
+    block: usize,
+    key_value_heads: Option<usize>,
+) -> PyResult<RustArray> {
+    indrajala_math::attention::cross_attention_attend_batch(
+        x,
+        k,
+        v,
+        wq,
+        bq,
+        wo,
+        bo,
+        heads,
+        key_value_heads.unwrap_or(heads),
+        segments.map(|a| &a.0),
+        memory_segments.map(|a| &a.0),
+        block,
+    )
+    .map(RustArray::from)
+    .map_err(py_err)
+}

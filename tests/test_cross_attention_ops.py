@@ -29,6 +29,7 @@ from indrajala_math_rust import (
     attention_downstream_batch,
     attention_forward_batch,
     cross_attention_accumulate_gradient_batch,
+    cross_attention_attend_batch,
     cross_attention_downstream_batch,
     cross_attention_forward_batch,
     layer_accumulate_gradient_batch,
@@ -440,6 +441,70 @@ def test_the_cross_attention_ops_refuse_what_doesnt_fit():
             *[to_array(c[name]) for name in ("wq", "wk", "wv", "wo")]
             + [to_array(f["q"]), to_array(f["k"][:-1])]
             + [to_array(f[name]) for name in ("v", "h", "m", "l")],
+            heads=2,
+            key_value_heads=1,
+        )
+
+
+# decoding (indrajala-ml's cross-attention workplan, D7): the queries against the keys and values
+# computed once per source, the forward pass's k and v, give its output by bits
+
+
+def _attend(c: dict[str, Any], f: dict[str, Any], x: np.ndarray, segments: Any = None, **options: Any) -> np.ndarray:
+    heads, key_value_heads = c["shape"][5], c["shape"][7]
+    return to_numpy(
+        cross_attention_attend_batch(
+            to_array(x),
+            to_array(f["k"]),
+            to_array(f["v"]),
+            *(to_array(c[name]) for name in ("wq", "bq", "wo", "bo")),
+            heads=heads,
+            key_value_heads=key_value_heads,
+            **_segment_options(segments),
+            **options,
+        )
+    )
+
+
+@pytest.mark.parametrize("case", CASES, ids=map(_case_id, CASES))
+def test_attending_from_the_cached_keys_and_values_is_the_forward_pass_by_bits(case: tuple[tuple[int, ...], int, bool]):
+    shape, block, segmented = case
+    c, segments = _case(shape), _case_segments(shape, segmented)
+    f = _forward(c, segments, block=block)
+    assert bits(_attend(c, f, c["x"], segments, block=block)) == bits(f["a"])
+
+
+@pytest.mark.parametrize("shape", SHAPES, ids=map(_id, SHAPES))
+def test_one_query_a_row_is_the_forward_passs_row_at_that_token_by_bits(shape: tuple[int, ...]):
+    # a decode's step: each token alone against the whole memory, its own segment's mask
+    _, tokens, d = shape[:3]
+    c, segments = _case(shape), _case_segments(shape, True)
+    f = _forward(c, segments)
+    for t in range(tokens):
+        x = c["x"][:, t * d : (t + 1) * d]
+        one = (segments[0][:, t : t + 1], segments[1])
+        assert bits(_attend(c, f, x, one)) == bits(f["a"][:, t * d : (t + 1) * d]), t
+
+
+def test_the_attend_op_refuses_what_doesnt_fit():
+    shape = (2, 3, 4, 5, 6, 2, 2, 1)
+    c = _case(shape)
+    f = _forward(c)
+    with pytest.raises(ValueError, match="k of whole memories"):
+        cross_attention_attend_batch(
+            to_array(c["x"]),
+            to_array(f["k"][:-1]),
+            to_array(f["v"]),
+            *(to_array(c[name]) for name in ("wq", "bq", "wo", "bo")),
+            heads=2,
+            key_value_heads=1,
+        )
+    with pytest.raises(ValueError, match="requires v of shape"):
+        cross_attention_attend_batch(
+            to_array(c["x"]),
+            to_array(f["k"]),
+            to_array(f["v"][:, :-1]),
+            *(to_array(c[name]) for name in ("wq", "bq", "wo", "bo")),
             heads=2,
             key_value_heads=1,
         )

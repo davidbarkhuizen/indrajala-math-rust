@@ -1362,6 +1362,74 @@ pub fn cross_attention_forward_batch(
     Ok((a, q, k, v, h, m, l, saved))
 }
 
+/// `CrossAttentionArrayLayer`'s decoding (indrajala-ml's cross-attention workplan, D7): the queries
+/// `x` (2D, `batch, T * d`, a prefill's `T` tokens or a step's one) against keys `k` and values `v`
+/// computed once per source, `(N * S, g·d_k)` each, the memory's rows through `wk`, `bk` and `wv`,
+/// `bv` (`affine_forward_batch`, project's products): `Q = X Wq^T + bq`, then attend and combine as
+/// `cross_attention_forward_batch`, masked by `segments` and `memory_segments` (both or neither),
+/// never dropped. Returns `a` in `x`'s shape. Each query's row is attended alone in the same key
+/// blocks, so its bits are the full pass's at that token.
+#[allow(clippy::too_many_arguments)]
+pub fn cross_attention_attend_batch(
+    x: &Array,
+    k: &Array,
+    v: &Array,
+    wq: &Array,
+    bq: &Array,
+    wo: &Array,
+    bo: &Array,
+    heads: usize,
+    key_value_heads: usize,
+    segments: Option<&Array>,
+    memory_segments: Option<&Array>,
+    block: usize,
+) -> Result<Array, Error> {
+    let context = "cross_attention_attend_batch";
+    let (d, width) = (bo.data.len(), bq.data.len());
+    if d == 0 {
+        return Err(Error::invalid(format!("{context} requires a non-empty bo")));
+    }
+    let options = AttentionOptions::new(heads, key_value_heads, width, 0.0, context)?;
+    require_shape(wq, Shape::Matrix(width, d), "wq", context)?;
+    require_shape(bq, Shape::Vector(width), "bq", context)?;
+    require_shape(wo, Shape::Matrix(d, width), "wo", context)?;
+    require_block(block, context)?;
+    if !matches!(x.shape, Shape::Matrix(_, _)) {
+        return Err(Error::invalid(format!(
+            "{context} requires a 2D x, got shape {:?}",
+            x.shape
+        )));
+    }
+    let (examples, tokens) = examples_and_tokens(x, d, "x", context)?;
+    let memory_rows = match k.shape {
+        Shape::Matrix(rows, _) if rows > 0 && rows.is_multiple_of(examples) => rows,
+        shape => {
+            return Err(Error::invalid(format!(
+                "{context} requires k of whole memories, S rows per example of {examples}; got shape {shape:?}"
+            )));
+        }
+    };
+    require_shape(k, Shape::Matrix(memory_rows, options.kv_width()), "k", context)?;
+    require_shape(v, Shape::Matrix(memory_rows, options.kv_width()), "v", context)?;
+    let memory_tokens = memory_rows / examples;
+    let segments = cross_segments(segments, memory_segments, (examples, tokens, memory_tokens), context)?;
+    let q = affine_forward_batch(wq, &token_rows(x, d), bq)?;
+    let extent = Extent {
+        examples,
+        queries: tokens,
+        keys: memory_tokens,
+        block,
+        origin: 0,
+    };
+    let masking = cross_masking(segments, tokens, memory_tokens);
+    let (h, _m, _l) = tiled_forward([&q, k, v], extent, &options, masking, None)?;
+    let out = affine_forward_batch(wo, &h, bo)?;
+    Ok(Array {
+        data: out.data,
+        shape: x.shape,
+    })
+}
+
 /// `CrossAttentionArrayLayer._backward`: from `delta_batch` (`dl/dout`, 2D `batch, T * d`) and the
 /// forward pass's `q`, `k`, `v`, `h`, `m` and `l` (`cross_attention_forward_batch`'s), masked as the
 /// forward was (`segments`, `memory_segments`) in its key blocks of `block`, its dropout drawn again

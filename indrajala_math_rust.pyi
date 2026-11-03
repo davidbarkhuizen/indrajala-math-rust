@@ -419,6 +419,21 @@ def cross_attention_forward_batch(
     block: int = 16,
     key_value_heads: int | None = None,
 ) -> tuple[Array, Array, Array, Array, Array, Array, Array, Generator | None]: ...
+def cross_attention_attend_batch(
+    x: Array,
+    k: Array,
+    v: Array,
+    wq: Array,
+    bq: Array,
+    wo: Array,
+    bo: Array,
+    heads: int,
+    *,
+    segments: Array | None = None,
+    memory_segments: Array | None = None,
+    block: int = 16,
+    key_value_heads: int | None = None,
+) -> Array: ...
 def cross_attention_downstream_batch(
     delta_batch: Array,
     wq: Array,
