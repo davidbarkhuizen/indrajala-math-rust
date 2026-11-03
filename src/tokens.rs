@@ -6,8 +6,6 @@ use pyo3::prelude::*;
 use crate::array::RustArray;
 use crate::generator::Generator;
 use crate::linalg::py_err;
-#[allow(unused_imports)]
-pub(crate) use indrajala_math::nn::tokens::*;
 
 /// `PatchesArrayLayer.forward_batch` (and `forward`, one example): each channel-major `(H, W, C)`
 /// image as `H/p * W/p` tokens of `p * p * C` features, a fixed permutation.
@@ -43,7 +41,7 @@ pub fn patches_downstream(
 /// fold from `0.0` over the tokens in order, as numpy's `np.cumsum` along them.
 #[pyfunction]
 pub fn token_mean_forward(x: &RustArray, tokens: usize) -> PyResult<RustArray> {
-    indrajala_math::nn::tokens::token_mean_forward(x, tokens)
+    indrajala_math::nn::tokens::mean_forward(x, tokens)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -52,7 +50,7 @@ pub fn token_mean_forward(x: &RustArray, tokens: usize) -> PyResult<RustArray> {
 /// token `t`.
 #[pyfunction]
 pub fn token_mean_downstream(delta: &RustArray, tokens: usize) -> PyResult<RustArray> {
-    indrajala_math::nn::tokens::token_mean_downstream(delta, tokens)
+    indrajala_math::nn::tokens::mean_downstream(delta, tokens)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -87,7 +85,7 @@ pub fn token_dropout_forward(
     drop_probability: f64,
     mut rng: PyRefMut<'_, Generator>,
 ) -> PyResult<(RustArray, RustArray)> {
-    indrajala_math::nn::tokens::token_dropout_forward(x, drop_probability, &mut rng.0)
+    indrajala_math::nn::tokens::dropout_forward(x, drop_probability, &mut rng.0)
         .map(|r| {
             let (r0, r1) = r;
             (RustArray::from(r0), RustArray::from(r1))
@@ -99,7 +97,7 @@ pub fn token_dropout_forward(
 /// downstream, `mask` `token_dropout_forward`'s.
 #[pyfunction]
 pub fn token_dropout_downstream(delta: &RustArray, mask: &RustArray, drop_probability: f64) -> PyResult<RustArray> {
-    indrajala_math::nn::tokens::token_dropout_downstream(delta, mask, drop_probability)
+    indrajala_math::nn::tokens::dropout_downstream(delta, mask, drop_probability)
         .map(RustArray::from)
         .map_err(py_err)
 }

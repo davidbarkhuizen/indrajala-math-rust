@@ -1,8 +1,6 @@
 use pyo3::prelude::*;
 
 mod array;
-// moved to the core, kept at their old paths for the bindings' modules
-
 mod attention;
 mod batch_norm;
 mod conv;

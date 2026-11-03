@@ -1,7 +1,7 @@
 //! The hidden layers' activations (indrajala-ml's FFN activations workplan, D9): ReLU, GELU (the
 //! exact, `erf` form; Hendrycks & Gimpel 2016), GELU-tanh (GPT-2's approximation) and SiLU
 //! (`z * sigmoid(z)`, Elfwing et al. 2018; the gated FFN's, D3), one family the fused dense ops
-//! ([`crate::nn::dense`]), the gated ops and the masks ([`crate::ops::unary::array_activation_mask`]) take
+//! ([`crate::nn::dense`]), the gated ops and the masks ([`crate::ops::mask::activation`]) take
 //! as an argument.
 //!
 //! The expressions, their grouping fixed (indrajala-ml's pure-Python and numpy layers take the same
@@ -29,9 +29,9 @@
 //! forward keeps is [`Activation::keeps_preactivation`]'s answer, and a hidden delta's `cached`
 //! operand is `a` for ReLU and `z` for the rest.
 
-use crate::num::exp::{exp, sigmoid_in_place};
 use crate::num::erf::erf;
 use crate::num::exp::tanh_in_place;
+use crate::num::exp::{exp, sigmoid_in_place};
 use crate::num::scalar::relu;
 use crate::Error;
 

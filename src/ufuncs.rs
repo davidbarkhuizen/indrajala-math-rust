@@ -6,8 +6,6 @@ use pyo3::prelude::*;
 use crate::array::RustArray;
 use crate::fused::activation_named;
 use crate::linalg::py_err;
-#[allow(unused_imports)]
-pub(crate) use indrajala_math::ops::unary::*;
 
 /// Elementwise `e^x` over a whole array - mirrors `array_layer.sigmoid`'s own reliance on
 /// `exp`'s overflow behavior (a large negative `z` drives `exp(-z)` to `f64::INFINITY`, and
@@ -62,7 +60,7 @@ pub fn sum_axis0(arr: &RustArray) -> PyResult<RustArray> {
 /// otherwise out of scope for this core; this is the one exception.
 #[pyfunction]
 pub fn array_relu(arr: &RustArray) -> RustArray {
-    RustArray::from(indrajala_math::ops::unary::array_relu(arr))
+    RustArray::from(indrajala_math::ops::unary::relu(arr))
 }
 
 /// `downstream * act'(cached)` - a hidden layer's delta from a downstream it was handed (before a
@@ -72,7 +70,7 @@ pub fn array_relu(arr: &RustArray) -> RustArray {
 #[pyfunction]
 pub fn array_activation_mask(downstream: &RustArray, cached: &RustArray, activation: &str) -> PyResult<RustArray> {
     let activation = activation_named(activation)?;
-    indrajala_math::ops::unary::array_activation_mask(downstream, cached, activation)
+    indrajala_math::ops::mask::activation(downstream, cached, activation)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -84,7 +82,7 @@ pub fn array_activation_mask(downstream: &RustArray, cached: &RustArray, activat
 /// same downstream it computes their bits. Shape-agnostic, as `array_activation_mask`.
 #[pyfunction]
 pub fn array_sigmoid_mask(downstream: &RustArray, a: &RustArray) -> PyResult<RustArray> {
-    indrajala_math::ops::unary::array_sigmoid_mask(downstream, a)
+    indrajala_math::ops::mask::sigmoid(downstream, a)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -101,7 +99,7 @@ pub fn array_dropout_mask(
     keep_probability: f64,
     was_training: bool,
 ) -> PyResult<RustArray> {
-    indrajala_math::ops::unary::array_dropout_mask(downstream, base_activation, mask, keep_probability, was_training)
+    indrajala_math::ops::mask::dropout(downstream, base_activation, mask, keep_probability, was_training)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -117,7 +115,7 @@ pub fn array_dropout_mask(
 /// output's sum in indrajala-ml), not `e.sum()`'s pairwise sum.
 #[pyfunction]
 pub fn array_softmax(arr: &RustArray) -> RustArray {
-    RustArray::from(indrajala_math::ops::unary::array_softmax(arr))
+    RustArray::from(indrajala_math::ops::unary::softmax(arr))
 }
 
 /// The index of the largest element in a 1D array - `classify_state`'s own

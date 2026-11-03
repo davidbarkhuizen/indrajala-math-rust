@@ -5,11 +5,11 @@
 //! `indrajala_ml/model/layers/numpy/array_layer.py` method's formula exactly - see that file for the
 //! reference this crate is checked against.
 
-use crate::num::activation::Activation;
 use crate::array::{Array, Shape};
 use crate::linalg::{matmul, matmul_add, matmul_nt};
-use crate::ops::arith::same_shape_elementwise;
+use crate::num::activation::Activation;
 use crate::ops::arith::require_same_shape;
+use crate::ops::arith::same_shape_elementwise;
 use crate::ops::mask::masked;
 use crate::ops::unary::sum_axis0;
 use crate::Error;
@@ -40,19 +40,19 @@ pub(super) fn linear_preactivation_batch(w: &Array, x: &Array, b: &Array) -> Res
 }
 
 /// `ArrayLayer.forward`: `sigmoid(self.W @ x + self.b)`, `x`/`b` both 1D.
-pub fn layer_forward(w: &Array, x: &Array, b: &Array) -> Result<Array, Error> {
+pub fn forward(w: &Array, x: &Array, b: &Array) -> Result<Array, Error> {
     Ok(sigmoid(&linear_preactivation(w, x, b)?))
 }
 
 /// `ArrayLayer.forward_batch`: `sigmoid(X @ self.W.T + self.b)`, `X` 2D (`batch, input_size`).
-pub fn layer_forward_batch(w: &Array, x: &Array, b: &Array) -> Result<Array, Error> {
+pub fn forward_batch(w: &Array, x: &Array, b: &Array) -> Result<Array, Error> {
     Ok(sigmoid(&linear_preactivation_batch(w, x, b)?))
 }
 
 /// `ArrayLayer.compute_output_delta`/`compute_output_delta_batch`: `(a - reference) * a * (1 -
 /// a)` - one elementwise formula, shape-agnostic (works for both the single-example 1D case and
 /// the batched 2D case), so unlike `forward`/`forward_batch` this needs only one function.
-pub fn layer_output_delta(a: &Array, reference: &Array) -> Result<Array, Error> {
+pub fn output_delta(a: &Array, reference: &Array) -> Result<Array, Error> {
     require_same_shape(a, reference, "layer_output_delta")?;
     let data = a
         .data
@@ -71,7 +71,7 @@ pub fn layer_output_delta(a: &Array, reference: &Array) -> Result<Array, Error> 
 /// most of the call: 273 of 327 µs at 32 x 5408). It sums sequentially over `W`'s rows (`matmul`'s tiled kernel, as a
 /// one-row product), not with `dot_product`'s 4-lane grouping, so the result differs from `W.T @ delta` by a few ULPs,
 /// but is still the same on the scalar and AVX2 paths.
-pub fn layer_downstream(w: &Array, delta: &Array) -> Result<Array, Error> {
+pub fn downstream(w: &Array, delta: &Array) -> Result<Array, Error> {
     if !matches!(delta.shape, Shape::Vector(_)) {
         return Err(Error::invalid(format!(
             "layer_downstream requires a 1D delta, got shape {:?}",
@@ -82,7 +82,7 @@ pub fn layer_downstream(w: &Array, delta: &Array) -> Result<Array, Error> {
 }
 
 /// `ArrayLayer.downstream_batch`: `self.delta_batch @ self.W`.
-pub fn layer_downstream_batch(w: &Array, delta_batch: &Array) -> Result<Array, Error> {
+pub fn downstream_batch(w: &Array, delta_batch: &Array) -> Result<Array, Error> {
     matmul(delta_batch, w)
 }
 
@@ -91,7 +91,7 @@ pub fn layer_downstream_batch(w: &Array, delta_batch: &Array) -> Result<Array, E
 /// ReLU, dropout); each differs only in what elementwise formula it applies on top, not in how
 /// the downstream matmul itself is computed.
 pub(super) fn hidden_downstream(next_w: &Array, next_delta: &Array, a: &Array, context: &str) -> Result<Array, Error> {
-    let downstream = layer_downstream(next_w, next_delta)?;
+    let downstream = downstream(next_w, next_delta)?;
     require_same_shape(&downstream, a, context)?;
     Ok(downstream)
 }
@@ -105,14 +105,14 @@ pub(super) fn hidden_downstream_batch(
     a_batch: &Array,
     context: &str,
 ) -> Result<Array, Error> {
-    let downstream = layer_downstream_batch(next_w, next_delta_batch)?;
+    let downstream = downstream_batch(next_w, next_delta_batch)?;
     require_same_shape(&downstream, a_batch, context)?;
     Ok(downstream)
 }
 
 /// `ArrayLayer.compute_hidden_delta`: `(next_layer.W.T @ next_layer.delta) * self.a * (1 -
 /// self.a)`, single-example (`next_delta`/`a` both 1D).
-pub fn layer_hidden_delta(next_w: &Array, next_delta: &Array, a: &Array) -> Result<Array, Error> {
+pub fn hidden_delta(next_w: &Array, next_delta: &Array, a: &Array) -> Result<Array, Error> {
     let downstream = hidden_downstream(next_w, next_delta, a, "layer_hidden_delta")?;
     let data = downstream
         .data
@@ -126,7 +126,7 @@ pub fn layer_hidden_delta(next_w: &Array, next_delta: &Array, a: &Array) -> Resu
 /// `ArrayLayer.compute_hidden_delta_batch`: `(next_layer.delta_batch @ next_layer.W) * self.A *
 /// (1 - self.A)` - batched; see `hidden_downstream_batch` for why this needs its own downstream
 /// computation rather than reusing `hidden_downstream`.
-pub fn layer_hidden_delta_batch(next_w: &Array, next_delta_batch: &Array, a_batch: &Array) -> Result<Array, Error> {
+pub fn hidden_delta_batch(next_w: &Array, next_delta_batch: &Array, a_batch: &Array) -> Result<Array, Error> {
     let downstream = hidden_downstream_batch(next_w, next_delta_batch, a_batch, "layer_hidden_delta_batch")?;
     let data = downstream
         .data
@@ -144,7 +144,7 @@ pub fn layer_hidden_delta_batch(next_w: &Array, next_delta_batch: &Array, a_batc
 /// += delta`, single-example. Returns the updated `(grad_W, grad_b)` pair rather than mutating in
 /// place - `Array` is immutable from Python's own operators (`+=` rebinds via `__iadd__`, which
 /// this crate already has), so the caller rebinds `self._grad_W`/`self._grad_b` the same way.
-pub fn layer_accumulate_gradient(
+pub fn accumulate_gradient(
     delta: &Array,
     input_activation: &Array,
     grad_w: &Array,
@@ -182,7 +182,7 @@ pub fn layer_accumulate_gradient(
 
 /// `ArrayLayer.accumulate_gradient_batch`: `self._grad_W += self.delta_batch.T @
 /// input_activation_batch; self._grad_b += self.delta_batch.sum(axis=0)`.
-pub fn layer_accumulate_gradient_batch(
+pub fn accumulate_gradient_batch(
     delta_batch: &Array,
     input_activation_batch: &Array,
     grad_w: &Array,
@@ -200,7 +200,7 @@ pub fn layer_accumulate_gradient_batch(
 /// pre-activation when the activation's derivative reads it
 /// ([`Activation::keeps_preactivation`], the GELUs), else `None` (ReLU, whose arithmetic is
 /// `max(0, z)` by [`crate::num::scalar::relu`] as it always was).
-pub fn layer_activation_forward(
+pub fn activation_forward(
     w: &Array,
     x: &Array,
     b: &Array,
@@ -209,9 +209,9 @@ pub fn layer_activation_forward(
     Ok(activated(linear_preactivation(w, x, b)?, activation))
 }
 
-/// `layer_activation_forward`, batched: `act(X @ self.W.T + self.b)`, `X` 2D (`batch,
+/// `activation_forward`, batched: `act(X @ self.W.T + self.b)`, `X` 2D (`batch,
 /// input_size`).
-pub fn layer_activation_forward_batch(
+pub fn activation_forward_batch(
     w: &Array,
     x: &Array,
     b: &Array,
@@ -236,8 +236,8 @@ fn activated(z: Array, activation: Activation) -> (Array, Option<Array>) {
 
 /// The hidden delta of a dense layer with `activation`: `(next_layer.W.T @ next_layer.delta) *
 /// act'(cached)`, single-example (`next_delta`/`cached` both 1D); `cached` is what
-/// `layer_activation_forward` kept, `a` for ReLU (its mask `a > 0`), `z` for the GELUs.
-pub fn layer_activation_hidden_delta(
+/// `activation_forward` kept, `a` for ReLU (its mask `a > 0`), `z` for the GELUs.
+pub fn activation_hidden_delta(
     next_w: &Array,
     next_delta: &Array,
     cached: &Array,
@@ -248,10 +248,10 @@ pub fn layer_activation_hidden_delta(
     Ok(masked(&downstream, cached, activation))
 }
 
-/// `layer_activation_hidden_delta`, batched: `(next_layer.delta_batch @ next_layer.W) *
+/// `activation_hidden_delta`, batched: `(next_layer.delta_batch @ next_layer.W) *
 /// act'(cached_batch)`, no transpose on `next_w` (the shape-of-call-sites distinction
-/// `layer_hidden_delta_batch` documents).
-pub fn layer_activation_hidden_delta_batch(
+/// `hidden_delta_batch` documents).
+pub fn activation_hidden_delta_batch(
     next_w: &Array,
     next_delta_batch: &Array,
     cached_batch: &Array,
@@ -289,18 +289,18 @@ pub(super) fn with_skip(downstream: Array, skip: &Array, context: &str) -> Resul
 
 /// `ArrayLayer.compute_hidden_delta` when the next layer is a residual block's fork: `(body_w.T @
 /// body_delta + skip) * self.a * (1 - self.a)`, `body_w`/`body_delta` the body's first layer's and
-/// `skip` the block's add's delta - `layer_hidden_delta` with the skip term added to the downstream
+/// `skip` the block's add's delta - `hidden_delta` with the skip term added to the downstream
 /// before the sigmoid's derivative, in one call. Single-example (`body_delta`/`skip`/`a` all 1D).
-pub fn layer_hidden_delta_skip(body_w: &Array, body_delta: &Array, skip: &Array, a: &Array) -> Result<Array, Error> {
+pub fn hidden_delta_skip(body_w: &Array, body_delta: &Array, skip: &Array, a: &Array) -> Result<Array, Error> {
     let downstream = hidden_downstream(body_w, body_delta, a, "layer_hidden_delta_skip")?;
     let downstream = with_skip(downstream, skip, "layer_hidden_delta_skip")?;
     let data = same_shape_elementwise(&downstream.data, &a.data, |d, av| d * av * (1.0 - av));
     Ok(Array { data, shape: a.shape })
 }
 
-/// `layer_hidden_delta_skip`, batched: `(body_delta_batch @ body_w + skip_batch) * self.A * (1 -
+/// `hidden_delta_skip`, batched: `(body_delta_batch @ body_w + skip_batch) * self.A * (1 -
 /// self.A)`.
-pub fn layer_hidden_delta_skip_batch(
+pub fn hidden_delta_skip_batch(
     body_w: &Array,
     body_delta_batch: &Array,
     skip_batch: &Array,
@@ -316,9 +316,9 @@ pub fn layer_hidden_delta_skip_batch(
 }
 
 /// The hidden delta of a dense layer with `activation` when the next layer is a residual block's
-/// fork: `(body_w.T @ body_delta + skip) * act'(cached)`, `layer_activation_hidden_delta` with the
+/// fork: `(body_w.T @ body_delta + skip) * act'(cached)`, `activation_hidden_delta` with the
 /// skip term.
-pub fn layer_activation_hidden_delta_skip(
+pub fn activation_hidden_delta_skip(
     body_w: &Array,
     body_delta: &Array,
     skip: &Array,
@@ -331,9 +331,9 @@ pub fn layer_activation_hidden_delta_skip(
     Ok(masked(&downstream, cached, activation))
 }
 
-/// `layer_activation_hidden_delta_skip`, batched: `(body_delta_batch @ body_w + skip_batch) *
+/// `activation_hidden_delta_skip`, batched: `(body_delta_batch @ body_w + skip_batch) *
 /// act'(cached_batch)`.
-pub fn layer_activation_hidden_delta_skip_batch(
+pub fn activation_hidden_delta_skip_batch(
     body_w: &Array,
     body_delta_batch: &Array,
     skip_batch: &Array,
@@ -364,7 +364,7 @@ pub fn linear_forward_batch(w: &Array, x: &Array) -> Result<Array, Error> {
 }
 
 /// `LinearArrayLayer.accumulate_gradient_batch`: `self.grad_W += self.delta_batch.T @
-/// input_activation_batch`, `layer_accumulate_gradient_batch`'s `grad_W` without its `grad_b`.
+/// input_activation_batch`, `accumulate_gradient_batch`'s `grad_W` without its `grad_b`.
 pub fn linear_accumulate_gradient_batch(
     delta_batch: &Array,
     input_activation_batch: &Array,

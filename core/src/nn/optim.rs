@@ -18,7 +18,7 @@ fn require_batch_size(batch_size: usize, context: &str) -> Result<(), Error> {
 /// batch_size); self.b -= learning_rate * (self._grad_b / batch_size)` - shape-agnostic
 /// (`W`/`grad_W` are always the same shape as each other, likewise `b`/`grad_b`), so one function
 /// covers both the single-example (`batch_size=1`) and batched caller.
-pub fn layer_apply_accumulated_gradient(
+pub fn apply_accumulated_gradient(
     w: &Array,
     b: &Array,
     grad_w: &Array,
@@ -41,14 +41,14 @@ pub fn layer_apply_accumulated_gradient(
     Ok((new_w, new_b))
 }
 
-/// One single-example plain-SGD step: `layer_accumulate_gradient` into fresh zero accumulators,
-/// then `layer_apply_accumulated_gradient` with `batch_size=1`, in one pass and one allocation
+/// One single-example plain-SGD step: `dense::accumulate_gradient` into fresh zero accumulators,
+/// then `apply_accumulated_gradient` with `batch_size=1`, in one pass and one allocation
 /// per parameter. `RustArrayNetworkBase.learn` runs exactly that pair on every layer, and apply
 /// resets the accumulators, so at batch size 1 they are always fresh. Computes `w - lr * (0.0 +
 /// delta[i] * x[j])`: the `0.0 +` is the add into the zero accumulator, kept on purpose. It turns
 /// a `-0.0` product into `+0.0`, which changes the result where `w` is `-0.0`, so dropping it
 /// would break bit-identity with the pair it replaces.
-pub fn layer_sgd_step(
+pub fn sgd_step(
     w: &Array,
     b: &Array,
     delta: &Array,
@@ -73,7 +73,7 @@ pub fn layer_sgd_step(
             b.shape
         )));
     }
-    // layer_apply_accumulated_gradient's learning_rate * (g / batch_size) is exactly
+    // apply_accumulated_gradient's learning_rate * (g / batch_size) is exactly
     // learning_rate * g at batch_size=1
     let scale = learning_rate;
     let x = &input_activation.data;
@@ -92,7 +92,7 @@ pub fn layer_sgd_step(
 
 /// `AdamArrayLayer.apply_accumulated_gradient`: the Adam (Kingma & Ba, 2014) update rule, as one
 /// fused call per parameter (`W` or `b`) instead of composing it from several `Array` operators.
-/// Shape-agnostic like `layer_apply_accumulated_gradient`
+/// Shape-agnostic like `apply_accumulated_gradient`
 /// above, so this one helper covers both the `W`/`grad_W`/`m_W`/`v_W` (2D) and `b`/`grad_b`/`m_b`/
 /// `v_b` (1D) cases. `t` is the step count *after* incrementing - mirrors
 /// `AdamArrayLayer._t += 1` happening before the bias-correction terms are computed, so the
@@ -157,7 +157,7 @@ fn adam_update(
 /// isn't decayed; 0 is Adam): `W * (1 - learning_rate * weight_decay) - learning_rate * m_hat /
 /// (sqrt(v_hat) + epsilon)`. Returns `(W, b, m_W, v_W, m_b, v_b)`, the new parameters and moments.
 #[allow(clippy::too_many_arguments)]
-pub fn layer_adam_apply_accumulated_gradient(
+pub fn adam_apply_accumulated_gradient(
     w: &Array,
     b: &Array,
     grad_w: &Array,
@@ -226,10 +226,10 @@ pub fn layer_adam_apply_accumulated_gradient(
 /// added to the mean gradient: `W -= learning_rate * (grad_W / batch_size + l2_lambda * W);
 /// b -= learning_rate * (grad_b / batch_size)` (bias unregularized). No persistent
 /// per-parameter state at all (unlike
-/// `layer_adam_apply_accumulated_gradient`/`layer_momentum_apply_accumulated_gradient`), so this
+/// `adam_apply_accumulated_gradient`/`momentum_apply_accumulated_gradient`), so this
 /// takes only `W`/`b`/`grad_W`/`grad_b` plus the scalar `l2_lambda` - the simplest fused op in
 /// this round.
-pub fn layer_l2_apply_accumulated_gradient(
+pub fn l2_apply_accumulated_gradient(
     w: &Array,
     b: &Array,
     grad_w: &Array,
@@ -259,11 +259,11 @@ pub fn layer_l2_apply_accumulated_gradient(
 /// `velocity = momentum * velocity + grad / batch_size; param -= learning_rate * velocity`. It
 /// replaces Rumelhart et al.'s eq. (10), which folds the rate into the velocity and so needs a
 /// correction when the rate changes. One velocity array per parameter tensor, shape-agnostic like
-/// `layer_apply_accumulated_gradient` (covers both the `W`/`grad_W`/`velocity_W` (2D) and
+/// `apply_accumulated_gradient` (covers both the `W`/`grad_W`/`velocity_W` (2D) and
 /// `b`/`grad_b`/`velocity_b` (1D) cases via two calls from the Python caller, the same convention
-/// `layer_apply_accumulated_gradient` itself uses).
+/// `apply_accumulated_gradient` itself uses).
 #[allow(clippy::too_many_arguments)]
-pub fn layer_momentum_apply_accumulated_gradient(
+pub fn momentum_apply_accumulated_gradient(
     w: &Array,
     b: &Array,
     grad_w: &Array,

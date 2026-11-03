@@ -1,6 +1,6 @@
 //! The crate's scalar rules where IEEE 754 or the compiler would leave the bits to the machine
 //! (the aarch64 workplan's D6, in indrajala-ml), so a Rust-backend network computes the same
-//! bits on every architecture. `exp` is `cr_exp`, correctly rounded (D4).
+//! bits on every architecture. `exp` is [`num::exp`](super::exp), correctly rounded (D4).
 //!
 //! What stays the machine's: the sign and payload of a NaN that an invalid operation creates
 //! (`inf - inf`, `0 * inf`): x86 makes it negative, ARM positive. The cross-machine claim is

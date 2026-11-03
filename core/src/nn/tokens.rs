@@ -3,7 +3,7 @@
 //! `Embedding` (its sequence task workplan, D5), and the token-wise dropout (its attention-dropout
 //! workplan, D2). One Rust function per method of `PatchesArrayLayer`, `TokenMeanArrayLayer`,
 //! `EmbeddingArrayLayer` and `TokenDropoutArrayLayer` in
-//! `indrajala_ml/model/layers/numpy/token_array_layer.py`, as `fused.rs` is for `array_layer.py`.
+//! `indrajala_ml/model/layers/numpy/token_array_layer.py`, as [`dense`](crate::nn::dense) is for `array_layer.py`.
 //! A token sequence of `T` tokens of `d` features is flat and token-major, index `t * d + j`. Each
 //! function takes one example (1D) or a batch (2D, one example per row) and returns the same rank.
 //! `Position` needs none: it is `Array`'s `+` and `sum_axis0`.
@@ -149,7 +149,7 @@ fn require_tokens(tokens: usize, width: usize, name: &str, context: &str) -> Res
 
 /// `TokenMeanArrayLayer.forward_batch` (and `forward`): `out_j = sum_t(x_tj) / T`, the sum a left
 /// fold from `0.0` over the tokens in order, as numpy's `np.cumsum` along them.
-pub fn token_mean_forward(x: &Array, tokens: usize) -> Result<Array, Error> {
+pub fn mean_forward(x: &Array, tokens: usize) -> Result<Array, Error> {
     let (rows, width) = rows_and_width(x);
     let features = require_tokens(tokens, width, "x", "token_mean_forward")?;
     let mut data = Vec::with_capacity(rows * features);
@@ -167,7 +167,7 @@ pub fn token_mean_forward(x: &Array, tokens: usize) -> Result<Array, Error> {
 
 /// `TokenMeanArrayLayer.downstream_batch` (and `downstream`): `dx_tj = delta_j / T` for every
 /// token `t`.
-pub fn token_mean_downstream(delta: &Array, tokens: usize) -> Result<Array, Error> {
+pub fn mean_downstream(delta: &Array, tokens: usize) -> Result<Array, Error> {
     if tokens == 0 {
         return Err(Error::invalid("token_mean_downstream requires 1 or more tokens, got 0"));
     }
@@ -277,7 +277,7 @@ fn masked(x: &Array, mask: &Array, keep: f64) -> Array {
 /// C order (example, token, feature), `u >= drop_probability`, then `x * mask / keep`. One
 /// example (1D) or a batch (2D); an example's draws are its batch of one's. Returns `(a, mask)`.
 /// In inference the layer passes its input on and calls nothing.
-pub fn token_dropout_forward(x: &Array, drop_probability: f64, rng: &mut Generator) -> Result<(Array, Array), Error> {
+pub fn dropout_forward(x: &Array, drop_probability: f64, rng: &mut Generator) -> Result<(Array, Array), Error> {
     let keep = keep_probability(drop_probability, "token_dropout_forward")?;
     let mask = Array {
         data: rng.draw_bernoulli_mask(drop_probability, x.data.len()),
@@ -287,8 +287,8 @@ pub fn token_dropout_forward(x: &Array, drop_probability: f64, rng: &mut Generat
 }
 
 /// `TokenDropoutArrayLayer`'s backward pass after a training forward: `delta * mask / keep`, the
-/// downstream, `mask` `token_dropout_forward`'s.
-pub fn token_dropout_downstream(delta: &Array, mask: &Array, drop_probability: f64) -> Result<Array, Error> {
+/// downstream, `mask` `dropout_forward`'s.
+pub fn dropout_downstream(delta: &Array, mask: &Array, drop_probability: f64) -> Result<Array, Error> {
     let context = "token_dropout_downstream";
     let keep = keep_probability(drop_probability, context)?;
     if delta.shape != mask.shape {

@@ -6,8 +6,8 @@ use crate::num::activation::Activation;
 use crate::ops::arith::{require_same_shape, same_shape_elementwise};
 use crate::Error;
 
-/// `downstream * act'(cached)`, shape-checked: `ufuncs.rs`'s `array_activation_mask`. `cached` is
-/// the layer's `a` for ReLU, its `z` for the GELUs.
+/// `downstream * act'(cached)`, shape-checked, for the fused deltas; [`activation`] is its public form.
+/// `cached` is the layer's `a` for ReLU, its `z` for the GELUs.
 pub(crate) fn activation_mask(
     downstream: &Array,
     cached: &Array,
@@ -27,9 +27,8 @@ pub(crate) fn masked(downstream: &Array, cached: &Array, activation: Activation)
     }
 }
 
-/// Shared by `layer_dropout_hidden_delta`/`layer_dropout_hidden_delta_batch` above and by
-/// `ufuncs.rs`'s `array_dropout_mask` - they differ only in how `downstream` was computed, not in
-/// the elementwise formula applied on top of it.
+/// Shared by `nn::dropout::hidden_delta`/`hidden_delta_batch` and by [`dropout`] - they differ only
+/// in how `downstream` was computed, not in the elementwise formula applied on top of it.
 pub(crate) fn dropout_hidden_delta_from_downstream(
     downstream: &Array,
     base_activation: &Array,
@@ -63,7 +62,7 @@ pub(crate) fn dropout_hidden_delta_from_downstream(
 /// `layer_activation_hidden_delta*` ops' own elementwise step, so given the same downstream it
 /// computes their bits. `cached` is the layer's `a` for ReLU (the mask `a > 0`), its `z` for the
 /// GELUs ([`Activation::keeps_preactivation`]). Shape-agnostic (single-example 1D or batched 2D).
-pub fn array_activation_mask(downstream: &Array, cached: &Array, activation: Activation) -> Result<Array, Error> {
+pub fn activation(downstream: &Array, cached: &Array, activation: Activation) -> Result<Array, Error> {
     activation_mask(downstream, cached, activation, "array_activation_mask")
 }
 
@@ -71,8 +70,8 @@ pub fn array_activation_mask(downstream: &Array, cached: &Array, activation: Act
 /// layer's fused `layer_hidden_delta*` can't compute, because the next layer has no `W` to read
 /// (a `LayerNorm`, or a residual fork whose body starts with one: indrajala-ml's layer-norm and
 /// attention workplan, D5). The fused ops' elementwise expression, in their grouping, so given the
-/// same downstream it computes their bits. Shape-agnostic, as `array_activation_mask`.
-pub fn array_sigmoid_mask(downstream: &Array, a: &Array) -> Result<Array, Error> {
+/// same downstream it computes their bits. Shape-agnostic, as `activation`.
+pub fn sigmoid(downstream: &Array, a: &Array) -> Result<Array, Error> {
     if downstream.shape != a.shape {
         return Err(Error::invalid(format!(
             "array_sigmoid_mask requires matching shapes, got {:?} and {:?}",
@@ -87,9 +86,9 @@ pub fn array_sigmoid_mask(downstream: &Array, a: &Array) -> Result<Array, Error>
 
 /// `downstream * base_activation * (1 - base_activation) * scale`, `scale = mask /
 /// keep_probability` if `was_training` else `1.0` - the dropout layer's hidden delta from a
-/// downstream it was handed, as `array_sigmoid_mask` is the sigmoid layer's (D5): the fused
+/// downstream it was handed, as `sigmoid` is the sigmoid layer's (D5): the fused
 /// `layer_dropout_hidden_delta*` ops' own elementwise expression. Shape-agnostic.
-pub fn array_dropout_mask(
+pub fn dropout(
     downstream: &Array,
     base_activation: &Array,
     mask: &Array,

@@ -28,9 +28,9 @@
 //! exact: a skipped block's terms would add exact zeros.
 //!
 //! The products between activations are `@` (`matmul`) per example, head and tile, a transpose
-//! copied first; `exp` is the crate's correctly rounded `cr_exp`; project, combine and the
+//! copied first; `exp` is the crate's correctly rounded `exp` ([`num::exp`](crate::num::exp)); project, combine and the
 //! parameter gradients are a dense layer's on the `(N * T, d)` and `(N * T, h·d_k)` (`g·d_k`) rows
-//! (`affine_forward_batch`, `layer_downstream_batch`, `layer_accumulate_gradient_batch`), one
+//! (`affine_forward_batch`, `dense::downstream_batch`, `dense::accumulate_gradient_batch`), one
 //! product over all heads.
 //!
 //! Dropout (indrajala-ml's attention-dropout workplan, D3-D5; its context-length workplan, D12): a
@@ -69,14 +69,14 @@
 //!
 //! Cross-attention's ops are in [`cross`].
 
-
 pub mod cross;
 
 use crate::array::{Array, Shape};
-use crate::num::exp::{exp, exp_in_place};
-use crate::nn::dense::{affine_forward_batch, layer_accumulate_gradient_batch, layer_downstream_batch};
-use crate::random::generator::Generator;
 use crate::linalg::matmul;
+use crate::nn::dense;
+use crate::nn::dense::affine_forward_batch;
+use crate::num::exp::{exp, exp_in_place};
+use crate::random::generator::Generator;
 use crate::Error;
 
 /// What attend reads besides `Q`, `K` and `V`: the query and key/value head counts, each head's
@@ -706,16 +706,16 @@ fn combine(h: &Array, projections: &Projections) -> Result<Array, Error> {
 
 /// `dH = delta Wo`, `(N * T, h·d_k)`, from the `(N * T, d)` delta rows.
 fn combine_backward(delta: &Array, wo: &Array) -> Result<Array, Error> {
-    layer_downstream_batch(wo, delta)
+    dense::downstream_batch(wo, delta)
 }
 
 /// `dX = (dQ Wq + dK Wk) + dV Wv`, `(N * T, d)`: three products over all heads, summed in this order.
 fn project_backward(gradients: [&Array; 3], weights: [&Array; 3]) -> Result<Array, Error> {
     let [dq, dk, dv] = gradients;
     let [wq, wk, wv] = weights;
-    let dx_q = layer_downstream_batch(wq, dq)?;
-    let dx_k = layer_downstream_batch(wk, dk)?;
-    let dx_v = layer_downstream_batch(wv, dv)?;
+    let dx_q = dense::downstream_batch(wq, dq)?;
+    let dx_k = dense::downstream_batch(wk, dk)?;
+    let dx_v = dense::downstream_batch(wv, dv)?;
     let dx = dx_q
         .data
         .iter()
@@ -842,7 +842,7 @@ fn forward_examples(
 /// dropout_rng)`: `a` 1D, and what the backward pass reads, `q` and `h` `(T, h·d_k)`, `k`, `v` `(T, g·d_k)`, `m`
 /// and `l` `(T, heads)`, and the generator's copy before the draws, or `None`.
 #[allow(clippy::too_many_arguments)]
-pub fn attention_forward(
+pub fn forward(
     x: &Array,
     wq: &Array,
     bq: &Array,
@@ -899,12 +899,12 @@ pub fn attention_forward(
 }
 
 /// `AttentionArrayLayer.forward_batch`: `x` 2D (`batch, T * d`), masked if `causal` and by
-/// `segments` (`N * T` ids, examples then tokens), dropped and rotated as `attention_forward`,
+/// `segments` (`N * T` ids, examples then tokens), dropped and rotated as `forward`,
 /// tiled in key blocks of `block`. Returns `(a, q, k, v, h, m, l, dropout_rng)`, the caches over the
 /// batch's `(N * T)` rows, examples then tokens. A key block's draws are every example's, head's,
 /// query's and key's in that order (D12), numpy's `(N, h, T, b)` draw.
 #[allow(clippy::too_many_arguments)]
-pub fn attention_forward_batch(
+pub fn forward_batch(
     x: &Array,
     wq: &Array,
     bq: &Array,
@@ -987,7 +987,7 @@ fn appended(cache: &Array, row: &Array, window: usize, width: usize) -> Array {
 /// keys, so a step's bits are the full pass's at that token, whose masked keys and skipped blocks
 /// change nothing.
 #[allow(clippy::too_many_arguments)]
-pub fn attention_step(
+pub fn step(
     x: &Array,
     wq: &Array,
     bq: &Array,
@@ -1063,7 +1063,7 @@ pub fn attention_step(
 }
 
 /// `AttentionArrayLayer._backward`: from `delta_batch` (`dl/dout`, 2D `batch, T * d`, or 1D for
-/// one example, whose caches are `attention_forward`'s) and the forward pass's `q`, `k`, `v`, `h`,
+/// one example, whose caches are `forward`'s) and the forward pass's `q`, `k`, `v`, `h`,
 /// `m` and `l`, in `heads` heads across `wq`'s rows, masked as the forward was (`causal`,
 /// `segments`) and tiled in its key blocks of `block`, returns `(dx, dq, dk, dv)`: `dx`, the
 /// downstream, in `delta_batch`'s shape, and `dq` `(N * T, h·d_k)` and `dk`, `dv` `(N * T, g·d_k)`, which the
@@ -1071,7 +1071,7 @@ pub fn attention_step(
 /// copy), from a copy of which it draws the same masks again; one that rotated takes its `cos` and
 /// `sin`, and returns `dq` and `dk` rotated back.
 #[allow(clippy::too_many_arguments)]
-pub fn attention_downstream_batch(
+pub fn downstream_batch(
     delta_batch: &Array,
     wq: &Array,
     wk: &Array,
@@ -1140,11 +1140,11 @@ pub fn attention_downstream_batch(
 
 /// `AttentionArrayLayer.accumulate_gradient_batch`: each projection's `(grad_W, grad_b)` as a
 /// dense layer's, `grad_W += delta^T X` and `grad_b += sum(delta)` over the `(N * T)` rows, with
-/// `dq`, `dk`, `dv` (`attention_downstream_batch`'s) against `x`, and `delta_batch` against `h`
+/// `dq`, `dk`, `dv` (`downstream_batch`'s) against `x`, and `delta_batch` against `h`
 /// (the forward pass's), `delta_batch` and `x` 2D or, for one example, 1D. Head-free: each is one
 /// product over all heads. Returns the eight updated gradients in the parameters' order.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub fn attention_accumulate_gradient_batch(
+pub fn accumulate_gradient_batch(
     delta_batch: &Array,
     x: &Array,
     h: &Array,
@@ -1191,10 +1191,10 @@ fn accumulate(
     let [delta, x_rows, kv_rows, h] = rows;
     let [dq, dk, dv] = gradients;
     let [grad_wq, grad_bq, grad_wk, grad_bk, grad_wv, grad_bv, grad_wo, grad_bo] = grads;
-    let (grad_wq, grad_bq) = layer_accumulate_gradient_batch(dq, x_rows, grad_wq, grad_bq)?;
-    let (grad_wk, grad_bk) = layer_accumulate_gradient_batch(dk, kv_rows, grad_wk, grad_bk)?;
-    let (grad_wv, grad_bv) = layer_accumulate_gradient_batch(dv, kv_rows, grad_wv, grad_bv)?;
-    let (grad_wo, grad_bo) = layer_accumulate_gradient_batch(delta, h, grad_wo, grad_bo)?;
+    let (grad_wq, grad_bq) = dense::accumulate_gradient_batch(dq, x_rows, grad_wq, grad_bq)?;
+    let (grad_wk, grad_bk) = dense::accumulate_gradient_batch(dk, kv_rows, grad_wk, grad_bk)?;
+    let (grad_wv, grad_bv) = dense::accumulate_gradient_batch(dv, kv_rows, grad_wv, grad_bv)?;
+    let (grad_wo, grad_bo) = dense::accumulate_gradient_batch(delta, h, grad_wo, grad_bo)?;
     Ok((grad_wq, grad_bq, grad_wk, grad_bk, grad_wv, grad_bv, grad_wo, grad_bo))
 }
 

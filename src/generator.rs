@@ -281,13 +281,13 @@ impl Generator {
     #[pyo3(signature = (seed=None))]
     fn new(py: Python<'_>, seed: Option<Bound<'_, PyAny>>) -> PyResult<Self> {
         if let Some(seed_sequence) = seed.as_ref().and_then(|seed| seed.cast::<SeedSequence>().ok()) {
-            return Ok(Generator(indrajala_math::random::generator::Generator::from_seed_sequence(
-                &seed_sequence.get().inner,
-            )));
+            return Ok(Generator(
+                indrajala_math::random::generator::Generator::from_seed_sequence(&seed_sequence.get().inner),
+            ));
         }
-        Ok(Generator(indrajala_math::random::generator::Generator::from_seed_sequence(
-            &SeedSequence::new(py, seed, None)?.inner,
-        )))
+        Ok(Generator(
+            indrajala_math::random::generator::Generator::from_seed_sequence(&SeedSequence::new(py, seed, None)?.inner),
+        ))
     }
 
     /// `rng.random(shape)`: doubles in `[0, 1)`, filled in C order.

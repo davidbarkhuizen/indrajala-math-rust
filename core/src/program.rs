@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! window w      a_0 = x[:, w k : (w + 1) k],  a_(i+1) = op_i(a_i)   (the StateInputs read c_w)
-//! step w        c_(w+1) = step(a_reads, c_w)                          (factored.rs's step_forward)
+//! step w        c_(w+1) = step(a_reads, c_w)                          (factored's step_forward)
 //!                (factor g's pooling reads the input of op reads[g]: one op for every factor, or
 //!                each its own, the end of its branch)
 //! merge         a_(i+1) = e_1 + ... + e_B                              (the ends of the branches it closes)
@@ -19,27 +19,24 @@
 //! op's in turn, then each factor's pooling query, cell `w`, `u`, `b`, codes (if snapped) and
 //! initial state (which the program doesn't read: the caller snaps the initial state).
 
-use crate::num::activation::Activation;
 use crate::array::{Array, Shape};
-use crate::nn::attention::{
-    attention_accumulate_gradient_batch, attention_downstream_batch, attention_forward_batch, BLOCK,
-};
+use crate::nn::attention;
+use crate::nn::attention::BLOCK;
+use crate::nn::dense;
+use crate::nn::dense::affine_forward_batch;
+use crate::nn::norm::layer_norm;
 use crate::nn::recurrent::factored::{step_forward, sum_in_order, Consolidation, StepCore, StepGradients};
-use crate::nn::dense::{
-    affine_forward_batch, layer_accumulate_gradient_batch, layer_activation_forward_batch, layer_downstream_batch,
-};
-use crate::nn::softmax::layer_softmax_forward_batch;
-use crate::random::generator::Generator;
-use crate::nn::norm::layer_norm::{layer_norm_accumulate_gradient_batch, layer_norm_downstream_batch, layer_norm_forward_batch};
 use crate::nn::recurrent::{
     columns, join_columns, matrix_shape, state_input_backward, state_input_film_backward, state_input_film_forward,
     state_input_forward,
 };
-use crate::nn::tokens::{
-    embedding_accumulate_gradient, embedding_forward, token_dropout_downstream, token_dropout_forward,
-};
-use crate::ops::mask::array_activation_mask;
+use crate::nn::softmax;
+use crate::nn::tokens;
+use crate::nn::tokens::{embedding_accumulate_gradient, embedding_forward};
+use crate::num::activation::Activation;
+use crate::ops::mask;
 use crate::ops::unary::sum_axis0;
+use crate::random::generator::Generator;
 use crate::Error;
 
 /// One layer of a window, as the program runs it.
@@ -71,7 +68,7 @@ pub enum Op {
     /// the innermost open split closes (indrajala-ml's post-paper workplan, D7): its branches' ends
     /// summed in order, the last branch's end its input
     Merge,
-    /// `layer_norm_forward_batch`; parameters `gamma`, `beta`
+    /// `layer_norm::forward_batch`; parameters `gamma`, `beta`
     LayerNorm {
         /// added to the variance
         epsilon: f64,
@@ -88,7 +85,7 @@ pub enum Op {
         /// the window's tokens
         tokens: usize,
     },
-    /// `attention_forward_batch`; parameters `Wq`, `bq`, `Wk`, `bk`, `Wv`, `bv`, `Wo`, `bo`
+    /// `attention::forward_batch`; parameters `Wq`, `bq`, `Wk`, `bk`, `Wv`, `bv`, `Wo`, `bo`
     Attention {
         /// the heads
         heads: usize,
@@ -122,7 +119,7 @@ impl Op {
 }
 
 /// A window-recurrent network's window as ops, and its recurrence's shape: what
-/// `window_program_forward` runs.
+/// `forward` runs.
 ///
 /// `ops` are tuples, a kind then its settings: `("embedding",)`, `("position",)`,
 /// `("state_input", tokens)`, `("fork",)`, `("add",)`, `("layer_norm", epsilon)`,
@@ -492,7 +489,7 @@ impl WindowProgram {
                     Some(a.combine_with_array(&tape.activations[skip], |x, y| x + y, "add")?)
                 }
                 Op::LayerNorm { epsilon } => {
-                    let (out, xhat, std) = layer_norm_forward_batch(a, p[0], p[1], *epsilon)?;
+                    let (out, xhat, std) = layer_norm::forward_batch(a, p[0], p[1], *epsilon)?;
                     cache = Cache::LayerNorm { xhat, std };
                     Some(out)
                 }
@@ -504,7 +501,7 @@ impl WindowProgram {
                     };
                     Some(token_rows(a, *tokens, p[0], p[1], forward)?)
                 }
-                Op::TokenOutput { tokens } => Some(token_rows(a, *tokens, p[0], p[1], layer_softmax_forward_batch)?),
+                Op::TokenOutput { tokens } => Some(token_rows(a, *tokens, p[0], p[1], softmax::forward_batch)?),
                 Op::Attention {
                     heads,
                     causal,
@@ -512,7 +509,7 @@ impl WindowProgram {
                     cos,
                     sin,
                 } => {
-                    let (out, q, k, v, h, m, l, dropout_rng) = attention_forward_batch(
+                    let (out, q, k, v, h, m, l, dropout_rng) = attention::forward_batch(
                         a,
                         p[0],
                         p[1],
@@ -548,7 +545,7 @@ impl WindowProgram {
                 }
                 Op::Dropout { p: drop } => match rng.as_deref_mut() {
                     Some(rng) => {
-                        let (out, mask) = token_dropout_forward(a, *drop, rng)?;
+                        let (out, mask) = tokens::dropout_forward(a, *drop, rng)?;
                         cache = Cache::Dropout { mask };
                         Some(out)
                     }
@@ -670,11 +667,11 @@ impl WindowProgram {
     }
 }
 
-/// A token-wise ReLU layer's forward, `layer_activation_forward_batch`'s ReLU arm (which keeps no
+/// A token-wise ReLU layer's forward, `dense::activation_forward_batch`'s ReLU arm (which keeps no
 /// `z`): the window program's token-wise dense layers are ReLU (indrajala-ml's FFN activations
 /// workplan, D5).
 fn relu_forward_batch(w: &Array, x: &Array, b: &Array) -> Result<Array, Error> {
-    Ok(layer_activation_forward_batch(w, x, b, Activation::Relu)?.0)
+    Ok(dense::activation_forward_batch(w, x, b, Activation::Relu)?.0)
 }
 
 /// A token-wise dense layer's pass: `a` `(N, T * in)` as `(N * T, in)` rows, `forward(w, rows, b)`,
@@ -718,7 +715,7 @@ fn reshaped(a: &Array, rows: usize, cols: usize) -> Array {
     }
 }
 
-/// `window_program_forward`'s result: the outputs, and, as kept, each window's next state, its
+/// `forward`'s result: the outputs, and, as kept, each window's next state, its
 /// cells' outputs before the snap, and its factors' code indices.
 pub type ProgramForward = (Array, Vec<Array>, Vec<Array>, Vec<Vec<Option<Vec<usize>>>>);
 
@@ -732,7 +729,7 @@ pub type ProgramForward = (Array, Vec<Array>, Vec<Array>, Vec<Vec<Option<Vec<usi
 /// formation workplan, the warm-up); with `couplings`, factor `g`'s next state `(1 - couplings[g])
 /// h + couplings[g] q` (the workplan's gradual handover; None, every 1).
 #[allow(clippy::too_many_arguments)]
-pub fn window_program_forward(
+pub fn forward(
     program: &WindowProgram,
     x: &Array,
     parameters: &[&Array],
@@ -843,12 +840,12 @@ impl Backward<'_> {
                 let Cache::LayerNorm { xhat, std } = &self.tape.caches[j] else {
                     unreachable!("a layer norm's cache")
                 };
-                layer_norm_downstream_batch(self.delta(j), p[0], xhat, std)?
+                layer_norm::downstream_batch(self.delta(j), p[0], xhat, std)?
             }
             Op::TokenDense { tokens, .. } | Op::TokenOutput { tokens } => {
                 let (size, input_size) = matrix_shape(p[0], "a token-wise layer's w", "window program")?;
                 let (examples, rows) = token_shape(self.delta(j), *tokens, size)?;
-                let out = layer_downstream_batch(p[0], &reshaped(self.delta(j), rows, size))?;
+                let out = dense::downstream_batch(p[0], &reshaped(self.delta(j), rows, size))?;
                 Array {
                     data: out.data,
                     shape: Shape::Matrix(examples, tokens * input_size),
@@ -860,7 +857,7 @@ impl Backward<'_> {
                 .0
                 .clone(),
             Op::Dropout { p: drop } => match &self.tape.caches[j] {
-                Cache::Dropout { mask } => token_dropout_downstream(self.delta(j), mask, *drop)?,
+                Cache::Dropout { mask } => tokens::dropout_downstream(self.delta(j), mask, *drop)?,
                 _ => delta(),
             },
         })
@@ -997,7 +994,7 @@ impl WindowProgram {
             let p = &parameters[offsets[i]..];
             match &self.ops[i] {
                 Op::TokenDense { relu: true, .. } => {
-                    d = array_activation_mask(&d, &tape.activations[tape.outputs[i]], Activation::Relu)?;
+                    d = mask::activation(&d, &tape.activations[tape.outputs[i]], Activation::Relu)?;
                 }
                 Op::Attention {
                     heads,
@@ -1012,7 +1009,7 @@ impl WindowProgram {
                     else {
                         unreachable!("an attention's cache in training")
                     };
-                    back.attention[i] = Some(attention_downstream_batch(
+                    back.attention[i] = Some(attention::downstream_batch(
                         &d,
                         p[0],
                         p[2],
@@ -1085,14 +1082,14 @@ impl WindowProgram {
                         unreachable!("a layer norm's cache")
                     };
                     let (gg, gbeta) =
-                        layer_norm_accumulate_gradient_batch(back.delta(i), xhat, &gradients[at], &gradients[at + 1])?;
+                        layer_norm::accumulate_gradient_batch(back.delta(i), xhat, &gradients[at], &gradients[at + 1])?;
                     gradients[at] = gg;
                     gradients[at + 1] = gbeta;
                 }
                 Op::TokenDense { tokens, .. } | Op::TokenOutput { tokens } => {
                     let (size, input_size) = matrix_shape(parameters[at], "a token-wise layer's w", context)?;
                     let (_, rows) = token_shape(back.delta(i), *tokens, size)?;
-                    let (gw, gbias) = layer_accumulate_gradient_batch(
+                    let (gw, gbias) = dense::accumulate_gradient_batch(
                         &reshaped(back.delta(i), rows, size),
                         &reshaped(input, rows, input_size),
                         &gradients[at],
@@ -1107,7 +1104,7 @@ impl WindowProgram {
                     };
                     let (_, dq, dk, dv) = back.attention[i].as_ref().expect("an attention's backward pass");
                     let g = &gradients[at..at + 8];
-                    let new = attention_accumulate_gradient_batch(
+                    let new = attention::accumulate_gradient_batch(
                         back.delta(i),
                         input,
                         h,
@@ -1172,7 +1169,7 @@ pub const MEMORY_BUDGET: usize = 2 << 30;
 /// straight through (`soft_codes_backward`'s; the workplan's D51). Refused before the windows past the first run when what they keep would pass `memory_budget`
 /// bytes.
 #[allow(clippy::too_many_arguments)]
-pub fn window_program_learn(
+pub fn learn(
     program: &WindowProgram,
     x: &Array,
     y: &Array,

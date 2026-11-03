@@ -7,13 +7,11 @@ use crate::array::RustArray;
 use crate::generator::Generator;
 use crate::linalg::py_err;
 use indrajala_math::num::activation::Activation;
-#[allow(unused_imports)]
-pub(crate) use indrajala_math::nn::dense::*;
 
 /// `ArrayLayer.forward`: `sigmoid(self.W @ x + self.b)`, `x`/`b` both 1D.
 #[pyfunction]
 pub fn layer_forward(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
-    indrajala_math::nn::dense::layer_forward(w, x, b)
+    indrajala_math::nn::dense::forward(w, x, b)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -21,7 +19,7 @@ pub fn layer_forward(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<Ru
 /// `ArrayLayer.forward_batch`: `sigmoid(X @ self.W.T + self.b)`, `X` 2D (`batch, input_size`).
 #[pyfunction]
 pub fn layer_forward_batch(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
-    indrajala_math::nn::dense::layer_forward_batch(w, x, b)
+    indrajala_math::nn::dense::forward_batch(w, x, b)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -31,7 +29,7 @@ pub fn layer_forward_batch(w: &RustArray, x: &RustArray, b: &RustArray) -> PyRes
 /// the batched 2D case), so unlike `forward`/`forward_batch` this needs only one function.
 #[pyfunction]
 pub fn layer_output_delta(a: &RustArray, reference: &RustArray) -> PyResult<RustArray> {
-    indrajala_math::nn::dense::layer_output_delta(a, reference)
+    indrajala_math::nn::dense::output_delta(a, reference)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -46,7 +44,7 @@ pub fn layer_output_delta(a: &RustArray, reference: &RustArray) -> PyResult<Rust
 /// but is still the same on the scalar and AVX2 paths.
 #[pyfunction]
 pub fn layer_downstream(w: &RustArray, delta: &RustArray) -> PyResult<RustArray> {
-    indrajala_math::nn::dense::layer_downstream(w, delta)
+    indrajala_math::nn::dense::downstream(w, delta)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -54,7 +52,7 @@ pub fn layer_downstream(w: &RustArray, delta: &RustArray) -> PyResult<RustArray>
 /// `ArrayLayer.downstream_batch`: `self.delta_batch @ self.W`.
 #[pyfunction]
 pub fn layer_downstream_batch(w: &RustArray, delta_batch: &RustArray) -> PyResult<RustArray> {
-    indrajala_math::nn::dense::layer_downstream_batch(w, delta_batch)
+    indrajala_math::nn::dense::downstream_batch(w, delta_batch)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -63,7 +61,7 @@ pub fn layer_downstream_batch(w: &RustArray, delta_batch: &RustArray) -> PyResul
 /// self.a)`, single-example (`next_delta`/`a` both 1D).
 #[pyfunction]
 pub fn layer_hidden_delta(next_w: &RustArray, next_delta: &RustArray, a: &RustArray) -> PyResult<RustArray> {
-    indrajala_math::nn::dense::layer_hidden_delta(next_w, next_delta, a)
+    indrajala_math::nn::dense::hidden_delta(next_w, next_delta, a)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -77,7 +75,7 @@ pub fn layer_hidden_delta_batch(
     next_delta_batch: &RustArray,
     a_batch: &RustArray,
 ) -> PyResult<RustArray> {
-    indrajala_math::nn::dense::layer_hidden_delta_batch(next_w, next_delta_batch, a_batch)
+    indrajala_math::nn::dense::hidden_delta_batch(next_w, next_delta_batch, a_batch)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -93,7 +91,7 @@ pub fn layer_accumulate_gradient(
     grad_w: &RustArray,
     grad_b: &RustArray,
 ) -> PyResult<(RustArray, RustArray)> {
-    indrajala_math::nn::dense::layer_accumulate_gradient(delta, input_activation, grad_w, grad_b)
+    indrajala_math::nn::dense::accumulate_gradient(delta, input_activation, grad_w, grad_b)
         .map(|r| {
             let (r0, r1) = r;
             (RustArray::from(r0), RustArray::from(r1))
@@ -110,7 +108,7 @@ pub fn layer_accumulate_gradient_batch(
     grad_w: &RustArray,
     grad_b: &RustArray,
 ) -> PyResult<(RustArray, RustArray)> {
-    indrajala_math::nn::dense::layer_accumulate_gradient_batch(delta_batch, input_activation_batch, grad_w, grad_b)
+    indrajala_math::nn::dense::accumulate_gradient_batch(delta_batch, input_activation_batch, grad_w, grad_b)
         .map(|r| {
             let (r0, r1) = r;
             (RustArray::from(r0), RustArray::from(r1))
@@ -132,7 +130,7 @@ pub fn layer_apply_accumulated_gradient(
     learning_rate: f64,
     batch_size: usize,
 ) -> PyResult<(RustArray, RustArray)> {
-    indrajala_math::nn::dense::layer_apply_accumulated_gradient(w, b, grad_w, grad_b, learning_rate, batch_size)
+    indrajala_math::nn::optim::apply_accumulated_gradient(w, b, grad_w, grad_b, learning_rate, batch_size)
         .map(|r| {
             let (r0, r1) = r;
             (RustArray::from(r0), RustArray::from(r1))
@@ -155,7 +153,7 @@ pub fn layer_sgd_step(
     input_activation: &RustArray,
     learning_rate: f64,
 ) -> PyResult<(RustArray, RustArray)> {
-    indrajala_math::nn::dense::layer_sgd_step(w, b, delta, input_activation, learning_rate)
+    indrajala_math::nn::optim::sgd_step(w, b, delta, input_activation, learning_rate)
         .map(|r| {
             let (r0, r1) = r;
             (RustArray::from(r0), RustArray::from(r1))
@@ -183,7 +181,7 @@ pub fn layer_adam_apply_accumulated_gradient(
     batch_size: usize,
     weight_decay: f64,
 ) -> PyResult<(RustArray, RustArray, RustArray, RustArray, RustArray, RustArray)> {
-    indrajala_math::nn::dense::layer_adam_apply_accumulated_gradient(
+    indrajala_math::nn::optim::adam_apply_accumulated_gradient(
         w,
         b,
         grad_w,
@@ -231,20 +229,12 @@ pub fn layer_l2_apply_accumulated_gradient(
     learning_rate: f64,
     batch_size: usize,
 ) -> PyResult<(RustArray, RustArray)> {
-    indrajala_math::nn::dense::layer_l2_apply_accumulated_gradient(
-        w,
-        b,
-        grad_w,
-        grad_b,
-        l2_lambda,
-        learning_rate,
-        batch_size,
-    )
-    .map(|r| {
-        let (r0, r1) = r;
-        (RustArray::from(r0), RustArray::from(r1))
-    })
-    .map_err(py_err)
+    indrajala_math::nn::optim::l2_apply_accumulated_gradient(w, b, grad_w, grad_b, l2_lambda, learning_rate, batch_size)
+        .map(|r| {
+            let (r0, r1) = r;
+            (RustArray::from(r0), RustArray::from(r1))
+        })
+        .map_err(py_err)
 }
 
 /// `MomentumArrayLayer.apply_accumulated_gradient`: momentum as Goyal et al. 2017's eq. (9),
@@ -267,7 +257,7 @@ pub fn layer_momentum_apply_accumulated_gradient(
     learning_rate: f64,
     batch_size: usize,
 ) -> PyResult<(RustArray, RustArray, RustArray, RustArray)> {
-    indrajala_math::nn::dense::layer_momentum_apply_accumulated_gradient(
+    indrajala_math::nn::optim::momentum_apply_accumulated_gradient(
         w,
         b,
         grad_w,
@@ -313,7 +303,7 @@ pub fn layer_activation_forward(
     activation: &str,
 ) -> PyResult<(RustArray, Option<RustArray>)> {
     let activation = activation_named(activation)?;
-    indrajala_math::nn::dense::layer_activation_forward(w, x, b, activation)
+    indrajala_math::nn::dense::activation_forward(w, x, b, activation)
         .map(with_preactivation)
         .map_err(py_err)
 }
@@ -328,7 +318,7 @@ pub fn layer_activation_forward_batch(
     activation: &str,
 ) -> PyResult<(RustArray, Option<RustArray>)> {
     let activation = activation_named(activation)?;
-    indrajala_math::nn::dense::layer_activation_forward_batch(w, x, b, activation)
+    indrajala_math::nn::dense::activation_forward_batch(w, x, b, activation)
         .map(with_preactivation)
         .map_err(py_err)
 }
@@ -344,7 +334,7 @@ pub fn layer_activation_hidden_delta(
     activation: &str,
 ) -> PyResult<RustArray> {
     let activation = activation_named(activation)?;
-    indrajala_math::nn::dense::layer_activation_hidden_delta(next_w, next_delta, cached, activation)
+    indrajala_math::nn::dense::activation_hidden_delta(next_w, next_delta, cached, activation)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -359,7 +349,7 @@ pub fn layer_activation_hidden_delta_batch(
     activation: &str,
 ) -> PyResult<RustArray> {
     let activation = activation_named(activation)?;
-    indrajala_math::nn::dense::layer_activation_hidden_delta_batch(next_w, next_delta_batch, cached_batch, activation)
+    indrajala_math::nn::dense::activation_hidden_delta_batch(next_w, next_delta_batch, cached_batch, activation)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -370,7 +360,7 @@ pub fn layer_activation_hidden_delta_batch(
 /// Python/Rust FFI crossing.
 #[pyfunction]
 pub fn layer_softmax_forward(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
-    indrajala_math::nn::dense::layer_softmax_forward(w, x, b)
+    indrajala_math::nn::softmax::forward(w, x, b)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -379,7 +369,7 @@ pub fn layer_softmax_forward(w: &RustArray, x: &RustArray, b: &RustArray) -> PyR
 /// normalization, `X` 2D (`batch, input_size`).
 #[pyfunction]
 pub fn layer_softmax_forward_batch(w: &RustArray, x: &RustArray, b: &RustArray) -> PyResult<RustArray> {
-    indrajala_math::nn::dense::layer_softmax_forward_batch(w, x, b)
+    indrajala_math::nn::softmax::forward_batch(w, x, b)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -389,7 +379,7 @@ pub fn layer_softmax_forward_batch(w: &RustArray, x: &RustArray, b: &RustArray) 
 /// like `layer_output_delta`, so one function covers both the single-example and batched case.
 #[pyfunction]
 pub fn layer_softmax_output_delta(a: &RustArray, reference: &RustArray) -> PyResult<RustArray> {
-    indrajala_math::nn::dense::layer_softmax_output_delta(a, reference)
+    indrajala_math::nn::softmax::output_delta(a, reference)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -413,7 +403,7 @@ pub fn layer_dropout_forward(
     training: bool,
     mut rng: Option<PyRefMut<'_, Generator>>,
 ) -> PyResult<(RustArray, RustArray, RustArray)> {
-    indrajala_math::nn::dense::layer_dropout_forward(
+    indrajala_math::nn::dropout::forward(
         w,
         x,
         b,
@@ -442,7 +432,7 @@ pub fn layer_dropout_forward_batch(
     training: bool,
     mut rng: Option<PyRefMut<'_, Generator>>,
 ) -> PyResult<(RustArray, RustArray, RustArray)> {
-    indrajala_math::nn::dense::layer_dropout_forward_batch(
+    indrajala_math::nn::dropout::forward_batch(
         w,
         x,
         b,
@@ -474,7 +464,7 @@ pub fn layer_dropout_hidden_delta(
     keep_probability: f64,
     was_training: bool,
 ) -> PyResult<RustArray> {
-    indrajala_math::nn::dense::layer_dropout_hidden_delta(
+    indrajala_math::nn::dropout::hidden_delta(
         next_w,
         next_delta,
         base_activation,
@@ -498,7 +488,7 @@ pub fn layer_dropout_hidden_delta_batch(
     keep_probability: f64,
     was_training: bool,
 ) -> PyResult<RustArray> {
-    indrajala_math::nn::dense::layer_dropout_hidden_delta_batch(
+    indrajala_math::nn::dropout::hidden_delta_batch(
         next_w,
         next_delta_batch,
         base_activation_batch,
@@ -540,7 +530,7 @@ pub fn layer_hidden_delta_skip(
     skip: &RustArray,
     a: &RustArray,
 ) -> PyResult<RustArray> {
-    indrajala_math::nn::dense::layer_hidden_delta_skip(body_w, body_delta, skip, a)
+    indrajala_math::nn::dense::hidden_delta_skip(body_w, body_delta, skip, a)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -554,7 +544,7 @@ pub fn layer_hidden_delta_skip_batch(
     skip_batch: &RustArray,
     a_batch: &RustArray,
 ) -> PyResult<RustArray> {
-    indrajala_math::nn::dense::layer_hidden_delta_skip_batch(body_w, body_delta_batch, skip_batch, a_batch)
+    indrajala_math::nn::dense::hidden_delta_skip_batch(body_w, body_delta_batch, skip_batch, a_batch)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -571,7 +561,7 @@ pub fn gated_forward_batch(
     activation: &str,
 ) -> PyResult<(RustArray, RustArray)> {
     let activation = activation_named(activation)?;
-    indrajala_math::nn::dense::gated_forward_batch(w, x, b, activation)
+    indrajala_math::nn::gated::forward_batch(w, x, b, activation)
         .map(|(out, z)| (RustArray::from(out), RustArray::from(z)))
         .map_err(py_err)
 }
@@ -582,7 +572,7 @@ pub fn gated_forward_batch(
 #[pyfunction]
 pub fn gated_delta_batch(delta: &RustArray, z: &RustArray, activation: &str) -> PyResult<RustArray> {
     let activation = activation_named(activation)?;
-    indrajala_math::nn::dense::gated_delta_batch(delta, z, activation)
+    indrajala_math::nn::gated::delta_batch(delta, z, activation)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -598,7 +588,7 @@ pub fn layer_activation_hidden_delta_skip(
     activation: &str,
 ) -> PyResult<RustArray> {
     let activation = activation_named(activation)?;
-    indrajala_math::nn::dense::layer_activation_hidden_delta_skip(body_w, body_delta, skip, cached, activation)
+    indrajala_math::nn::dense::activation_hidden_delta_skip(body_w, body_delta, skip, cached, activation)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -614,7 +604,7 @@ pub fn layer_activation_hidden_delta_skip_batch(
     activation: &str,
 ) -> PyResult<RustArray> {
     let activation = activation_named(activation)?;
-    indrajala_math::nn::dense::layer_activation_hidden_delta_skip_batch(
+    indrajala_math::nn::dense::activation_hidden_delta_skip_batch(
         body_w,
         body_delta_batch,
         skip_batch,
@@ -638,7 +628,7 @@ pub fn layer_dropout_hidden_delta_skip(
     keep_probability: f64,
     was_training: bool,
 ) -> PyResult<RustArray> {
-    indrajala_math::nn::dense::layer_dropout_hidden_delta_skip(
+    indrajala_math::nn::dropout::hidden_delta_skip(
         body_w,
         body_delta,
         skip,
@@ -662,7 +652,7 @@ pub fn layer_dropout_hidden_delta_skip_batch(
     keep_probability: f64,
     was_training: bool,
 ) -> PyResult<RustArray> {
-    indrajala_math::nn::dense::layer_dropout_hidden_delta_skip_batch(
+    indrajala_math::nn::dropout::hidden_delta_skip_batch(
         body_w,
         body_delta_batch,
         skip_batch,

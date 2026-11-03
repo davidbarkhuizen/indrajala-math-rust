@@ -17,7 +17,7 @@ pub fn exp(arr: &Array) -> Array {
     Array { data, shape: arr.shape }
 }
 
-/// `exp` one value at a time (`cr_exp::exp`, no vector lanes): the vector kernel's reference in
+/// `exp` one value at a time (`num::exp::exp`, no vector lanes): the vector kernel's reference in
 /// the tests, which check the two agree bit for bit.
 pub fn exp_scalar(arr: &Array) -> Array {
     Array {
@@ -26,7 +26,7 @@ pub fn exp_scalar(arr: &Array) -> Array {
     }
 }
 
-/// `exp` in place on a copy of `arr` (`cr_exp::exp_in_place`, where `exp` writes a new buffer), and
+/// `exp` in place on a copy of `arr` (`num::exp::exp_in_place`, where `exp` writes a new buffer), and
 /// how many values it redid one at a time: lanes whose rounding test failed or whose input is
 /// outside the fast path's ordinary range, and the tail short of a vector. For the tests.
 pub fn exp_lanes(arr: &Array) -> (Array, usize) {
@@ -67,7 +67,7 @@ pub fn sum_axis0(arr: &Array) -> Result<Array, Error> {
 /// Elementwise `max(0.0, x)` - the Rust core's counterpart to `np.maximum(0.0, z)`
 /// (`ArrayLayer.forward`'s array-level `relu_activation`). `np.maximum`/`np.where` remain
 /// otherwise out of scope for this core; this is the one exception.
-pub fn array_relu(arr: &Array) -> Array {
+pub fn relu(arr: &Array) -> Array {
     Array {
         data: arr.data.iter().map(|&v| scalar::relu(v)).collect(),
         shape: arr.shape,
@@ -76,14 +76,14 @@ pub fn array_relu(arr: &Array) -> Array {
 
 /// Numerically-stable softmax normalization - `SoftmaxArrayLayer.forward`/`forward_batch`'s own
 /// max-shift-then-exponentiate-then-normalize formula, validated directly against numpy
-/// independently of either array-based softmax class, the same way `array_relu`/`array_activation_mask`
+/// independently of either array-based softmax class, the same way `relu`/`mask::activation`
 /// are validated for ReLU. A 1D vector is normalized as one whole distribution (`forward`'s
 /// shape); a 2D matrix is normalized row-wise, one independent distribution per row
 /// (`forward_batch`'s shape) - general axis-parameterized reduction stays out of scope; this is
 /// the one fixed case, matching `sum_axis0`'s own precedent. Each row's sum is a left fold from
 /// `0.0` in column order, numpy's `np.cumsum(e, axis=-1)[..., -1:]` (attention's and the token-wise
 /// output's sum in indrajala-ml), not `e.sum()`'s pairwise sum.
-pub fn array_softmax(arr: &Array) -> Array {
+pub fn softmax(arr: &Array) -> Array {
     fn normalize_row(row: &[f64]) -> Vec<f64> {
         let max_value = row.iter().fold(f64::NEG_INFINITY, |running, &v| max(running, v));
         let mut exp_values: Vec<f64> = row.iter().map(|&v| v - max_value).collect();

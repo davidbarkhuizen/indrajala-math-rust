@@ -2,8 +2,8 @@
 //! its forward and its delta.
 
 use crate::array::{Array, Shape};
-use crate::num::activation::Activation;
 use crate::nn::dense::linear_preactivation_batch;
+use crate::num::activation::Activation;
 use crate::Error;
 
 /// A gated token-wise layer's split of its pre-activation `z` `(rows, 2 * size)` into the gate
@@ -35,7 +35,7 @@ fn gate_and_value(z: &Array, context: &str) -> Result<(Vec<f64>, Vec<f64>, usize
 /// rows then the value's, and `act(a) * v` of each row's gate `a` and value `v`, `act` SiLU for
 /// SwiGLU, or a GELU for GEGLU. One product for both projections. Returns `(out, z)`: `out`
 /// `(rows, size)`, and `z` `(rows, 2 * size)`, which the backward reads.
-pub fn gated_forward_batch(w: &Array, x: &Array, b: &Array, activation: Activation) -> Result<(Array, Array), Error> {
+pub fn forward_batch(w: &Array, x: &Array, b: &Array, activation: Activation) -> Result<(Array, Array), Error> {
     let z = linear_preactivation_batch(w, x, b)?;
     let (gate, value, rows, size) = gate_and_value(&z, "gated_forward_batch")?;
     let data = activation
@@ -50,8 +50,8 @@ pub fn gated_forward_batch(w: &Array, x: &Array, b: &Array, activation: Activati
 /// `GatedDenseArrayLayer`'s delta of its pre-activation from its output's, `delta` `(rows, size)`:
 /// each row's gate part `(d * v) * act'(a)` then its value part `d * act(a)`, `(rows, 2 * size)`,
 /// laid out as `z`. The downstream and the gradients are then the dense ops'
-/// (`layer_downstream_batch`, `layer_accumulate_gradient_batch`) on it.
-pub fn gated_delta_batch(delta: &Array, z: &Array, activation: Activation) -> Result<Array, Error> {
+/// (`dense::downstream_batch`, `dense::accumulate_gradient_batch`) on it.
+pub fn delta_batch(delta: &Array, z: &Array, activation: Activation) -> Result<Array, Error> {
     let context = "gated_delta_batch";
     let (gate, value, rows, size) = gate_and_value(z, context)?;
     if delta.shape != Shape::Matrix(rows, size) {

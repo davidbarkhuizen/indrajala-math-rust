@@ -18,11 +18,11 @@ fn available_parallelism_cached() -> usize {
 
 /// The three matmul shape combinations `ArrayLayer`'s own formulas actually use - matrix @
 /// vector (`self.W @ x`), vector @ matrix (`self.W.T @ self.delta`, computed as `delta @ W` by
-/// `fused.rs::layer_downstream` on every single-example backward step), and matrix @
+/// `nn::dense::downstream` on every single-example backward step), and matrix @
 /// matrix (`next_layer.delta_batch @ next_layer.W`, `self.delta_batch.T @ input_activation_batch`;
 /// `X @ self.W.T` is `matmul_nt` below). All three cases are SIMD-accelerated. The
 /// matrix@vector case matters most: it's this codebase's actual `batch_size=1` production path
-/// (`fused.rs::layer_forward`/`layer_hidden_delta` call it on every `learn()` step), accounting
+/// (`nn::dense::forward`/`hidden_delta` call it on every `learn()` step), accounting
 /// for ~97% of a fused forward call's cost at the real `dimension=784, hidden=16` shape - without
 /// SIMD acceleration it runs ~3.5x slower than numpy at that shape.
 pub fn matmul(a: &Array, b: &Array) -> Result<Array, Error> {
@@ -265,7 +265,7 @@ fn matmul_2d<const MODE: u8>(a_data: &[f64], b_data: &[f64], out: &mut [f64], r1
 /// `c + a @ b` for matrices, bit-identical to `matmul(a, b)` then an elementwise add: each
 /// output's chain still starts from 0.0 and runs all of `k`, and only the finished chain is added
 /// to `c`, one rounding as the separate add. Saves that add's full pass over the output, and one
-/// output-sized array (`layer_accumulate_gradient_batch` at 32 x 5408 spent 140-160 us on the pass).
+/// output-sized array (`nn::dense::accumulate_gradient_batch` at 32 x 5408 spent 140-160 us on the pass).
 pub fn matmul_add(c: &Array, a: &Array, b: &Array) -> Result<Array, Error> {
     let (Shape::Matrix(r1, c1), Shape::Matrix(r2, c2)) = (a.shape, b.shape) else {
         return Err(shape_error(a.shape, b.shape));

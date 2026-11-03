@@ -12,7 +12,7 @@
 //!
 //! `c_(-g)` is the other factors' states in factor order, the state's columns without factor
 //! `g`'s; factor `g`'s `w` is then `(3 s_g, d + S - s_g)`, its input `d` first. Each step is the
-//! single-factor op it names in `recurrent.rs`, called factor by factor in factor order, so with
+//! single-factor op it names in [`recurrent`](super), called factor by factor in factor order, so with
 //! G = 1 the forward and backward passes are today's by bits (the workplan's D6), and every
 //! factor's are those ops' at any G. The sums the factors share are left folds in factor order,
 //! each starting from factor 1's term (not from `0.0`, which would turn a `-0.0` into `0.0`):
@@ -27,13 +27,12 @@
 use std::collections::HashMap;
 
 use crate::array::{Array, Shape};
-use crate::ops::arith::same_shape_elementwise;
 use crate::nn::recurrent;
 use crate::nn::recurrent::{
-    attention_pooling_backward, attention_pooling_forward, columns, features_per_token,
-    gru_backward, gru_forward, matrix_shape, require_shape, require_temperature, soft_codes_backward,
-    soft_codes_forward,
+    attention_pooling_backward, attention_pooling_forward, columns, features_per_token, gru_backward, gru_forward,
+    matrix_shape, require_shape, require_temperature, soft_codes_backward, soft_codes_forward,
 };
+use crate::ops::arith::same_shape_elementwise;
 use crate::Error;
 
 /// Each factor's first column, from the factors' sizes, every one 1 or more; and their total.
@@ -163,7 +162,8 @@ fn snap_backward(
     }
     match (indices, grad_e) {
         (Some(indices), Some(grad_e)) => {
-            let (dh, grad_e) = recurrent::codes_backward(&dq, h, q, indices.clone(), grad_e, weight, commitment, target)?;
+            let (dh, grad_e) =
+                recurrent::codes_backward(&dq, h, q, indices.clone(), grad_e, weight, commitment, target)?;
             Ok((dh, Some(grad_e)))
         }
         (None, None) => match target {
@@ -185,7 +185,7 @@ fn snap_backward(
 /// nearest of its codes `codes[g]` (`codes_forward`), or kept for a continuous factor (None).
 /// Returns `(q, indices)`, `q` `(N, S)` and each factor's indices, None for a continuous factor.
 #[allow(clippy::type_complexity)]
-pub fn factored_codes_forward(
+pub fn codes_forward(
     h: &Array,
     sizes: Vec<usize>,
     codes: &[Option<&Array>],
@@ -205,12 +205,12 @@ pub fn factored_codes_forward(
     Ok((join(&blocks, rows, total), indices))
 }
 
-/// `factored_codes_forward`'s backward pass: factor by factor, `codes_backward` of its columns of
+/// `codes_forward`'s backward pass: factor by factor, `codes_backward` of its columns of
 /// `dq`, `h` and `q` with its own commitment and its commitment target `targets[g]` (None: its
 /// `q`; no `targets`, every factor's `q`), or `dq`'s columns straight through for a continuous
 /// factor (its `grad_codes` None). Returns `(dh, grad_codes)`.
 #[allow(clippy::too_many_arguments)]
-pub fn factored_codes_backward(
+pub fn codes_backward(
     dq: &Array,
     h: &Array,
     q: &Array,

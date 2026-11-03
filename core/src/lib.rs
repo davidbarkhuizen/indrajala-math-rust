@@ -20,17 +20,18 @@
 //! # Ok::<(), indrajala_math::Error>(())
 //! ```
 
-// The layers, each using only those listed above it (indrajala-ml's crate structure workplan, D1;
-// tests/layers.rs checks it).
+// The modules in layers, each using only its own and those below (indrajala-ml's crate structure
+// workplan, D1; tests/layers.rs checks it): `program` and `data` over `nn`, over `ops`, `linalg`
+// and `random`, over `num`, over `Array` and `Error`.
 mod array;
+pub mod data;
 mod error;
+pub mod linalg;
+pub mod nn;
 pub mod num;
 pub mod ops;
-pub mod linalg;
-pub mod random;
-pub mod nn;
 pub mod program;
-pub mod data;
+pub mod random;
 
 pub use array::{Array, Shape};
 pub use error::Error;

@@ -1,7 +1,7 @@
 //! Batch normalization (Ioffe & Szegedy 2015) and the bias-free linear layer before a dense one:
 //! one Rust function per method of indrajala-ml's `indrajala_ml/model/layers/numpy/batch_norm_array_layer.py`
-//! and `linear_array_layer.py`, as `fused.rs` is for `array_layer.py`. (The bias-free conv layer's
-//! ops are `conv.rs`'s `conv_linear_*`.)
+//! and `linear_array_layer.py`, as [`dense`](crate::nn::dense) is for `array_layer.py`. (The bias-free conv layer's
+//! ops are [`conv`](crate::nn::conv)'s `linear_*`.)
 //!
 //! Each batch-norm function normalizes every channel over the batch. After a dense layer a
 //! channel is a feature, a column of the `(N, C)` batch, and `positions` is 1. After a conv layer
@@ -40,7 +40,7 @@ impl Activation {
         }
     }
 
-    /// `fused.rs`'s sigmoid and ReLU, in place.
+    /// `dense`'s sigmoid and ReLU, in place.
     fn apply(self, values: &mut [f64]) {
         match self {
             Activation::Sigmoid => sigmoid_in_place(values),
@@ -160,7 +160,7 @@ fn zip_channels(
 /// `channels * positions` values: `xhat = (x - running_mean) / sqrt(running_var + eps)`, then
 /// `gamma * xhat + beta` and the activation, per channel. The running averages don't move.
 #[allow(clippy::too_many_arguments)]
-pub fn batch_norm_forward(
+pub fn forward(
     x: &Array,
     gamma: &Array,
     beta: &Array,
@@ -215,7 +215,7 @@ pub fn batch_norm_forward(
 /// eps)` per group per channel, group-major, so 1D of `channels` for one group), and the new
 /// running averages, the running variance taking each group's unbiased `ss / (m - 1)`.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub fn batch_norm_forward_batch(
+pub fn forward_batch(
     x: &Array,
     gamma: &Array,
     beta: &Array,
@@ -296,9 +296,9 @@ pub fn batch_norm_forward_batch(
 /// `BatchNormArrayLayer.downstream_batch`: `dl/dx`, the linear layer's delta, from `delta_batch`
 /// (`dl/dy`, the activation's derivative already applied) by the paper's § 3 chain rule, term by
 /// term, each ghost group over its own values. `d`, `var` and `std` are
-/// `batch_norm_forward_batch`'s, with the same `positions` and `group_size`.
+/// `forward_batch`'s, with the same `positions` and `group_size`.
 #[allow(clippy::too_many_arguments)]
-pub fn batch_norm_downstream_batch(
+pub fn downstream_batch(
     delta_batch: &Array,
     gamma: &Array,
     d: &Array,
@@ -352,7 +352,7 @@ pub fn batch_norm_downstream_batch(
 /// `BatchNormArrayLayer.accumulate_gradient_batch`: `grad_gamma += sum(delta * xhat)` and
 /// `grad_beta += sum(delta)` over each channel's values. Returns the updated `(grad_gamma,
 /// grad_beta)`.
-pub fn batch_norm_accumulate_gradient_batch(
+pub fn accumulate_gradient_batch(
     delta_batch: &Array,
     xhat: &Array,
     grad_gamma: &Array,

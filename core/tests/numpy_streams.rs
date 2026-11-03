@@ -3,12 +3,13 @@
 //! generator is process-wide.
 
 use indrajala_math::random::generator::{Generator, SeedSequence};
-use indrajala_math::{random, Shape};
+use indrajala_math::random::legacy;
+use indrajala_math::Shape;
 
 #[test]
 fn the_global_generator_is_numpys_legacy_stream() {
-    random::seed_word(42);
-    let draws = random::random(Shape::Vector(3));
+    legacy::seed_word(42);
+    let draws = legacy::random(Shape::Vector(3));
     assert_eq!(
         draws.data(),
         &[0.3745401188473625, 0.9507143064099162, 0.7319939418114051]

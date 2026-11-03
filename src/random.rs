@@ -8,7 +8,9 @@ use crate::array::{parse_shape, RustArray};
 use crate::linalg::py_err;
 use indrajala_math::random::legacy as core_random;
 #[allow(unused_imports)]
-pub(crate) use indrajala_math::random::legacy::{bernoulli_values, draw_bernoulli_mask, seed_at_import, shaped, DoubleSource};
+pub(crate) use indrajala_math::random::legacy::{
+    bernoulli_values, draw_bernoulli_mask, seed_at_import, shaped, DoubleSource,
+};
 
 const SEED_RANGE_MESSAGE: &str = "Seed must be between 0 and 2**32 - 1";
 

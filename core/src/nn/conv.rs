@@ -26,7 +26,7 @@ use crate::Error;
 /// The shape arithmetic for one conv or pool layer, built once by the Python layer and passed to
 /// every call. Pooling uses it with `kernel_size = pool_size`.
 #[derive(Clone, Copy, Debug)]
-pub struct ConvGeometry {
+pub struct Geometry {
     /// The input's height.
     pub input_height: usize,
     /// The input's width.
@@ -49,7 +49,7 @@ pub struct ConvGeometry {
     pub input_size: usize,
 }
 
-impl ConvGeometry {
+impl Geometry {
     /// The geometry of a `kernel_size` kernel at `stride` over an `input_channels x input_height x
     /// input_width` input, with the same checks as `ConvArrayLayer`'s constructor.
     pub fn new(
@@ -76,7 +76,7 @@ impl ConvGeometry {
         }
         let out_height = (input_height - kernel_size) / stride + 1;
         let out_width = (input_width - kernel_size) / stride + 1;
-        Ok(ConvGeometry {
+        Ok(Geometry {
             input_height,
             input_width,
             input_channels,
@@ -91,7 +91,7 @@ impl ConvGeometry {
     }
 }
 
-impl ConvGeometry {
+impl Geometry {
     /// The flat index into one example's `C*H*W` input that kernel offset `(kr, kc)` of channel
     /// `c` reads at output position `(out_row, out_col)`.
     #[inline]
@@ -136,7 +136,7 @@ fn batch_output(data: Vec<f64>, n: usize, cols: usize, is_vector: bool) -> Array
 
 /// `W`'s row count (the output channel count), after checking its columns match the geometry's
 /// kernel fan-in.
-fn channel_count(w: &Array, geometry: &ConvGeometry, context: &str) -> Result<usize, Error> {
+fn channel_count(w: &Array, geometry: &Geometry, context: &str) -> Result<usize, Error> {
     match w.shape {
         Shape::Matrix(rows, cols) if cols == geometry.fan_in => Ok(rows),
         shape => Err(Error::invalid(format!(
@@ -164,9 +164,9 @@ fn deltas_by_channel(delta: &Array, n: usize, o: usize, p: usize) -> Array {
 /// `P` rows of `cols @ W.T` with the tiled kernel into one `(P, O)` buffer reused for every
 /// example (so each output has `matmul`'s bits), then `A`'s channel-major row appended in order,
 /// adding `b` and applying the ReLU as it goes. Returns `(A, cols)`, `A` a vector when `X` is one,
-/// `cols` always `(N*P, C*k*k)`: `cols` is kept by the caller for `conv_accumulate_gradient_batch`,
+/// `cols` always `(N*P, C*k*k)`: `cols` is kept by the caller for `accumulate_gradient_batch`,
 /// as `ConvArrayLayer._cols` is. The pre-activation `Z` is never stored: nothing in the backward
-/// pass reads it (`array_activation_mask` masks on `A`).
+/// pass reads it (`ops::mask::activation` masks on `A`).
 ///
 /// Per example, not over the whole batch:
 /// at N = 32 the whole-batch `cols`, product and `A` are 1.4-1.6 MB each, past L2, and zeroing
@@ -175,7 +175,7 @@ fn deltas_by_channel(delta: &Array, n: usize, o: usize, p: usize) -> Array {
 /// of `cols` and its 43 KB product are still in cache when they are read. The product runs on
 /// one thread: threading the whole batch's product over its rows made no difference at N = 512.
 #[inline]
-pub fn conv_forward_batch(w: &Array, x: &Array, b: &Array, geometry: &ConvGeometry) -> Result<(Array, Array), Error> {
+pub fn forward_batch(w: &Array, x: &Array, b: &Array, geometry: &Geometry) -> Result<(Array, Array), Error> {
     let o = channel_count(w, geometry, "conv_forward_batch")?;
     if b.shape != Shape::Vector(o) {
         return Err(Error::invalid(format!(
@@ -218,13 +218,13 @@ pub fn conv_forward_batch(w: &Array, x: &Array, b: &Array, geometry: &ConvGeomet
     Ok((batch_output(a, n, o * p, is_vector), cols))
 }
 
-/// `LinearConvArrayLayer.forward_batch`: `conv_forward_batch`'s products without the bias and the
+/// `LinearConvArrayLayer.forward_batch`: `forward_batch`'s products without the bias and the
 /// ReLU, the pre-activations a batch-norm layer normalizes. Returns `(A, cols)` as that op does.
 ///
-/// Its own copy of `conv_forward_batch`'s body, not a shared helper: with the body shared, the
-/// conv mini-batch op profile put `conv_forward_batch` 8-17% above its unshared form.
+/// Its own copy of `forward_batch`'s body, not a shared helper: with the body shared, the
+/// conv mini-batch op profile put `forward_batch` 8-17% above its unshared form.
 #[inline]
-pub fn conv_linear_forward_batch(w: &Array, x: &Array, geometry: &ConvGeometry) -> Result<(Array, Array), Error> {
+pub fn linear_forward_batch(w: &Array, x: &Array, geometry: &Geometry) -> Result<(Array, Array), Error> {
     let o = channel_count(w, geometry, "conv_linear_forward_batch")?;
     let (n, is_vector) = require_batch(x, geometry.input_size, "conv_linear_forward_batch X")?;
     let g = geometry;
@@ -265,13 +265,13 @@ pub fn conv_linear_forward_batch(w: &Array, x: &Array, geometry: &ConvGeometry) 
 /// position, so each input accumulates its contributions in the same order as numpy's
 /// one-slice-add-per-offset loop. `dX` is a vector when `delta_batch` is one.
 ///
-/// Per example, as `conv_forward_batch`: each example's `(P, C*k*k)` product goes into one buffer
+/// Per example, as `forward_batch`: each example's `(P, C*k*k)` product goes into one buffer
 /// reused for every example, still in cache when col2im reads it. The whole batch's product
 /// (10.6 MB at 26x26x8, N = 32), threaded over its rows, was memory-bound on the Pi: with the
 /// NEON kernel 4 threads ran no faster than one, and the op took 15 ms against the scalar kernel's
 /// 9.5 (the aarch64 workplan's stage 7). Threads take whole examples, each with its own buffers
 /// and `dX` rows, so no output's value depends on the split.
-pub fn conv_downstream_batch(w: &Array, delta_batch: &Array, geometry: &ConvGeometry) -> Result<Array, Error> {
+pub fn downstream_batch(w: &Array, delta_batch: &Array, geometry: &Geometry) -> Result<Array, Error> {
     let o = channel_count(w, geometry, "conv_downstream_batch")?;
     let g = geometry;
     let (p, fan_in) = (g.positions, g.fan_in);
@@ -310,7 +310,7 @@ pub fn conv_downstream_batch(w: &Array, delta_batch: &Array, geometry: &ConvGeom
 
 /// One example's col2im: `dcols` (`P, C*k*k`) scattered into its `dX` (`out`, zeroed), kernel
 /// offset outside output position.
-fn col2im(out: &mut [f64], dcols: &[f64], g: &ConvGeometry) {
+fn col2im(out: &mut [f64], dcols: &[f64], g: &Geometry) {
     let (k, fan_in) = (g.kernel_size, g.fan_in);
     for c in 0..g.input_channels {
         for kr in 0..k {
@@ -329,14 +329,14 @@ fn col2im(out: &mut [f64], dcols: &[f64], g: &ConvGeometry) {
 
 /// `ConvArrayLayer._accumulate`: `grad_W += D @ cols` with `matmul_long_k`, `D` the deltas regrouped to
 /// `(O, N*P)`, and `grad_b += ` each channel's delta sum over every example and position. Returns
-/// the updated pair for the caller to rebind, as `layer_accumulate_gradient_batch` does. A vector
+/// the updated pair for the caller to rebind, as `dense::accumulate_gradient_batch` does. A vector
 /// `delta_batch` is one example, whose `cols` has `P` rows.
-pub fn conv_accumulate_gradient_batch(
+pub fn accumulate_gradient_batch(
     delta_batch: &Array,
     cols: &Array,
     grad_w: &Array,
     grad_b: &Array,
-    geometry: &ConvGeometry,
+    geometry: &Geometry,
 ) -> Result<(Array, Array), Error> {
     let o = channel_count(grad_w, geometry, "conv_accumulate_gradient_batch")?;
     if grad_b.shape != Shape::Vector(o) {
@@ -366,13 +366,13 @@ pub fn conv_accumulate_gradient_batch(
     Ok((new_grad_w, Array::from_vector(new_grad_b)))
 }
 
-/// `LinearConvArrayLayer.accumulate_gradient_batch`: `conv_accumulate_gradient_batch`'s `grad_W`,
+/// `LinearConvArrayLayer.accumulate_gradient_batch`: `accumulate_gradient_batch`'s `grad_W`,
 /// without its `grad_b`. Returns the updated `grad_W`.
-pub fn conv_linear_accumulate_gradient_batch(
+pub fn linear_accumulate_gradient_batch(
     delta_batch: &Array,
     cols: &Array,
     grad_w: &Array,
-    geometry: &ConvGeometry,
+    geometry: &Geometry,
 ) -> Result<Array, Error> {
     let o = channel_count(grad_w, geometry, "conv_linear_accumulate_gradient_batch")?;
     let contexts = [
@@ -390,7 +390,7 @@ fn accumulate_w(
     delta_batch: &Array,
     cols: &Array,
     grad_w: &Array,
-    geometry: &ConvGeometry,
+    geometry: &Geometry,
     o: usize,
     [delta_context, cols_context]: [&str; 2],
 ) -> Result<(Array, Array), Error> {
@@ -411,7 +411,7 @@ fn accumulate_w(
 /// small exact integers, and it avoids a separate integer array type. The scan uses strict `>`,
 /// so the first maximal slot wins, as with `np.argmax` and `PoolUnit`. Both kernels scan in that
 /// order; 2x2 windows at stride 2 take a fixed-size one, which runs in about a third of the time.
-pub fn max_pool_forward_batch(x: &Array, geometry: &ConvGeometry) -> Result<(Array, Array), Error> {
+pub fn max_pool_forward_batch(x: &Array, geometry: &Geometry) -> Result<(Array, Array), Error> {
     let g = geometry;
     let (n, is_vector) = require_batch(x, g.input_size, "max_pool_forward_batch X")?;
     let size = g.input_channels * g.positions;
@@ -441,7 +441,7 @@ pub fn max_pool_forward_batch(x: &Array, geometry: &ConvGeometry) -> Result<(Arr
 
 /// One channel plane of `max_pool_forward_batch`, any window and stride. It walks each window's
 /// rows as slices, counting the slot alongside, so no slot costs a division or a full index.
-fn max_pool_plane(channel: &[f64], g: &ConvGeometry, a: &mut [f64], argmax: &mut [f64]) {
+fn max_pool_plane(channel: &[f64], g: &Geometry, a: &mut [f64], argmax: &mut [f64]) {
     let (k, s, w) = (g.kernel_size, g.stride, g.input_width);
     let mut out = 0;
     for out_row in 0..g.out_height {
@@ -468,7 +468,7 @@ fn max_pool_plane(channel: &[f64], g: &ConvGeometry, a: &mut [f64], argmax: &mut
 }
 
 /// `max_pool_plane` for 2x2 windows at stride 2: the same scan with the window unrolled.
-fn max_pool_plane_2x2(channel: &[f64], g: &ConvGeometry, a: &mut [f64], argmax: &mut [f64]) {
+fn max_pool_plane_2x2(channel: &[f64], g: &Geometry, a: &mut [f64], argmax: &mut [f64]) {
     let w = g.input_width;
     for (out_row, (a_row, argmax_row)) in a
         .chunks_exact_mut(g.out_width)
@@ -506,7 +506,7 @@ fn max_pool_plane_2x2(channel: &[f64], g: &ConvGeometry, a: &mut [f64], argmax: 
 /// is bit-identical to numpy's. Without overlap each input receives at most one delta, so one pass
 /// in window order stores `0.0 + d`, the bits the add into the zeroed `dX` gives (`-0.0` included).
 /// `delta_batch` and `argmax` must have the same rank; `dX` has it too.
-pub fn max_pool_downstream_batch(delta_batch: &Array, argmax: &Array, geometry: &ConvGeometry) -> Result<Array, Error> {
+pub fn max_pool_downstream_batch(delta_batch: &Array, argmax: &Array, geometry: &Geometry) -> Result<Array, Error> {
     let g = geometry;
     let k = g.kernel_size;
     let size = g.input_channels * g.positions;
@@ -569,7 +569,7 @@ fn max_pool_downstream_plane(
     deltas: &[f64],
     slots: &[f64],
     offsets: &[usize],
-    g: &ConvGeometry,
+    g: &Geometry,
     out: &mut [f64],
 ) -> Result<(), f64> {
     let (s, w) = (g.stride, g.input_width);

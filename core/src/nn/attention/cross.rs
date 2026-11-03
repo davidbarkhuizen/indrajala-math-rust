@@ -86,7 +86,7 @@ fn cross_segments<'a>(
 /// h, T, b)`), tiled in key blocks of `block`. Returns `(a, q, k, v, h, m, l, dropout_rng)`: `q`,
 /// `h`, `m`, `l` over the `(N * T)` query rows and `k`, `v` over the `(N * S)` memory rows.
 #[allow(clippy::too_many_arguments)]
-pub fn cross_attention_forward_batch(
+pub fn forward_batch(
     x: &Array,
     memory: &Array,
     wq: &Array,
@@ -160,11 +160,11 @@ pub fn cross_attention_forward_batch(
 /// `x` (2D, `batch, T * d`, a prefill's `T` tokens or a step's one) against keys `k` and values `v`
 /// computed once per source, `(N * S, g·d_k)` each, the memory's rows through `wk`, `bk` and `wv`,
 /// `bv` (`affine_forward_batch`, project's products): `Q = X Wq^T + bq`, then attend and combine as
-/// `cross_attention_forward_batch`, masked by `segments` and `memory_segments` (both or neither),
+/// `forward_batch`, masked by `segments` and `memory_segments` (both or neither),
 /// never dropped. Returns `a` in `x`'s shape. Each query's row is attended alone in the same key
 /// blocks, so its bits are the full pass's at that token.
 #[allow(clippy::too_many_arguments)]
-pub fn cross_attention_attend_batch(
+pub fn attend_batch(
     x: &Array,
     k: &Array,
     v: &Array,
@@ -225,14 +225,14 @@ pub fn cross_attention_attend_batch(
 }
 
 /// `CrossAttentionArrayLayer._backward`: from `delta_batch` (`dl/dout`, 2D `batch, T * d`) and the
-/// forward pass's `q`, `k`, `v`, `h`, `m` and `l` (`cross_attention_forward_batch`'s), masked as the
+/// forward pass's `q`, `k`, `v`, `h`, `m` and `l` (`forward_batch`'s), masked as the
 /// forward was (`segments`, `memory_segments`) in its key blocks of `block`, its dropout drawn again
 /// from a copy of `dropout_rng`, returns `(dx, dm, dq, dk, dv)`: `dx = dQ Wq` in `delta_batch`'s
 /// shape; `dm = dK Wk + dV Wv`, the memory's gradient, `(N * S, d_m)` rows, as numpy's
 /// `memory_downstream_batch`; and `dq` `(N * T, h·d_k)`, `dk`, `dv` `(N * S, g·d_k)`, which the
 /// gradients read.
 #[allow(clippy::too_many_arguments)]
-pub fn cross_attention_downstream_batch(
+pub fn downstream_batch(
     delta_batch: &Array,
     wq: &Array,
     wk: &Array,
@@ -297,13 +297,13 @@ pub fn cross_attention_downstream_batch(
     let masking = cross_masking(segments, tokens, memory_tokens);
     let mut rng = if dropout > 0.0 { dropout_rng.cloned() } else { None };
     let (dq, dk, dv) = tiled_backward(&dh, [q, k, v, h, m, l], extent, &options, masking, rng.as_mut())?;
-    let dx = layer_downstream_batch(wq, &dq)?;
+    let dx = dense::downstream_batch(wq, &dq)?;
     let dx = Array {
         data: dx.data,
         shape: delta_batch.shape,
     };
-    let dm_k = layer_downstream_batch(wk, &dk)?;
-    let dm_v = layer_downstream_batch(wv, &dv)?;
+    let dm_k = dense::downstream_batch(wk, &dk)?;
+    let dm_v = dense::downstream_batch(wv, &dv)?;
     let dm = Array {
         data: dm_k.data.iter().zip(&dm_v.data).map(|(&a, &b)| a + b).collect(),
         shape: dm_k.shape,
@@ -317,7 +317,7 @@ pub fn cross_attention_downstream_batch(
 /// forward pass's), `delta_batch`, `x` and `memory` 2D. Returns the eight updated gradients in the
 /// parameters' order.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub fn cross_attention_accumulate_gradient_batch(
+pub fn accumulate_gradient_batch(
     delta_batch: &Array,
     x: &Array,
     memory: &Array,

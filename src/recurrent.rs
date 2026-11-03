@@ -5,8 +5,6 @@ use pyo3::prelude::*;
 
 use crate::array::RustArray;
 use crate::linalg::py_err;
-#[allow(unused_imports)]
-pub(crate) use indrajala_math::nn::recurrent::*;
 
 /// `StateInputArrayLayer.forward_batch`: `out_t = x_t + P c` for each of the `tokens` tokens of
 /// each example, `x` `(N, T * d)`, `state` `(N, s)`, `p` `(d, s)`; `P c` is
