@@ -20,27 +20,18 @@
 //! # Ok::<(), indrajala_math::Error>(())
 //! ```
 
-pub mod activation;
+// The modules in layers, each using only its own and those below (indrajala-ml's crate structure
+// workplan, D1; tests/layers.rs checks it): `program` and `data` over `nn`, over `ops`, `linalg`
+// and `random`, over `num`, over `Array` and `Error`.
 mod array;
-pub mod attention;
-pub mod batch_norm;
-pub mod conv;
-pub mod cr_exp;
-pub mod erf;
+pub mod data;
 mod error;
-pub mod factored;
-pub mod fused;
-pub mod generator;
-pub mod layer_norm;
 pub mod linalg;
-pub mod mnist;
+pub mod nn;
+pub mod num;
 pub mod ops;
 pub mod program;
 pub mod random;
-pub mod recurrent;
-pub mod scalar;
-pub mod tokens;
-pub mod ufuncs;
 
 pub use array::{Array, Shape};
 pub use error::Error;

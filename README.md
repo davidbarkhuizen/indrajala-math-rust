@@ -56,15 +56,18 @@ generator draws, and each kernel family's output bits against `core/tests/fixtur
 every platform must reproduce (`INDRAJALA_MATH_BLESS=1 cargo test -p indrajala-math` rewrites it
 after a change meant to move bits). The tests that check the fused layer ops against
 indrajala-ml's numpy reference classes live in indrajala-ml's own `tests/`, so a change to
-`core/src/fused.rs` or `core/src/conv.rs` should also be tested there: in an indrajala-ml checkout, point `rust/` at the new commit, then
+`core/src/nn/` should also be tested there: in an indrajala-ml checkout, point `rust/` at the new commit, then
 `./cli build-rust && ./cli test`.
 
 ## Layout
 
-Each `src/<module>.rs` binds `core/src/<module>.rs`, which holds the module's arithmetic (its
-`#[pyfunction]`s are wrappers over the core's functions of the same names), except `src/lib.rs`
-(the Python module) and the core's `error.rs` (its `Error`, raised as `ValueError` or
-`OverflowError`). The Python API, by module:
+The core (`core/src/`) is a layered module tree: `num` (scalar rules), then `ops`, `linalg` and
+`random`, then `nn` (the layers), then `program` and `data`. Each module uses only its own layer and
+those below it (`core/tests/layers.rs`), and its functions are named within it
+(`nn::norm::layer_norm::forward_batch`). Each `src/<module>.rs` binds part of the core, its
+`#[pyfunction]`s thin wrappers that keep the Python names (`layer_norm_forward_batch`), except
+`src/lib.rs` (the Python module); the core's `Error` is raised as `ValueError` or `OverflowError`.
+The Python API, by module:
 
 | File | Python API |
 | --- | --- |
@@ -84,16 +87,16 @@ Each `src/<module>.rs` binds `core/src/<module>.rs`, which holds the module's ar
 | `src/layer_norm.rs` | `layer_norm_*`: one call per `LayerNormArrayLayer` method (forward, single and batch; downstream, gradient accumulate) |
 | `src/attention.rs` | `attention_*`: one call per pass of `AttentionArrayLayer` (forward, single and batch; downstream, which also returns `dQ, dK, dV`; gradient accumulate), multi-head (`heads`), causal (`causal`), masked by segment (`segments`), tiled in key blocks (`block`, 16: an online softmax, keeping each query's max `m` and sum `l`, never the weights; the step cut at the cache's `origin`), dropping its weights in training (`dropout`, `training`, `rng`: drawn key block by key block; the forward ops return the generator's copy before the draws, which the downstream takes as `dropout_rng` and draws from again), rotary positions (`cos`, `sin`: the forward ops rotate `Q` and `K`, the downstream rotates `dQ` and `dK` back), each a thin wrapper over the crate-internal blocks project, attend and combine, composed of the crate's dense ops, `@` and `cr_exp` |
 | `src/recurrent.rs` | `state_input_*`, `attention_pooling_*`, `gru_*`, `codes_*`: one call per pass of a window-recurrent network's `StateInputArrayLayer`/`AttentionPoolingArrayLayer`/`GRUArrayLayer`/`CodesArrayLayer` (forward, backward), batch-only, composed of the crate's dense ops, `@` and `array_softmax`, with `tanh` through `exp`; `concatenate_columns`, which joins the windows' outputs |
-| `core/src/cr_exp.rs` | (core only) `exp`, correctly rounded: a port of CORE-MATH's `cr_exp`; every `exp` in the crate (the `exp` ufunc, sigmoid, `tanh`, softmax, `erf`) goes through it |
-| `core/src/activation.rs` | (core only) `Activation`: ReLU, GELU (`erf`), GELU-tanh (GPT-2's) and SiLU, their values and derivative masks in one fixed grouping (the module's doc), through `erf` and `cr_exp` |
-| `core/src/erf.rs` | (core only) `erf`: a port of fdlibm's `s_erf.c` through `cr_exp`, within one ulp (not correctly rounded); the `erf` ufunc's |
-| `core/src/scalar.rs` | (core only) the scalar rules below: relu, the softmax row maximum, `powi` |
+| `core/src/num/exp.rs` | (core only) `exp`, correctly rounded: a port of CORE-MATH's `cr_exp`; every `exp` in the crate (the `exp` ufunc, sigmoid, `tanh`, softmax, `erf`) goes through it |
+| `core/src/num/activation.rs` | (core only) `Activation`: ReLU, GELU (`erf`), GELU-tanh (GPT-2's) and SiLU, their values and derivative masks in one fixed grouping (the module's doc), through `erf` and `cr_exp` |
+| `core/src/num/erf.rs` | (core only) `erf`: a port of fdlibm's `s_erf.c` through `cr_exp`, within one ulp (not correctly rounded); the `erf` ufunc's |
+| `core/src/num/scalar.rs` | (core only) the scalar rules below: relu, the softmax row maximum, `powi` |
 
-Each `layer_*` function in `core/src/fused.rs` mirrors a method of indrajala-ml's
+Each function in `core/src/nn/dense.rs`, `dropout.rs`, `softmax.rs`, `gated.rs` and `optim.rs` mirrors a method of indrajala-ml's
 `indrajala_ml/model/layers/numpy/array_layer.py` or one of its ReLU/softmax/dropout/Adam/L2/momentum variants,
-and must stay numerically identical to it. Likewise each `conv_*`/`max_pool_*` function in
-`core/src/conv.rs` mirrors a method of `indrajala_ml/model/layers/numpy/conv_array_layer.py`/`max_pool_array_layer.py`, each `conv_linear_*` function one of its `LinearConvArrayLayer`, each `linear_*`/`batch_norm_*` function in `core/src/batch_norm.rs` one of `linear_array_layer.py`/`batch_norm_array_layer.py`, and each function in `core/src/tokens.rs`, `core/src/layer_norm.rs`, `core/src/attention.rs` and `core/src/recurrent.rs` one of `token_array_layer.py`, `layer_norm_array_layer.py`, `attention_array_layer.py` or `recurrent_array_layer.py`. Conv tensors cross the boundary as matrices
-(`Array` stays 1D/2D); `core/src/conv.rs`'s module comment gives the layouts.
+and must stay numerically identical to it. Likewise each function in
+`core/src/nn/conv.rs` mirrors a method of `indrajala_ml/model/layers/numpy/conv_array_layer.py`/`max_pool_array_layer.py`, each `linear_*` function one of its `LinearConvArrayLayer`, each `linear_*` function in `core/src/nn/dense.rs` and each function in `core/src/nn/norm/batch_norm.rs` one of `linear_array_layer.py`/`batch_norm_array_layer.py`, and each function in `core/src/nn/tokens.rs`, `core/src/nn/norm/layer_norm.rs`, `core/src/nn/attention/` and `core/src/nn/recurrent/` one of `token_array_layer.py`, `layer_norm_array_layer.py`, `attention_array_layer.py` or `recurrent_array_layer.py`. Conv tensors cross the boundary as matrices
+(`Array` stays 1D/2D); `core/src/nn/conv.rs`'s module comment gives the layouts.
 
 ## Same bits on every machine
 
@@ -101,10 +104,10 @@ A network on this backend trains to the same bits on x86_64 and aarch64 (indraja
 retired aarch64 workplan: `git show 6b9c6fe:docs/workplans/infrastructure/aarch64-workplan.md`). Products follow one order on every path: four `mul_add` lanes
 combined `(l0 + l1) + (l2 + l3)`, tails in order, reductions as left folds (`core/src/linalg.rs`);
 threading splits rows or column chunks, never one sum. `exp` is correctly rounded
-(`core/src/cr_exp.rs`), so it is mathematics' value, not a C library's. A C library's `exp` need not
+(`core/src/num/exp.rs`), so it is mathematics' value, not a C library's. A C library's `exp` need not
 be: glibc 2.43's rounds about 0.075% of inputs to the neighbouring double (worst 0.504 ULP,
 within its documented bound), and which inputs differs between libraries. Where IEEE 754 or the compiler
-would leave a result to the machine, `core/src/scalar.rs` fixes it: relu gives `+0.0` for both zeros
+would leave a result to the machine, `core/src/num/scalar.rs` fixes it: relu gives `+0.0` for both zeros
 and propagates NaN; the softmax row maximum is a left fold with relu's comparison; Adam's `powi`
 is square-and-multiply from the exponent's low bit. Not claimed: the sign and payload of a NaN
 that an invalid operation (`inf - inf`, `0 * inf`) creates, which is the hardware's.
@@ -130,6 +133,6 @@ retagged: each publish skips a version its index already has.
 
 ## License
 
-MIT, see [LICENSE](LICENSE). `core/src/cr_exp.rs` is a port of CORE-MATH's `cr_exp` (MIT, Alexei
-Sibidanov), its copyright and permission notice kept in the file. `core/src/erf.rs` is a port of
+MIT, see [LICENSE](LICENSE). `core/src/num/exp.rs` is a port of CORE-MATH's `cr_exp` (MIT, Alexei
+Sibidanov), its copyright and permission notice kept in the file. `core/src/num/erf.rs` is a port of
 fdlibm's `s_erf.c` (Sun Microsystems, 1993, freely granted), its notice kept in the file.

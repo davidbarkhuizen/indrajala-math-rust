@@ -8,21 +8,15 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use indrajala_math::activation::Activation;
-use indrajala_math::attention::{
-    attention_downstream_batch, attention_forward_batch, cross_attention_downstream_batch,
-    cross_attention_forward_batch,
-};
-use indrajala_math::conv::{conv_forward_batch, max_pool_forward_batch, ConvGeometry};
-use indrajala_math::fused::{
-    gated_delta_batch, gated_forward_batch, layer_activation_forward_batch, layer_activation_hidden_delta_batch,
-    layer_forward_batch,
-};
-use indrajala_math::generator::{Generator, SeedSequence};
-use indrajala_math::layer_norm::layer_norm_forward_batch;
 use indrajala_math::linalg::{matmul, matmul_add, matmul_long_k, matmul_nt, outer};
-use indrajala_math::recurrent::gru_forward;
-use indrajala_math::ufuncs::{array_softmax, erf, exp};
+use indrajala_math::nn::attention::{self, cross};
+use indrajala_math::nn::conv::{self, max_pool_forward_batch};
+use indrajala_math::nn::norm::layer_norm;
+use indrajala_math::nn::recurrent::gru_forward;
+use indrajala_math::nn::{dense, gated};
+use indrajala_math::num::activation::Activation;
+use indrajala_math::ops::unary::{self, erf, exp};
+use indrajala_math::random::generator::{Generator, SeedSequence};
 use indrajala_math::{Array, Shape};
 
 /// FNV-1a over the values' bits, and their count.
@@ -99,14 +93,14 @@ fn families() -> BTreeMap<&'static str, String> {
         f64::NEG_INFINITY,
     ]);
     out.insert("exp", hash(&[&exp(&Array::from_vector(values))]));
-    out.insert("softmax 7 x 10", hash(&[&array_softmax(&matrix(g, 7, 10))]));
+    out.insert("softmax 7 x 10", hash(&[&unary::softmax(&matrix(g, 7, 10))]));
 
     // conv and pooling on MNIST's shape
-    let geometry = ConvGeometry::new(28, 28, 1, 3, 1).unwrap();
+    let geometry = conv::Geometry::new(28, 28, 1, 3, 1).unwrap();
     let (w, x, b) = (matrix(g, 8, 9), matrix(g, 3, 784), vector(g, 8));
-    let (a, cols) = conv_forward_batch(&w, &x, &b, &geometry).unwrap();
+    let (a, cols) = conv::forward_batch(&w, &x, &b, &geometry).unwrap();
     out.insert("conv_forward_batch 28 x 28, 8 ch", hash(&[&a, &cols]));
-    let pool = ConvGeometry::new(26, 26, 8, 2, 2).unwrap();
+    let pool = conv::Geometry::new(26, 26, 8, 2, 2).unwrap();
     let (pooled, argmax) = max_pool_forward_batch(&a, &pool).unwrap();
     out.insert("max_pool_forward_batch 26 x 26, 8 ch", hash(&[&pooled, &argmax]));
 
@@ -114,10 +108,10 @@ fn families() -> BTreeMap<&'static str, String> {
     let (w, x, b) = (matrix(g, 30, 784), matrix(g, 5, 784), vector(g, 30));
     out.insert(
         "layer_forward_batch 30 x 784, b5",
-        hash(&[&layer_forward_batch(&w, &x, &b).unwrap()]),
+        hash(&[&dense::forward_batch(&w, &x, &b).unwrap()]),
     );
     let (x, gamma, beta) = (matrix(g, 4, 3 * 8), vector(g, 8), vector(g, 8));
-    let (a, xhat, std) = layer_norm_forward_batch(&x, &gamma, &beta, 1e-5).unwrap();
+    let (a, xhat, std) = layer_norm::forward_batch(&x, &gamma, &beta, 1e-5).unwrap();
     out.insert("layer_norm_forward_batch 4 x 3 tokens x 8", hash(&[&a, &xhat, &std]));
     let (u, c) = (matrix(g, 4, 6), matrix(g, 4, 5));
     let (w, uw, b) = (matrix(g, 15, 6), matrix(g, 15, 5), vector(g, 15));
@@ -155,9 +149,9 @@ fn families() -> BTreeMap<&'static str, String> {
         Activation::GeluTanh,
         Activation::Silu,
     ] {
-        let (a, z) = layer_activation_forward_batch(&w, &x, &b, activation).unwrap();
+        let (a, z) = dense::activation_forward_batch(&w, &x, &b, activation).unwrap();
         let cached = z.as_ref().unwrap_or(&a);
-        let delta = layer_activation_hidden_delta_batch(&next_w, &next_delta, cached, activation).unwrap();
+        let delta = dense::activation_hidden_delta_batch(&next_w, &next_delta, cached, activation).unwrap();
         let mut arrays = vec![&a, &delta];
         arrays.extend(z.as_ref());
         out.insert(
@@ -176,8 +170,8 @@ fn families() -> BTreeMap<&'static str, String> {
     let x = Array::from_matrix(x.data().iter().map(|v| v * 4.0).collect(), 13, 29);
     let delta = matrix(g, 13, 17);
     for (name, activation) in [("silu", Activation::Silu), ("gelu", Activation::Gelu)] {
-        let (y, z) = gated_forward_batch(&w, &x, &b, activation).unwrap();
-        let dz = gated_delta_batch(&delta, &z, activation).unwrap();
+        let (y, z) = gated::forward_batch(&w, &x, &b, activation).unwrap();
+        let dz = gated::delta_batch(&delta, &z, activation).unwrap();
         let label = match name {
             "silu" => "gated silu forward and delta 13 x 29 -> 17",
             _ => "gated gelu forward and delta 13 x 29 -> 17",
@@ -202,7 +196,7 @@ fn families() -> BTreeMap<&'static str, String> {
             vector(g, kv_width),
         );
         let (wo, bo) = (matrix(g, d, width), vector(g, d));
-        let (a, q, k, v, h, m, l, _) = attention_forward_batch(
+        let (a, q, k, v, h, m, l, _) = attention::forward_batch(
             &x,
             &wq,
             &bq,
@@ -224,7 +218,7 @@ fn families() -> BTreeMap<&'static str, String> {
             16,
         )
         .unwrap();
-        let (dx, dq, dk, dv) = attention_downstream_batch(
+        let (dx, dq, dk, dv) = attention::downstream_batch(
             &delta,
             &wq,
             &wk,
@@ -280,7 +274,7 @@ fn families() -> BTreeMap<&'static str, String> {
         Array::from_matrix(segments, examples, queries),
         Array::from_matrix(memory_segments, examples, memory_tokens),
     );
-    let (a, q, k, v, h, m, l, _) = cross_attention_forward_batch(
+    let (a, q, k, v, h, m, l, _) = cross::forward_batch(
         &x,
         &memory,
         &wq,
@@ -301,7 +295,7 @@ fn families() -> BTreeMap<&'static str, String> {
         16,
     )
     .unwrap();
-    let (dx, dm, dq, dk, dv) = cross_attention_downstream_batch(
+    let (dx, dm, dq, dk, dv) = cross::downstream_batch(
         &delta,
         &wq,
         &wk,

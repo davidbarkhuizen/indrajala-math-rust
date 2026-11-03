@@ -106,7 +106,7 @@ impl Mt19937 {
     }
 }
 
-/// A generator's doubles in `[0, 1)`: this file's MT19937 and `generator.rs`'s PCG64.
+/// A generator's doubles in `[0, 1)`: this file's MT19937 and [`generator`](super::generator)'s PCG64.
 pub trait DoubleSource {
     /// The next double in `[0, 1)`.
     fn next_double(&mut self) -> f64;
@@ -211,7 +211,7 @@ pub fn uniform(low: f64, high: f64, shape: Shape) -> Result<Array, Error> {
 }
 
 /// `(np.random.random(size) >= drop_probability)` as floats (1.0 kept, 0.0 dropped), the mask
-/// `DropoutArrayLayer` draws. `fused.rs`'s `layer_dropout_forward*` draw it inside the same Rust
+/// `DropoutArrayLayer` draws. [`nn::dropout`](crate::nn::dropout)'s `forward*` draw it inside the same Rust
 /// call as the matmul and sigmoid, so it is a plain `Vec<f64>`; `bernoulli_mask` below is its
 /// Python-visible form.
 pub fn draw_bernoulli_mask(drop_probability: f64, size: usize) -> Vec<f64> {

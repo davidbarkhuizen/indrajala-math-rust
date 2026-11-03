@@ -1,11 +1,8 @@
 //! Elementwise functions over one array: `exp` (correctly rounded), ReLU, softmax and the masks
 //! the backward passes apply, `sum_axis0` and `argmax`.
 
-use crate::activation::Activation;
 use crate::array::{Array, Shape};
-use crate::fused::{activation_mask, dropout_hidden_delta_from_downstream};
-use crate::ops::same_shape_elementwise;
-use crate::scalar::{max, relu};
+use crate::num::scalar::{self, max};
 use crate::Error;
 
 /// Elementwise `e^x` over a whole array - mirrors `array_layer.sigmoid`'s own reliance on
@@ -16,33 +13,33 @@ use crate::Error;
 /// itself is ever built on top of it.
 pub fn exp(arr: &Array) -> Array {
     let mut data = vec![0.0; arr.data.len()];
-    crate::cr_exp::exp_into(&arr.data, &mut data);
+    crate::num::exp::exp_into(&arr.data, &mut data);
     Array { data, shape: arr.shape }
 }
 
-/// `exp` one value at a time (`cr_exp::exp`, no vector lanes): the vector kernel's reference in
+/// `exp` one value at a time (`num::exp::exp`, no vector lanes): the vector kernel's reference in
 /// the tests, which check the two agree bit for bit.
 pub fn exp_scalar(arr: &Array) -> Array {
     Array {
-        data: arr.data.iter().map(|&v| crate::cr_exp::exp(v)).collect(),
+        data: arr.data.iter().map(|&v| crate::num::exp::exp(v)).collect(),
         shape: arr.shape,
     }
 }
 
-/// `exp` in place on a copy of `arr` (`cr_exp::exp_in_place`, where `exp` writes a new buffer), and
+/// `exp` in place on a copy of `arr` (`num::exp::exp_in_place`, where `exp` writes a new buffer), and
 /// how many values it redid one at a time: lanes whose rounding test failed or whose input is
 /// outside the fast path's ordinary range, and the tail short of a vector. For the tests.
 pub fn exp_lanes(arr: &Array) -> (Array, usize) {
     let mut data = arr.data.clone();
-    let redone = crate::cr_exp::exp_in_place(&mut data);
+    let redone = crate::num::exp::exp_in_place(&mut data);
     (Array { data, shape: arr.shape }, redone)
 }
 
-/// Elementwise `erf` ([`crate::erf::erf`], fdlibm's, through the correctly rounded `exp`): GELU's
+/// Elementwise `erf` ([`crate::num::erf::erf`], fdlibm's, through the correctly rounded `exp`): GELU's
 /// `erf(z / sqrt 2)`.
 pub fn erf(arr: &Array) -> Array {
     Array {
-        data: arr.data.iter().map(|&v| crate::erf::erf(v)).collect(),
+        data: arr.data.iter().map(|&v| crate::num::erf::erf(v)).collect(),
         shape: arr.shape,
     }
 }
@@ -70,80 +67,27 @@ pub fn sum_axis0(arr: &Array) -> Result<Array, Error> {
 /// Elementwise `max(0.0, x)` - the Rust core's counterpart to `np.maximum(0.0, z)`
 /// (`ArrayLayer.forward`'s array-level `relu_activation`). `np.maximum`/`np.where` remain
 /// otherwise out of scope for this core; this is the one exception.
-pub fn array_relu(arr: &Array) -> Array {
+pub fn relu(arr: &Array) -> Array {
     Array {
-        data: arr.data.iter().map(|&v| relu(v)).collect(),
+        data: arr.data.iter().map(|&v| scalar::relu(v)).collect(),
         shape: arr.shape,
     }
 }
 
-/// `downstream * act'(cached)` - a hidden layer's delta from a downstream it was handed (before a
-/// layer with no `W` to read: a `LayerNorm`, a token-wise layer, a conv layer's next), the fused
-/// `layer_activation_hidden_delta*` ops' own elementwise step, so given the same downstream it
-/// computes their bits. `cached` is the layer's `a` for ReLU (the mask `a > 0`), its `z` for the
-/// GELUs ([`Activation::keeps_preactivation`]). Shape-agnostic (single-example 1D or batched 2D).
-pub fn array_activation_mask(downstream: &Array, cached: &Array, activation: Activation) -> Result<Array, Error> {
-    activation_mask(downstream, cached, activation, "array_activation_mask")
-}
-
-/// `downstream * a * (1 - a)` - the sigmoid's derivative applied to a downstream that a dense
-/// layer's fused `layer_hidden_delta*` can't compute, because the next layer has no `W` to read
-/// (a `LayerNorm`, or a residual fork whose body starts with one: indrajala-ml's layer-norm and
-/// attention workplan, D5). The fused ops' elementwise expression, in their grouping, so given the
-/// same downstream it computes their bits. Shape-agnostic, as `array_activation_mask`.
-pub fn array_sigmoid_mask(downstream: &Array, a: &Array) -> Result<Array, Error> {
-    if downstream.shape != a.shape {
-        return Err(Error::invalid(format!(
-            "array_sigmoid_mask requires matching shapes, got {:?} and {:?}",
-            downstream.shape, a.shape
-        )));
-    }
-    Ok(Array {
-        data: same_shape_elementwise(&downstream.data, &a.data, |d, av| d * av * (1.0 - av)),
-        shape: downstream.shape,
-    })
-}
-
-/// `downstream * base_activation * (1 - base_activation) * scale`, `scale = mask /
-/// keep_probability` if `was_training` else `1.0` - the dropout layer's hidden delta from a
-/// downstream it was handed, as `array_sigmoid_mask` is the sigmoid layer's (D5): the fused
-/// `layer_dropout_hidden_delta*` ops' own elementwise expression. Shape-agnostic.
-pub fn array_dropout_mask(
-    downstream: &Array,
-    base_activation: &Array,
-    mask: &Array,
-    keep_probability: f64,
-    was_training: bool,
-) -> Result<Array, Error> {
-    if downstream.shape != base_activation.shape || mask.shape != base_activation.shape {
-        return Err(Error::invalid(format!(
-            "array_dropout_mask requires matching shapes, got {:?}, {:?} and {:?}",
-            downstream.shape, base_activation.shape, mask.shape
-        )));
-    }
-    Ok(dropout_hidden_delta_from_downstream(
-        downstream,
-        base_activation,
-        mask,
-        keep_probability,
-        was_training,
-    ))
-}
-
 /// Numerically-stable softmax normalization - `SoftmaxArrayLayer.forward`/`forward_batch`'s own
 /// max-shift-then-exponentiate-then-normalize formula, validated directly against numpy
-/// independently of either array-based softmax class, the same way `array_relu`/`array_activation_mask`
+/// independently of either array-based softmax class, the same way `relu`/`mask::activation`
 /// are validated for ReLU. A 1D vector is normalized as one whole distribution (`forward`'s
 /// shape); a 2D matrix is normalized row-wise, one independent distribution per row
 /// (`forward_batch`'s shape) - general axis-parameterized reduction stays out of scope; this is
 /// the one fixed case, matching `sum_axis0`'s own precedent. Each row's sum is a left fold from
 /// `0.0` in column order, numpy's `np.cumsum(e, axis=-1)[..., -1:]` (attention's and the token-wise
 /// output's sum in indrajala-ml), not `e.sum()`'s pairwise sum.
-pub fn array_softmax(arr: &Array) -> Array {
+pub fn softmax(arr: &Array) -> Array {
     fn normalize_row(row: &[f64]) -> Vec<f64> {
         let max_value = row.iter().fold(f64::NEG_INFINITY, |running, &v| max(running, v));
         let mut exp_values: Vec<f64> = row.iter().map(|&v| v - max_value).collect();
-        crate::cr_exp::exp_in_place(&mut exp_values);
+        crate::num::exp::exp_in_place(&mut exp_values);
         let total = exp_values.iter().fold(0.0, |acc, &e| acc + e);
         exp_values.iter().map(|&e| e / total).collect()
     }

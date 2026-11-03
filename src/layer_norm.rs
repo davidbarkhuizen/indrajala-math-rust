@@ -1,12 +1,10 @@
-//! The bindings of the core's `layer_norm` (`indrajala_math::layer_norm`): each `#[pyfunction]` lends its
+//! The bindings of the core's `layer_norm` (`indrajala_math::nn::norm::layer_norm`): each `#[pyfunction]` lends its
 //! arrays to the core's and moves the results in.
 
 use pyo3::prelude::*;
 
 use crate::array::RustArray;
 use crate::linalg::py_err;
-#[allow(unused_imports)]
-pub(crate) use indrajala_math::layer_norm::*;
 
 /// `LayerNormArrayLayer.forward`: one example, `x` 1D of `T * d` values. Returns `(a, xhat, std)`,
 /// what the backward pass reads: `xhat` in `x`'s layout and `std = sqrt(var + eps)` per token.
@@ -18,7 +16,7 @@ pub fn layer_norm_forward(
     beta: &RustArray,
     epsilon: f64,
 ) -> PyResult<(RustArray, RustArray, RustArray)> {
-    indrajala_math::layer_norm::layer_norm_forward(x, gamma, beta, epsilon)
+    indrajala_math::nn::norm::layer_norm::forward(x, gamma, beta, epsilon)
         .map(|r| {
             let (r0, r1, r2) = r;
             (RustArray::from(r0), RustArray::from(r1), RustArray::from(r2))
@@ -35,7 +33,7 @@ pub fn layer_norm_forward_batch(
     beta: &RustArray,
     epsilon: f64,
 ) -> PyResult<(RustArray, RustArray, RustArray)> {
-    indrajala_math::layer_norm::layer_norm_forward_batch(x, gamma, beta, epsilon)
+    indrajala_math::nn::norm::layer_norm::forward_batch(x, gamma, beta, epsilon)
         .map(|r| {
             let (r0, r1, r2) = r;
             (RustArray::from(r0), RustArray::from(r1), RustArray::from(r2))
@@ -54,7 +52,7 @@ pub fn layer_norm_downstream_batch(
     xhat: &RustArray,
     std: &RustArray,
 ) -> PyResult<RustArray> {
-    indrajala_math::layer_norm::layer_norm_downstream_batch(delta_batch, gamma, xhat, std)
+    indrajala_math::nn::norm::layer_norm::downstream_batch(delta_batch, gamma, xhat, std)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -69,7 +67,7 @@ pub fn layer_norm_accumulate_gradient_batch(
     grad_gamma: &RustArray,
     grad_beta: &RustArray,
 ) -> PyResult<(RustArray, RustArray)> {
-    indrajala_math::layer_norm::layer_norm_accumulate_gradient_batch(delta_batch, xhat, grad_gamma, grad_beta)
+    indrajala_math::nn::norm::layer_norm::accumulate_gradient_batch(delta_batch, xhat, grad_gamma, grad_beta)
         .map(|r| {
             let (r0, r1) = r;
             (RustArray::from(r0), RustArray::from(r1))

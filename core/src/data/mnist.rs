@@ -12,7 +12,7 @@ use crate::Error;
 /// records (784 pixel bytes + 1 label byte for real MNIST); returns pixels only, normalized to
 /// `[0.0, 1.0]`, shape `(record_count, record_size - 1)` - labels are dropped here exactly as
 /// `load_mnist_dataset_as_array` itself drops them.
-pub fn decode_mnist_pixels(data: &[u8], record_size: usize) -> Result<Array, Error> {
+pub fn decode_pixels(data: &[u8], record_size: usize) -> Result<Array, Error> {
     if record_size == 0 {
         return Err(Error::invalid("record_size must be at least 1"));
     }

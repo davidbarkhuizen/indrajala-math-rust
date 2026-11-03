@@ -213,20 +213,11 @@ pub fn window_program_forward(
 ) -> PyResult<PyProgramForward> {
     let parameters: Vec<&Array> = parameters.iter().map(|p| &p.0).collect();
     let arrays = |v: Vec<Array>| v.into_iter().map(RustArray::from).collect::<Vec<_>>();
-    indrajala_math::program::window_program_forward(
-        &program.0,
-        x,
-        &parameters,
-        c0,
-        states,
-        codes,
-        continuous,
-        couplings,
-    )
-    .map(|(outputs, kept_states, kept_cells, kept_indices): ProgramForward| {
-        (outputs.into(), arrays(kept_states), arrays(kept_cells), kept_indices)
-    })
-    .map_err(py_err)
+    indrajala_math::program::forward(&program.0, x, &parameters, c0, states, codes, continuous, couplings)
+        .map(|(outputs, kept_states, kept_cells, kept_indices): ProgramForward| {
+            (outputs.into(), arrays(kept_states), arrays(kept_cells), kept_indices)
+        })
+        .map_err(py_err)
 }
 
 /// A training step's gradients over every window of `x` `(N, W * k)` with targets `y`
@@ -271,7 +262,7 @@ pub fn window_program_learn(
 ) -> PyResult<RustArray> {
     let parameters: Vec<&Array> = parameters.iter().map(|p| &p.0).collect();
     let mut gradients: Vec<&mut Array> = gradients.iter_mut().map(|g| &mut g.0).collect();
-    indrajala_math::program::window_program_learn(
+    indrajala_math::program::learn(
         &program.0,
         x,
         y,

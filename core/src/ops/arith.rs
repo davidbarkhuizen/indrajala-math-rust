@@ -65,3 +65,13 @@ impl Array {
         }
     }
 }
+
+pub(crate) fn require_same_shape(a: &Array, b: &Array, context: &str) -> Result<(), Error> {
+    if a.shape != b.shape {
+        return Err(Error::invalid(format!(
+            "{context} requires matching shapes, got {:?} and {:?}",
+            a.shape, b.shape
+        )));
+    }
+    Ok(())
+}

@@ -1,19 +1,17 @@
-//! The bindings of the core's `recurrent` (`indrajala_math::recurrent`): each `#[pyfunction]` lends its
+//! The bindings of the core's `recurrent` (`indrajala_math::nn::recurrent`): each `#[pyfunction]` lends its
 //! arrays to the core's and moves the results in.
 
 use pyo3::prelude::*;
 
 use crate::array::RustArray;
 use crate::linalg::py_err;
-#[allow(unused_imports)]
-pub(crate) use indrajala_math::recurrent::*;
 
 /// `StateInputArrayLayer.forward_batch`: `out_t = x_t + P c` for each of the `tokens` tokens of
 /// each example, `x` `(N, T * d)`, `state` `(N, s)`, `p` `(d, s)`; `P c` is
 /// `linear_forward_batch(p, state)`.
 #[pyfunction]
 pub fn state_input_forward(x: &RustArray, state: &RustArray, p: &RustArray, tokens: usize) -> PyResult<RustArray> {
-    indrajala_math::recurrent::state_input_forward(x, state, p, tokens)
+    indrajala_math::nn::recurrent::state_input_forward(x, state, p, tokens)
         .map(RustArray::from)
         .map_err(py_err)
 }
@@ -29,7 +27,7 @@ pub fn state_input_backward(
     grad_p: &RustArray,
     tokens: usize,
 ) -> PyResult<(RustArray, RustArray)> {
-    indrajala_math::recurrent::state_input_backward(delta, state, p, grad_p, tokens)
+    indrajala_math::nn::recurrent::state_input_backward(delta, state, p, grad_p, tokens)
         .map(|r| {
             let (r0, r1) = r;
             (RustArray::from(r0), RustArray::from(r1))
@@ -47,7 +45,7 @@ pub fn state_input_film_forward(
     g: &RustArray,
     tokens: usize,
 ) -> PyResult<(RustArray, RustArray)> {
-    indrajala_math::recurrent::state_input_film_forward(x, state, p, g, tokens)
+    indrajala_math::nn::recurrent::state_input_film_forward(x, state, p, g, tokens)
         .map(|(out, gamma)| (RustArray::from(out), RustArray::from(gamma)))
         .map_err(py_err)
 }
@@ -68,7 +66,7 @@ pub fn state_input_film_backward(
     grad_g: &RustArray,
     tokens: usize,
 ) -> PyResult<(RustArray, RustArray, RustArray, RustArray)> {
-    indrajala_math::recurrent::state_input_film_backward(delta, x, state, p, g, gamma, grad_p, grad_g, tokens)
+    indrajala_math::nn::recurrent::state_input_film_backward(delta, x, state, p, g, gamma, grad_p, grad_g, tokens)
         .map(|(a, b, c, d)| {
             (
                 RustArray::from(a),
@@ -85,7 +83,7 @@ pub fn state_input_film_backward(
 /// Returns `(u, p)`, `(N, d)` and `(N, T)`.
 #[pyfunction]
 pub fn attention_pooling_forward(x: &RustArray, q: &RustArray, tokens: usize) -> PyResult<(RustArray, RustArray)> {
-    indrajala_math::recurrent::attention_pooling_forward(x, q, tokens)
+    indrajala_math::nn::recurrent::attention_pooling_forward(x, q, tokens)
         .map(|r| {
             let (r0, r1) = r;
             (RustArray::from(r0), RustArray::from(r1))
@@ -106,7 +104,7 @@ pub fn attention_pooling_backward(
     grad_q: &RustArray,
     tokens: usize,
 ) -> PyResult<(RustArray, RustArray)> {
-    indrajala_math::recurrent::attention_pooling_backward(x, p, q, du, grad_q, tokens)
+    indrajala_math::nn::recurrent::attention_pooling_backward(x, p, q, du, grad_q, tokens)
         .map(|r| {
             let (r0, r1) = r;
             (RustArray::from(r0), RustArray::from(r1))
@@ -126,7 +124,7 @@ pub fn gru_forward(
     u_weights: &RustArray,
     b: &RustArray,
 ) -> PyResult<(RustArray, RustArray, RustArray, RustArray, RustArray)> {
-    indrajala_math::recurrent::gru_forward(u, c, w, u_weights, b)
+    indrajala_math::nn::recurrent::gru_forward(u, c, w, u_weights, b)
         .map(|r| {
             let (r0, r1, r2, r3, r4) = r;
             (
@@ -160,7 +158,7 @@ pub fn gru_backward(
     grad_u: &RustArray,
     grad_b: &RustArray,
 ) -> PyResult<(RustArray, RustArray, RustArray, RustArray, RustArray)> {
-    indrajala_math::recurrent::gru_backward(dh, u, c, r, z, h_tilde, rc, w, u_weights, grad_w, grad_u, grad_b)
+    indrajala_math::nn::recurrent::gru_backward(dh, u, c, r, z, h_tilde, rc, w, u_weights, grad_w, grad_u, grad_b)
         .map(|r| {
             let (r0, r1, r2, r3, r4) = r;
             (
@@ -180,7 +178,7 @@ pub fn gru_backward(
 /// their indices.
 #[pyfunction]
 pub fn codes_forward(h: &RustArray, e: &RustArray) -> PyResult<(RustArray, Vec<usize>)> {
-    indrajala_math::recurrent::codes_forward(h, e)
+    indrajala_math::nn::recurrent::codes_forward(h, e)
         .map(|r| {
             let (r0, r1) = r;
             (RustArray::from(r0), r1)
@@ -206,7 +204,7 @@ pub fn codes_backward(
     commitment: f64,
     target: Option<&RustArray>,
 ) -> PyResult<(RustArray, RustArray)> {
-    indrajala_math::recurrent::codes_backward(dq, h, q, indices, grad_e, weight, commitment, target.map(|a| &a.0))
+    indrajala_math::nn::recurrent::codes_backward(dq, h, q, indices, grad_e, weight, commitment, target.map(|a| &a.0))
         .map(|r| {
             let (r0, r1) = r;
             (RustArray::from(r0), RustArray::from(r1))
@@ -226,7 +224,7 @@ pub fn soft_codes_forward(
     e: &RustArray,
     temperature: f64,
 ) -> PyResult<(RustArray, RustArray, Vec<usize>)> {
-    indrajala_math::recurrent::soft_codes_forward(h, e, temperature)
+    indrajala_math::nn::recurrent::soft_codes_forward(h, e, temperature)
         .map(|r| {
             let (r0, r1, r2) = r;
             (RustArray::from(r0), RustArray::from(r1), r2)
@@ -258,7 +256,7 @@ pub fn soft_codes_backward(
     temperature: f64,
     straight: bool,
 ) -> PyResult<(RustArray, RustArray)> {
-    indrajala_math::recurrent::soft_codes_backward(
+    indrajala_math::nn::recurrent::soft_codes_backward(
         dq,
         h,
         q,
@@ -280,7 +278,7 @@ pub fn soft_codes_backward(
 /// `np.concatenate(arrays, axis=1)`: matrices of one row count side by side, a copy.
 #[pyfunction]
 pub fn concatenate_columns(arrays: Vec<PyRef<'_, RustArray>>) -> PyResult<RustArray> {
-    indrajala_math::recurrent::concatenate_columns(&arrays.iter().map(|a| &a.0).collect::<Vec<_>>())
+    indrajala_math::nn::recurrent::concatenate_columns(&arrays.iter().map(|a| &a.0).collect::<Vec<_>>())
         .map(RustArray::from)
         .map_err(py_err)
 }

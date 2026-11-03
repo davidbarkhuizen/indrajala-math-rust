@@ -1,4 +1,4 @@
-//! The bindings of the core's `attention` (`indrajala_math::attention`): each `#[pyfunction]` lends its
+//! The bindings of the core's `attention` (`indrajala_math::nn::attention`): each `#[pyfunction]` lends its
 //! arrays to the core's and moves the results in.
 
 use pyo3::prelude::*;
@@ -7,7 +7,7 @@ use crate::array::RustArray;
 use crate::generator::Generator;
 use crate::linalg::py_err;
 
-/// `ForwardResult` (`indrajala_math::attention`) with the bindings' arrays.
+/// `ForwardResult` (`indrajala_math::nn::attention`) with the bindings' arrays.
 type ForwardResult = (
     RustArray,
     RustArray,
@@ -20,7 +20,7 @@ type ForwardResult = (
 );
 
 /// The core's forward result, moved into the bindings' arrays.
-fn forward_result(r: indrajala_math::attention::ForwardResult) -> ForwardResult {
+fn forward_result(r: indrajala_math::nn::attention::ForwardResult) -> ForwardResult {
     let (a, q, k, v, h, m, l, rng) = r;
     (
         a.into(),
@@ -33,8 +33,6 @@ fn forward_result(r: indrajala_math::attention::ForwardResult) -> ForwardResult 
         rng.map(Generator),
     )
 }
-#[allow(unused_imports)]
-pub(crate) use indrajala_math::attention::*;
 
 /// `AttentionArrayLayer.forward`: one example, `x` 1D of `T * d` values, `d` `bo`'s length, in
 /// `heads` heads across `bq`'s length, masked if `causal`, its weights dropped from `rng` in
@@ -68,7 +66,7 @@ pub fn attention_forward<'py>(
     block: usize,
     key_value_heads: Option<usize>,
 ) -> PyResult<ForwardResult> {
-    indrajala_math::attention::attention_forward(
+    indrajala_math::nn::attention::forward(
         x,
         wq,
         bq,
@@ -121,7 +119,7 @@ pub fn attention_forward_batch<'py>(
     block: usize,
     key_value_heads: Option<usize>,
 ) -> PyResult<ForwardResult> {
-    indrajala_math::attention::attention_forward_batch(
+    indrajala_math::nn::attention::forward_batch(
         x,
         wq,
         bq,
@@ -174,7 +172,7 @@ pub fn attention_step(
     block: usize,
     key_value_heads: Option<usize>,
 ) -> PyResult<(RustArray, RustArray, RustArray)> {
-    indrajala_math::attention::attention_step(
+    indrajala_math::nn::attention::step(
         x,
         wq,
         bq,
@@ -232,7 +230,7 @@ pub fn attention_downstream_batch(
     block: usize,
     key_value_heads: Option<usize>,
 ) -> PyResult<(RustArray, RustArray, RustArray, RustArray)> {
-    indrajala_math::attention::attention_downstream_batch(
+    indrajala_math::nn::attention::downstream_batch(
         delta_batch,
         wq,
         wk,
@@ -285,7 +283,7 @@ pub fn attention_accumulate_gradient_batch(
     RustArray,
     RustArray,
 )> {
-    indrajala_math::attention::attention_accumulate_gradient_batch(
+    indrajala_math::nn::attention::accumulate_gradient_batch(
         delta_batch,
         x,
         h,
@@ -347,7 +345,7 @@ pub fn cross_attention_forward_batch<'py>(
     block: usize,
     key_value_heads: Option<usize>,
 ) -> PyResult<ForwardResult> {
-    indrajala_math::attention::cross_attention_forward_batch(
+    indrajala_math::nn::attention::cross::forward_batch(
         x,
         memory,
         wq,
@@ -398,7 +396,7 @@ pub fn cross_attention_downstream_batch(
     block: usize,
     key_value_heads: Option<usize>,
 ) -> PyResult<(RustArray, RustArray, RustArray, RustArray, RustArray)> {
-    indrajala_math::attention::cross_attention_downstream_batch(
+    indrajala_math::nn::attention::cross::downstream_batch(
         delta_batch,
         wq,
         wk,
@@ -448,7 +446,7 @@ pub fn cross_attention_accumulate_gradient_batch(
     RustArray,
     RustArray,
 )> {
-    indrajala_math::attention::cross_attention_accumulate_gradient_batch(
+    indrajala_math::nn::attention::cross::accumulate_gradient_batch(
         delta_batch,
         x,
         memory,
@@ -501,7 +499,7 @@ pub fn cross_attention_attend_batch(
     block: usize,
     key_value_heads: Option<usize>,
 ) -> PyResult<RustArray> {
-    indrajala_math::attention::cross_attention_attend_batch(
+    indrajala_math::nn::attention::cross::attend_batch(
         x,
         k,
         v,

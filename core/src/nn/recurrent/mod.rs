@@ -3,7 +3,7 @@
 //! `GRUArrayLayer` and `CodesArrayLayer` in
 //! `indrajala_ml/model/layers/numpy/recurrent_array_layer.py`, and `concatenate_columns`, which
 //! joins the windows' outputs. Every function takes a batch, one example per row; a window's `T`
-//! tokens of `d` features are flat and token-major, index `t * d + j`, as in `tokens.rs`.
+//! tokens of `d` features are flat and token-major, index `t * d + j`, as in [`tokens`](crate::nn::tokens).
 //!
 //! ```text
 //! state input   out_t = x_t + P c;  dc = (sum_t delta_t) P;  dP += (sum_t delta_t)^T c
@@ -24,21 +24,24 @@
 //! code-consolidation workplan, D1: a duplicate code's state pulled to its representative's code).
 //!
 //! with `sigmoid(x) = 1 / (1 + exp(-x))` and `tanh(x) = 1 - 2 / (exp(2x) + 1)` (the workplan's W15),
-//! `exp` Rust's `f64::exp`, as `exp` (`ufuncs.rs`) is. The products are the crate's (`matmul`,
+//! `exp` Rust's `f64::exp`, as `exp` ([`crate::ops::unary`]) is. The products are the crate's (`matmul`,
 //! `matmul_nt`, `matmul_add`, as the dense layer's ops call them: `affine_forward_batch`,
-//! `linear_forward_batch`, `layer_downstream_batch`, `layer_accumulate_gradient_batch`,
+//! `linear_forward_batch`, `dense::downstream_batch`, `dense::accumulate_gradient_batch`,
 //! `linear_accumulate_gradient_batch`), so their bits are those ops'; numpy's products are BLAS's,
 //! not these. Every sum that isn't a product is a left fold from `0.0` in index order (numpy's
-//! `np.cumsum`), the softmax is `array_softmax`, and every elementwise expression is numpy's,
+//! `np.cumsum`), the softmax is `unary::softmax`, and every elementwise expression is numpy's,
 //! grouped as written above, so the steps between products are numpy's by bits. The codes' search
 //! and their backward pass have no product: they are numpy's by bits.
 
+pub mod factored;
+
 use crate::array::{Array, Shape};
-use crate::cr_exp::{exp_in_place, sigmoid_in_place};
-use crate::fused::{affine_forward_batch, layer_accumulate_gradient_batch};
 use crate::linalg::{matmul, matmul_add, matmul_nt};
-use crate::ops::same_shape_elementwise;
-use crate::ufuncs::array_softmax;
+use crate::nn::dense;
+use crate::nn::dense::affine_forward_batch;
+use crate::num::exp::{exp_in_place, sigmoid_in_place, tanh_in_place};
+use crate::ops::arith::same_shape_elementwise;
+use crate::ops::unary;
 use crate::Error;
 
 /// `(rows, cols)` of a matrix, refused for a vector.
@@ -70,20 +73,6 @@ pub(crate) fn features_per_token(tokens: usize, width: usize, context: &str) -> 
         )));
     }
     Ok(width / tokens)
-}
-
-/// `1 - 2 / (exp(2x) + 1)` for each of `values`, in place. The workplan's W15: through `exp`, as
-/// `sigmoid`, so it agrees where `exp` does. A large `x` overflows `exp(2x)` to infinity and gives
-/// exactly 1; a large negative `x` exactly -1. Doubling is exact, and each pass rounds value by
-/// value, so the bits are the expression's.
-pub(crate) fn tanh_in_place(values: &mut [f64]) {
-    for v in values.iter_mut() {
-        *v *= 2.0;
-    }
-    exp_in_place(values);
-    for v in values.iter_mut() {
-        *v = 1.0 - 2.0 / (*v + 1.0);
-    }
 }
 
 /// Columns `start..end` of a `cols`-wide matrix, a copy.
@@ -259,13 +248,13 @@ fn pooling_shape(x: &Array, q: &Array, tokens: usize, context: &str) -> Result<(
 }
 
 /// `AttentionPoolingArrayLayer.forward_batch`: the scores `s_t = q . x_t` (`x`'s `(N * T, d)` rows
-/// `@ q`), `p` their `array_softmax` per example, and `u = p @ x` per example, `(1, T) @ (T, d)`.
+/// `@ q`), `p` their `unary::softmax` per example, and `u = p @ x` per example, `(1, T) @ (T, d)`.
 /// Returns `(u, p)`, `(N, d)` and `(N, T)`.
 pub fn attention_pooling_forward(x: &Array, q: &Array, tokens: usize) -> Result<(Array, Array), Error> {
     let (rows, features) = pooling_shape(x, q, tokens, "attention_pooling_forward")?;
     let token_rows = Array::from_matrix(x.data.clone(), rows * tokens, features);
     let scores = matmul(&token_rows, q)?;
-    let p = array_softmax(&Array::from_matrix(scores.data, rows, tokens));
+    let p = unary::softmax(&Array::from_matrix(scores.data, rows, tokens));
     let mut data = Vec::with_capacity(rows * features);
     for (weights, example) in p.data.chunks_exact(tokens).zip(x.data.chunks_exact(tokens * features)) {
         let weights = Array::from_matrix(weights.to_vec(), 1, tokens);
@@ -387,7 +376,7 @@ pub fn gru_forward(
 
 /// `GRUArrayLayer.backward_batch` after `gru_forward` gave `r`, `z`, `h_tilde` and `rc`: `h`'s
 /// gradient `dh` `(N, s)` to `u`'s and `c`'s, and the parameters' gradients accumulated: `w`'s
-/// and `b`'s as `layer_accumulate_gradient_batch(dA, u, ...)`, `u_weights`' row blocks as
+/// and `b`'s as `dense::accumulate_gradient_batch(dA, u, ...)`, `u_weights`' row blocks as
 /// `linear_accumulate_gradient_batch`. Returns `(du, dc, grad_w, grad_u, grad_b)`.
 #[allow(clippy::too_many_arguments)]
 pub fn gru_backward(
@@ -452,7 +441,7 @@ pub fn gru_backward(
     let da = Array::from_matrix(da, rows, 3 * s);
     let da_rz = Array::from_matrix(da_rz, rows, 2 * s);
 
-    let (new_grad_w, new_grad_b) = layer_accumulate_gradient_batch(&da, u, grad_w, grad_b)?;
+    let (new_grad_w, new_grad_b) = dense::accumulate_gradient_batch(&da, u, grad_w, grad_b)?;
     let grad_u_rz = matmul_add(&row_block(grad_u, s, 0, 2 * s), &da_rz.transpose(), c)?;
     let grad_u_h = matmul_add(&row_block(grad_u, s, 2 * s, 3 * s), &da_h.transpose(), rc)?;
     let mut new_grad_u = grad_u_rz.data;

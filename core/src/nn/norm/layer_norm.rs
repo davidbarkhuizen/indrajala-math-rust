@@ -1,5 +1,5 @@
 //! Layer norm (indrajala-ml's layer-norm and attention workplan, D5): one Rust function per method
-//! of `LayerNormArrayLayer` in `indrajala_ml/model/layers/numpy/layer_norm_array_layer.py`, as `batch_norm.rs`
+//! of `LayerNormArrayLayer` in `indrajala_ml/model/layers/numpy/layer_norm_array_layer.py`, as [`batch_norm`](super::batch_norm)
 //! is for batch norm. Each token's `d` features (a flat layer's whole vector being one token) are
 //! normalized by their own mean and biased variance, then `gamma * xhat + beta`, `gamma` and
 //! `beta` of length `d` shared over the tokens. A token-major batch of `T` tokens per example is
@@ -85,12 +85,7 @@ fn normalize(
 /// `LayerNormArrayLayer.forward`: one example, `x` 1D of `T * d` values. Returns `(a, xhat, std)`,
 /// what the backward pass reads: `xhat` in `x`'s layout and `std = sqrt(var + eps)` per token.
 /// Training and inference alike.
-pub fn layer_norm_forward(
-    x: &Array,
-    gamma: &Array,
-    beta: &Array,
-    epsilon: f64,
-) -> Result<(Array, Array, Array), Error> {
+pub fn forward(x: &Array, gamma: &Array, beta: &Array, epsilon: f64) -> Result<(Array, Array, Array), Error> {
     let context = "layer_norm_forward";
     if !matches!(x.shape, Shape::Vector(_)) {
         return Err(Error::invalid(format!(
@@ -101,14 +96,9 @@ pub fn layer_norm_forward(
     normalize(x, gamma, beta, epsilon, context)
 }
 
-/// `LayerNormArrayLayer.forward_batch`: `x` 2D (`batch, T * d`), each row `layer_norm_forward`'s
+/// `LayerNormArrayLayer.forward_batch`: `x` 2D (`batch, T * d`), each row `forward`'s
 /// bits. Returns `(a, xhat, std)`, `std` per (example, token), 1D of `batch * T`.
-pub fn layer_norm_forward_batch(
-    x: &Array,
-    gamma: &Array,
-    beta: &Array,
-    epsilon: f64,
-) -> Result<(Array, Array, Array), Error> {
+pub fn forward_batch(x: &Array, gamma: &Array, beta: &Array, epsilon: f64) -> Result<(Array, Array, Array), Error> {
     let context = "layer_norm_forward_batch";
     if !matches!(x.shape, Shape::Matrix(_, _)) {
         return Err(Error::invalid(format!(
@@ -121,14 +111,9 @@ pub fn layer_norm_forward_batch(
 
 /// `LayerNormArrayLayer.downstream_batch`: `dl/dx` from `delta_batch` (`dl/dy`), per row,
 /// `dxhat = delta * gamma`, `m1 = sum(dxhat) / d`, `m2 = sum(dxhat * xhat) / d`, `dx = ((dxhat -
-/// m1) - xhat * m2) / std`. `xhat` and `std` are `layer_norm_forward_batch`'s, or, with a 1D
-/// `delta_batch` for one example, `layer_norm_forward`'s.
-pub fn layer_norm_downstream_batch(
-    delta_batch: &Array,
-    gamma: &Array,
-    xhat: &Array,
-    std: &Array,
-) -> Result<Array, Error> {
+/// m1) - xhat * m2) / std`. `xhat` and `std` are `forward_batch`'s, or, with a 1D
+/// `delta_batch` for one example, `forward`'s.
+pub fn downstream_batch(delta_batch: &Array, gamma: &Array, xhat: &Array, std: &Array) -> Result<Array, Error> {
     let context = "layer_norm_downstream_batch";
     let d = gamma.data.len();
     let rows = feature_rows(delta_batch, d, "delta_batch", context)?;
@@ -155,7 +140,7 @@ pub fn layer_norm_downstream_batch(
 /// `LayerNormArrayLayer.accumulate_gradient_batch`: `grad_gamma += sum(delta * xhat)` and
 /// `grad_beta += sum(delta)`, each feature's sum over the rows (examples, then tokens). Returns the
 /// updated `(grad_gamma, grad_beta)`. A 1D `delta_batch` and `xhat` are one example.
-pub fn layer_norm_accumulate_gradient_batch(
+pub fn accumulate_gradient_batch(
     delta_batch: &Array,
     xhat: &Array,
     grad_gamma: &Array,

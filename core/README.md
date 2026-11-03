@@ -25,14 +25,14 @@ assert_eq!(y.data(), &[-2.0, -2.0]);
 - **Products** (`linalg`): `a @ b` in its three shape cases, `c + a @ b`, `a @ b.T`, a long-`K`
   product, `outer`, with AVX2/FMA kernels on x86_64 (picked at runtime, scalar fallback) and NEON
   on aarch64, threaded over output rows for large products.
-- **Layers**, forward and backward: dense and fused layer updates (SGD, momentum, L2, Adam,
+- **Layers** (`nn`), forward and backward: dense and fused layer updates (SGD, momentum, L2, Adam,
   dropout), conv and max pooling, batch and layer norm, multi-head attention (causal, dropout,
   rotary positions), tokens (patches, embeddings, means, dropout), a GRU cell, attention pooling,
   and vector-quantized codes, plain and factored.
-- **Functions**: a correctly rounded `exp` (a port of
+- **Functions** (`num` over values, `ops` over arrays): a correctly rounded `exp` (a port of
   [CORE-MATH](https://core-math.gitlabpages.inria.fr/)'s `cr_exp`), `erf` (fdlibm's, through that `exp`), softmax, ReLU and
   their masks.
-- **Generators**: numpy's legacy `np.random` (MT19937) and `default_rng`
+- **Generators** (`random`): numpy's legacy `np.random` (MT19937) and `default_rng`
   (`Generator(PCG64(SeedSequence(seed)))`), bit for bit: after the same seed, the same draws as
   numpy.
 
@@ -51,6 +51,6 @@ the only panics are the ones documented (`Array::from_matrix` on a buffer of the
 
 ## License
 
-MIT. `src/cr_exp.rs` is a port of CORE-MATH's `cr_exp` (MIT, Alexei Sibidanov), its copyright and
-permission notice kept in the file. `src/erf.rs` is a port of fdlibm's `s_erf.c` (Sun Microsystems,
+MIT. `src/num/exp.rs` is a port of CORE-MATH's `cr_exp` (MIT, Alexei Sibidanov), its copyright and
+permission notice kept in the file. `src/num/erf.rs` is a port of fdlibm's `s_erf.c` (Sun Microsystems,
 1993, freely granted), its notice kept in the file.

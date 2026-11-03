@@ -1,4 +1,4 @@
-//! The bindings of the core's `default_rng` (`indrajala_math::generator`): a seed's Python forms
+//! The bindings of the core's `default_rng` (`indrajala_math::random::generator`): a seed's Python forms
 //! read as numpy reads them, and `bit_generator.state` as numpy's dict.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,7 +9,7 @@ use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 
 use crate::array::{parse_shape, RustArray};
 use crate::linalg::py_err;
-use indrajala_math::generator::{GeneratorState, POOL_SIZE};
+use indrajala_math::random::generator::{GeneratorState, POOL_SIZE};
 
 /// `_int_to_uint32_array`: a non-negative integer as 32-bit words, lowest first (`[0]` for 0).
 fn int_to_words(value: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
@@ -107,7 +107,7 @@ pub struct SeedSequence {
     entropy: Py<PyAny>,
     spawn_key: Py<PyTuple>,
     entropy_words: Vec<u32>,
-    inner: indrajala_math::generator::SeedSequence,
+    inner: indrajala_math::random::generator::SeedSequence,
     n_children_spawned: AtomicUsize,
 }
 
@@ -120,7 +120,7 @@ impl SeedSequence {
     ) -> PyResult<Self> {
         let spawn_words = coerce_words(spawn_key.as_any(), numpy)?;
         Ok(SeedSequence {
-            inner: indrajala_math::generator::SeedSequence::from_words(&entropy_words, &spawn_words),
+            inner: indrajala_math::random::generator::SeedSequence::from_words(&entropy_words, &spawn_words),
             entropy,
             spawn_key: spawn_key.unbind(),
             entropy_words,
@@ -257,10 +257,10 @@ fn out_of_bounds<T>(py: Python<'_>, extracted: PyResult<T>) -> PyResult<T> {
 /// from its own PCG64 in C order on the calling thread. `state` reads and writes numpy's
 /// `bit_generator.state` dict.
 #[pyclass(module = "indrajala_math_rust", skip_from_py_object)]
-pub struct Generator(pub indrajala_math::generator::Generator);
+pub struct Generator(pub indrajala_math::random::generator::Generator);
 
 impl std::ops::Deref for Generator {
-    type Target = indrajala_math::generator::Generator;
+    type Target = indrajala_math::random::generator::Generator;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -281,13 +281,13 @@ impl Generator {
     #[pyo3(signature = (seed=None))]
     fn new(py: Python<'_>, seed: Option<Bound<'_, PyAny>>) -> PyResult<Self> {
         if let Some(seed_sequence) = seed.as_ref().and_then(|seed| seed.cast::<SeedSequence>().ok()) {
-            return Ok(Generator(indrajala_math::generator::Generator::from_seed_sequence(
-                &seed_sequence.get().inner,
-            )));
+            return Ok(Generator(
+                indrajala_math::random::generator::Generator::from_seed_sequence(&seed_sequence.get().inner),
+            ));
         }
-        Ok(Generator(indrajala_math::generator::Generator::from_seed_sequence(
-            &SeedSequence::new(py, seed, None)?.inner,
-        )))
+        Ok(Generator(
+            indrajala_math::random::generator::Generator::from_seed_sequence(&SeedSequence::new(py, seed, None)?.inner),
+        ))
     }
 
     /// `rng.random(shape)`: doubles in `[0, 1)`, filled in C order.

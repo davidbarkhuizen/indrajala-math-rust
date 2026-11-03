@@ -1,12 +1,12 @@
 //! numpy's `default_rng`: `Generator(PCG64(SeedSequence(seed)))`, bit for bit. `SeedSequence`
 //! hashes a seed into a 128-bit pool and expands it into PCG64's 256-bit seed; `Pcg64` is
 //! O'Neill's PCG XSL-RR 128/64 as numpy runs it; `Generator` draws numpy's doubles from it. A
-//! separate stream from `random.rs`'s global MT19937 (numpy's legacy `np.random`), as numpy keeps
+//! separate stream from [`legacy`](super::legacy)'s global MT19937 (numpy's legacy `np.random`), as numpy keeps
 //! its `Generator` apart from its legacy functions. Each `Generator` owns its state, which reads
 //! and writes as numpy's `bit_generator.state`, so a state moves between numpy and the crate.
 
 use crate::array::{Array, Shape};
-use crate::random::{bernoulli_values, shaped, DoubleSource};
+use crate::random::legacy::{bernoulli_values, shaped, DoubleSource};
 use crate::Error;
 
 /// numpy's default pool: four 32-bit words.
