@@ -68,6 +68,10 @@ they merge, then move them into the release notes at release time and empty this
   is 0 and its output is `bo`. The downstream returns `(dx, dm, dq, dk, dv)`, where
   `dm = dK Wk + dV Wv` is the memory's gradient as `(N * S, d_m)` rows. Self-attention's bits are
   unchanged.
+- **Cross-attention's decoding** (indrajala-ml's cross-attention workplan, D7):
+  `cross_attention_attend_batch(x, k, v, wq, bq, wo, bo, heads, ...)` attends queries against keys
+  and values computed once per source (the memory's rows through `wk`, `bk` and `wv`, `bv`). Each
+  query's bits are the forward pass's at that token.
 - **`erf`** (#89), a port of fdlibm's `s_erf.c` through the correctly rounded `exp`. It is within
   one ulp, but not correctly rounded.
 
