@@ -30,6 +30,7 @@ from indrajala_math_rust import (
     matmul_threads_for,
     outer,
     set_kernel_overrides,
+    set_matmul_nt_slab,
     set_matmul_threading,
     sum_axis0,
 )
@@ -612,6 +613,30 @@ def test_thread_count_cannot_change_accumulate_gradient_batch_bits(reset_matmul_
     )
     for threads, result in threaded.items():
         assert result == unthreaded, threads
+
+
+@pytest.fixture
+def reset_nt_slab():
+    yield
+    set_matmul_nt_slab(0)
+
+
+# rows and columns past the register tiles, and `k` past a multiple of 4
+@pytest.mark.parametrize(
+    "m, k, n", [(1, 37, 1), (3, 37, 3), (4, 40, 2), (5, 41, 3), (9, 99, 8), (6, 1302, 5), (64, 900, 31)]
+)
+@pytest.mark.parametrize("slab", [4, 8, 36, 64, 1024])
+def test_the_slab_cannot_change_matmul_nt_bits(reset_nt_slab, reset_matmul_threading, m, k, n, slab):
+    rng = np.random.default_rng(m * 10000 + k * 10 + n)
+    W = Array(rng.uniform(-1.0, 1.0, size=(n, k)).tolist())
+    X = Array(rng.uniform(-1.0, 1.0, size=(m, k)).tolist())
+    b = Array([0.0] * n)
+    set_matmul_nt_slab(2**64 - 1)
+    whole = layer_relu_forward_batch(W, X, b).tolist()
+    set_matmul_nt_slab(slab)
+    assert layer_relu_forward_batch(W, X, b).tolist() == whole
+    set_matmul_threading(3, 1)
+    assert layer_relu_forward_batch(W, X, b).tolist() == whole
 
 
 @pytest.mark.parametrize(

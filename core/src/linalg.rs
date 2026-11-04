@@ -416,7 +416,13 @@ pub fn matmul_nt(a: &Array, b: &Array) -> Result<Array, Error> {
     }
     let _census = crate::census::enter("matmul_nt", m, k, n);
     let mut out = vec![0.0; m * n];
+    let slab = nt_slab(k, n);
     for_each_row_range(&mut out, m, n, m * k * n, |chunk, row_start, row_end| {
+        if let Some(slab) = slab {
+            if matmul_nt_in_slabs(&a.data, &b.data, chunk, (row_start, row_end), (k, n), slab) {
+                return;
+            }
+        }
         #[cfg(not(target_arch = "aarch64"))]
         #[cfg_attr(
             not(target_arch = "x86_64"),
@@ -440,6 +446,185 @@ pub fn matmul_nt(a: &Array, b: &Array) -> Result<Array, Error> {
         }
     });
     Ok(Array::from_matrix(out, m, n))
+}
+
+static NT_SLAB_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
+
+/// Benchmark hook: `matmul_nt`'s slab in `k`, rounded down to a multiple of 4 (0 = from `CpuInfo`;
+/// `usize::MAX` = none), process-wide until reset with 0. Like the other hooks, it can't change any
+/// output's value, which the tests check.
+pub fn set_matmul_nt_slab(slab: usize) {
+    NT_SLAB_OVERRIDE.store(slab, Ordering::Relaxed);
+}
+
+/// The largest slab of `b` worth keeping in L2, in bytes, whatever the L2: past it stone's P-cores,
+/// with 1,280 KB, gained no more.
+const NT_SLAB_MAX_BYTES: usize = 128 * 1024;
+
+/// The shortest slab worth its stored lanes. Each output's 4 lanes are written back once a slab, 32
+/// bytes against the 8 x 4 a slab's rows read per output's row of `b`, so that traffic is 16 / slab of
+/// what's read: at `n` = 512 on jebel a slab would be 12 rows, and a `d` 512 epoch took 5x as long.
+const NT_SLAB_MIN: usize = 64;
+
+/// `matmul_nt`'s slab in `k`, or `None` for one pass over all of `k`: only once `b` is past half the
+/// L2 share, which streams it again for every block of rows, and then a quarter of that share of `b`
+/// a slab, at most `NT_SLAB_MAX_BYTES` and at least `NT_SLAB_MIN` rows, or none at all (the crate
+/// performance workplan, K8: on jebel a slab reaching the L2 gained nothing, and on stone's P-cores
+/// slabbing a `b` that fits cost up to 10%).
+fn nt_slab(k: usize, n: usize) -> Option<usize> {
+    const F64_BYTES: usize = std::mem::size_of::<f64>();
+    let slab = match NT_SLAB_OVERRIDE.load(Ordering::Relaxed) {
+        usize::MAX => return None,
+        0 => {
+            let l2 = crate::sys::cpu_info::CpuInfo::get().l2_per_core;
+            if n * k * F64_BYTES <= l2 / 2 {
+                return None;
+            }
+            let slab = (l2 / 4).min(NT_SLAB_MAX_BYTES) / (n * F64_BYTES).max(1);
+            if slab < NT_SLAB_MIN {
+                return None;
+            }
+            slab
+        }
+        overridden => overridden,
+    };
+    let slab = slab / 4 * 4;
+    (slab >= 4 && slab < k).then_some(slab)
+}
+
+/// A chunk's rows of `a @ b.T` with `k` in slabs, each output's 4 lanes stored between them: a slab of
+/// `b` stays in cache across every block of rows, and the lanes are combined only after the last, so
+/// each output is `dot_product`'s grouping, bit for bit. `false` when there's no vector kernel here.
+fn matmul_nt_in_slabs(
+    a: &[f64],
+    b: &[f64],
+    chunk: &mut [f64],
+    rows: (usize, usize),
+    (k, n): (usize, usize),
+    slab: usize,
+) -> bool {
+    let (row_start, row_end) = rows;
+    let mut lanes = vec![0.0; (row_end - row_start) * n * 4];
+    let groups = k / 4 * 4;
+    let mut i0 = 0;
+    while i0 < groups {
+        let i1 = (i0 + slab).min(groups);
+        let shape = NtSlab { rows, k, n, i0, i1 };
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) {
+                return false;
+            }
+            // Safety: AVX2 and FMA were just checked; the shape lies within the three buffers.
+            unsafe { nt_slab_avx2_fma(a, b, &mut lanes, shape) };
+        }
+        // Safety: NEON is aarch64's baseline; the shape lies within the three buffers.
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            nt_slab_neon(a, b, &mut lanes, shape)
+        };
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let _ = (a, b, &mut lanes, shape);
+            return false;
+        }
+        i0 = i1;
+    }
+    for (r, (out_row, lane_row)) in chunk.chunks_exact_mut(n).zip(lanes.chunks_exact(n * 4)).enumerate() {
+        let a_row = &a[(row_start + r) * k..(row_start + r + 1) * k];
+        for (col, (out, l)) in out_row.iter_mut().zip(lane_row.as_chunks::<4>().0).enumerate() {
+            *out = dot_product_tail(&b[col * k..(col + 1) * k], a_row, groups, combine_lanes(*l));
+        }
+    }
+    true
+}
+
+/// One slab of `matmul_nt_in_slabs`: rows `rows`, the `k` groups `i0..i1`.
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    expect(dead_code, reason = "only the vector kernels read it")
+)]
+struct NtSlab {
+    rows: (usize, usize),
+    k: usize,
+    n: usize,
+    i0: usize,
+    i1: usize,
+}
+
+/// One slab in the register tiles (`NT_A_ROWS` x `NT_B_ROWS`), with 1-wide and 1-row tiles for what's
+/// left. Safety: AVX2 and FMA are present; `a` holds `rows.1 * k` values, `b` `n * k`, `lanes` 4 for each
+/// of the rows' outputs, and `i1 - i0` is a multiple of 4 with `i1 <= k`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn nt_slab_avx2_fma(a: &[f64], b: &[f64], lanes: &mut [f64], shape: NtSlab) {
+    let (row_start, row_end) = shape.rows;
+    let n = shape.n;
+    let mut row = row_start;
+    while row + NT_A_ROWS <= row_end {
+        let mut col = 0;
+        while col + NT_B_ROWS <= n {
+            nt_slab_tile_avx2_fma::<NT_A_ROWS, NT_B_ROWS>(a, b, lanes, shape, row, col);
+            col += NT_B_ROWS;
+        }
+        if col < n {
+            nt_slab_tile_avx2_fma::<NT_A_ROWS, 1>(a, b, lanes, shape, row, col);
+        }
+        row += NT_A_ROWS;
+    }
+    while row < row_end {
+        let mut col = 0;
+        while col + NT_B_ROWS <= n {
+            nt_slab_tile_avx2_fma::<1, NT_B_ROWS>(a, b, lanes, shape, row, col);
+            col += NT_B_ROWS;
+        }
+        if col < n {
+            nt_slab_tile_avx2_fma::<1, 1>(a, b, lanes, shape, row, col);
+        }
+        row += 1;
+    }
+}
+
+/// `dot_product_tile_avx2_fma` over one slab, its accumulators loaded from and stored to `lanes`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn nt_slab_tile_avx2_fma<const RA: usize, const RB: usize>(
+    a: &[f64],
+    b: &[f64],
+    lanes: &mut [f64],
+    shape: NtSlab,
+    row: usize,
+    col: usize,
+) {
+    use std::arch::x86_64::{_mm256_fmadd_pd, _mm256_loadu_pd, _mm256_setzero_pd, _mm256_storeu_pd};
+
+    let NtSlab { rows, k, n, i0, i1 } = shape;
+    let (a_ptr, b_ptr) = (a.as_ptr(), b.as_ptr());
+    let lanes_ptr = lanes.as_mut_ptr();
+    let lane_at = |r: usize, c: usize| lanes_ptr.add(((row + r - rows.0) * n + col + c) * 4);
+    let mut acc = [[_mm256_setzero_pd(); RB]; RA];
+    for r in 0..RA {
+        for c in 0..RB {
+            acc[r][c] = _mm256_loadu_pd(lane_at(r, c));
+        }
+    }
+    let mut i = i0;
+    while i < i1 {
+        let b_vecs: [_; RB] = std::array::from_fn(|c| _mm256_loadu_pd(b_ptr.add((col + c) * k + i)));
+        for r in 0..RA {
+            let a_vec = _mm256_loadu_pd(a_ptr.add((row + r) * k + i));
+            for c in 0..RB {
+                acc[r][c] = _mm256_fmadd_pd(b_vecs[c], a_vec, acc[r][c]);
+            }
+        }
+        i += 4;
+    }
+    for r in 0..RA {
+        for c in 0..RB {
+            _mm256_storeu_pd(lane_at(r, c), acc[r][c]);
+        }
+    }
 }
 
 /// `matmul_nt`'s register tile, 4 rows of `a` by 2 of `b`: 8 accumulators and 6 loads, in
@@ -671,6 +856,84 @@ unsafe fn matmul_nt_blocks_neon(
         row += NEON_NT_A_ROWS;
     }
     row
+}
+
+/// `nt_slab_avx2_fma` on NEON. Safety: as there, but for NEON, aarch64's baseline.
+#[cfg(target_arch = "aarch64")]
+unsafe fn nt_slab_neon(a: &[f64], b: &[f64], lanes: &mut [f64], shape: NtSlab) {
+    let (row_start, row_end) = shape.rows;
+    let n = shape.n;
+    let mut row = row_start;
+    while row + NEON_NT_A_ROWS <= row_end {
+        let mut col = 0;
+        while col + NEON_NT_B_ROWS <= n {
+            nt_slab_tile_neon::<NEON_NT_A_ROWS, NEON_NT_B_ROWS>(a, b, lanes, shape, row, col);
+            col += NEON_NT_B_ROWS;
+        }
+        if col < n {
+            nt_slab_tile_neon::<NEON_NT_A_ROWS, 1>(a, b, lanes, shape, row, col);
+        }
+        row += NEON_NT_A_ROWS;
+    }
+    while row < row_end {
+        let mut col = 0;
+        while col + NEON_NT_B_ROWS <= n {
+            nt_slab_tile_neon::<1, NEON_NT_B_ROWS>(a, b, lanes, shape, row, col);
+            col += NEON_NT_B_ROWS;
+        }
+        if col < n {
+            nt_slab_tile_neon::<1, 1>(a, b, lanes, shape, row, col);
+        }
+        row += 1;
+    }
+}
+
+/// `dot_product_tile_neon` over one slab, its accumulators loaded from and stored to `lanes`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn nt_slab_tile_neon<const RA: usize, const RB: usize>(
+    a: &[f64],
+    b: &[f64],
+    lanes: &mut [f64],
+    shape: NtSlab,
+    row: usize,
+    col: usize,
+) {
+    use std::arch::aarch64::{vdupq_n_f64, vfmaq_f64, vld1q_f64, vst1q_f64};
+
+    let NtSlab { rows, k, n, i0, i1 } = shape;
+    let (a_ptr, b_ptr) = (a.as_ptr(), b.as_ptr());
+    let lanes_ptr = lanes.as_mut_ptr();
+    let lane_at = |r: usize, c: usize| lanes_ptr.add(((row + r - rows.0) * n + col + c) * 4);
+    let mut acc = [[[vdupq_n_f64(0.0); 2]; RB]; RA];
+    for r in 0..RA {
+        for c in 0..RB {
+            acc[r][c] = [vld1q_f64(lane_at(r, c)), vld1q_f64(lane_at(r, c).add(2))];
+        }
+    }
+    let mut i = i0;
+    while i < i1 {
+        let b_vecs: [[_; 2]; RB] = std::array::from_fn(|c| {
+            [
+                vld1q_f64(b_ptr.add((col + c) * k + i)),
+                vld1q_f64(b_ptr.add((col + c) * k + i + 2)),
+            ]
+        });
+        for r in 0..RA {
+            let a_lo = vld1q_f64(a_ptr.add((row + r) * k + i));
+            let a_hi = vld1q_f64(a_ptr.add((row + r) * k + i + 2));
+            for c in 0..RB {
+                acc[r][c][0] = vfmaq_f64(acc[r][c][0], b_vecs[c][0], a_lo);
+                acc[r][c][1] = vfmaq_f64(acc[r][c][1], b_vecs[c][1], a_hi);
+            }
+        }
+        i += 4;
+    }
+    for r in 0..RA {
+        for c in 0..RB {
+            vst1q_f64(lane_at(r, c), acc[r][c][0]);
+            vst1q_f64(lane_at(r, c).add(2), acc[r][c][1]);
+        }
+    }
 }
 
 /// `tile[r][c] = dot_product(b_rows[c], a_rows[r])`, as `dot_product_tile_avx2_fma` computes it, each
