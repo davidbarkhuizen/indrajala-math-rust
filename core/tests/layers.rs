@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 fn layer(module: &str) -> Option<u8> {
     match module {
         "array" | "census" | "error" | "Array" | "Shape" | "Error" => Some(0),
-        "num" => Some(1),
+        "num" | "sys" => Some(1),
         "ops" | "linalg" | "random" => Some(2),
         "nn" => Some(3),
         "program" | "data" => Some(4),
