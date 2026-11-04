@@ -33,6 +33,13 @@ pub(crate) fn set_kernel_overrides(narrow_rows_per_block: usize, long_k_block: u
     linalg::set_kernel_overrides(narrow_rows_per_block, long_k_block);
 }
 
+/// Benchmark hook: `matmul_nt`'s slab in `k` (`linalg::set_matmul_nt_slab`; 0 resets, `usize::MAX`
+/// turns it off).
+#[pyfunction]
+pub(crate) fn set_matmul_nt_slab(slab: usize) {
+    linalg::set_matmul_nt_slab(slab);
+}
+
 #[pymethods]
 impl RustArray {
     /// Exposed as Python's `@` operator (`__matmul__`), not a free function - every real call
@@ -56,6 +63,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(set_matmul_threading, m)?)?;
     m.add_function(wrap_pyfunction!(matmul_threads_for, m)?)?;
     m.add_function(wrap_pyfunction!(set_kernel_overrides, m)?)?;
+    m.add_function(wrap_pyfunction!(set_matmul_nt_slab, m)?)?;
     m.add_function(wrap_pyfunction!(outer, m)?)?;
     Ok(())
 }

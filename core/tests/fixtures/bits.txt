@@ -44,6 +44,10 @@ matmul_add long k 70 x 300 x 21	1ad9a52691368045 1470
 matmul_add long k 9 x 1025 x 18	6219d49b04d57646 162
 matmul_long_k 8 x 4100 @ 4100 x 75	db182ed827d9ddcc 600
 matmul_nt 33 x 5408, 31 x 5408	94f53cf05f627cb3 1023
+matmul_nt past L2 13 x 2051 x 35	630e12d6335a6d47 455
+matmul_nt past L2 3 x 8197 x 7	cef873eeb0ddf99f 21
+matmul_nt past L2 64 x 5408 x 32	674e8dd574f33e78 2048
+matmul_nt past L2 9 x 1299 x 501	2ac81fbd694897e7 4509
 max_pool_forward_batch 26 x 26, 8 ch	0b09a5776571f29e 8112
 outer 17 x 23	e6810c1826d7d712 391
 softmax 7 x 10	85ef1bcae248578d 70
