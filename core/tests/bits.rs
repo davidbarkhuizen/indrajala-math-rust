@@ -327,16 +327,16 @@ fn families() -> BTreeMap<&'static str, String> {
         (9, 1025, 18),
         (64, 2048, 16),
         (7, 512, 800),
+        (3, 100, 517),
+        (33, 80, 530),
+        (64, 100, 37),
+        (70, 300, 21),
+        (130, 70, 512),
     ] {
         let (a, b, c) = (matrix(g, m, k), matrix(g, k, n), matrix(g, m, n));
-        let (name, name_add): (&'static str, &'static str) = match k {
-            64 => ("matmul long k 5 x 64 x 21", "matmul_add long k 5 x 64 x 21"),
-            65 => ("matmul long k 5 x 65 x 21", "matmul_add long k 5 x 65 x 21"),
-            300 => ("matmul long k 3 x 300 x 37", "matmul_add long k 3 x 300 x 37"),
-            1025 => ("matmul long k 9 x 1025 x 18", "matmul_add long k 9 x 1025 x 18"),
-            2048 => ("matmul long k 64 x 2048 x 16", "matmul_add long k 64 x 2048 x 16"),
-            _ => ("matmul long k 7 x 512 x 800", "matmul_add long k 7 x 512 x 800"),
-        };
+        // a leak for the family's name: a test, and these few, once
+        let name: &'static str = Box::leak(format!("matmul long k {m} x {k} x {n}").into_boxed_str());
+        let name_add: &'static str = Box::leak(format!("matmul_add long k {m} x {k} x {n}").into_boxed_str());
         out.insert(name, hash(&[&matmul(&a, &b).unwrap()]));
         out.insert(name_add, hash(&[&matmul_add(&c, &a, &b).unwrap()]));
     }
