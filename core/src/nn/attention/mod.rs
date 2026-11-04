@@ -71,8 +71,8 @@
 
 pub mod cross;
 
-use crate::array::{Array, Shape};
-use crate::linalg::matmul;
+use crate::array::{transpose_into, Array, Shape};
+use crate::linalg::matmul_into;
 use crate::nn::dense;
 use crate::nn::dense::affine_forward_batch;
 use crate::num::exp::{exp, exp_in_place};
@@ -388,14 +388,13 @@ fn key_blocks(keys: usize, block: usize, origin: usize) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Rows `r0..r1` and columns `c0..c0 + width` of a packed matrix, copied.
-fn tile(m: &Array, r0: usize, r1: usize, c0: usize, width: usize) -> Array {
+/// Rows `r0..r1` and columns `c0..c0 + width` of a packed matrix, copied into `out`.
+fn tile_into(out: &mut Vec<f64>, m: &Array, r0: usize, r1: usize, c0: usize, width: usize) {
     let stride = columns(m);
-    let mut data = Vec::with_capacity((r1 - r0) * width);
+    out.clear();
     for r in r0..r1 {
-        data.extend_from_slice(&m.data[r * stride + c0..r * stride + c0 + width]);
+        out.extend_from_slice(&m.data[r * stride + c0..r * stride + c0 + width]);
     }
-    Array::from_matrix(data, r1 - r0, width)
 }
 
 /// A left fold from the first value, as numpy's `cumsum` along a row: `((x0 + x1) + x2) + ...`.
@@ -414,27 +413,51 @@ struct Extent {
 }
 
 /// Example `n`'s key/value head `group`'s tile of keys or values `k0..k1`, `(k1 - k0, d_k)`.
-fn group_tile(m: &Array, n: usize, group: usize, k0: usize, k1: usize, extent: Extent, d_k: usize) -> Array {
-    tile(m, n * extent.keys + k0, n * extent.keys + k1, group * d_k, d_k)
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a tile's coordinates, inlined at its two callers"
+)]
+fn group_tile_into(
+    out: &mut Vec<f64>,
+    m: &Array,
+    n: usize,
+    group: usize,
+    k0: usize,
+    k1: usize,
+    extent: Extent,
+    d_k: usize,
+) {
+    tile_into(out, m, n * extent.keys + k0, n * extent.keys + k1, group * d_k, d_k);
 }
 
-/// One key block's scores against rows `r0..r1` of example `n`'s head `i`, `k_t` its key/value
-/// head's keys `k0..k1` transposed: `(Q K^T) / s`, masked scores `-inf`.
-fn scores(
+/// One key block's scores against rows `r0..r1` of example `n`'s head `i`, into `s`, `k_t` its
+/// key/value head's keys `k0..k1` transposed: `(Q K^T) / s`, masked scores `-inf`. `q_t` is left
+/// holding the head's `Q` tile, which a backward pass needs again.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the two reused buffers beside what a score needs"
+)]
+fn scores_into(
+    s: &mut Vec<f64>,
+    q_t: &mut Vec<f64>,
     q: &Array,
-    k_t: &Array,
+    k_t: &[f64],
     at: (usize, usize, usize, usize, usize, usize),
     extent: Extent,
     options: &AttentionOptions,
     masking: &Masking,
-) -> Result<Array, Error> {
+) {
     let (n, i, r0, r1, k0, k1) = at;
     let d_k = options.key_size;
-    let q_t = tile(q, n * extent.queries + r0, n * extent.queries + r1, i * d_k, d_k);
-    let mut s = divided(matmul(&q_t, k_t)?, options.scale());
+    let b = k1 - k0;
+    tile_into(q_t, q, n * extent.queries + r0, n * extent.queries + r1, i * d_k, d_k);
+    matmul_into(q_t, k_t, s, r1 - r0, d_k, b);
+    let scale = options.scale();
+    for value in s.iter_mut() {
+        *value /= scale;
+    }
     if masking.masks(r0, r1, k0, k1) {
-        let b = k1 - k0;
-        for (r, row) in s.data.chunks_exact_mut(b).enumerate() {
+        for (r, row) in s.chunks_exact_mut(b).enumerate() {
             for (j, score) in row.iter_mut().enumerate() {
                 if !masking.allowed(r0 + r, k0 + j) {
                     *score = f64::NEG_INFINITY;
@@ -442,7 +465,6 @@ fn scores(
             }
         }
     }
-    Ok(s)
 }
 
 /// A key block's dropout mask over every example, head, query and key in that order, `None` when
@@ -479,6 +501,9 @@ fn tiled_forward<'s>(
     let mut m = vec![f64::NEG_INFINITY; rows * heads];
     let mut l = vec![0.0; rows * heads];
     let mut h = vec![0.0; rows * width];
+    // one set of tiles, reused: at a window program's 3-token tiles their allocations were the cost
+    let (mut kv, mut k_t, mut v_t, mut q_t) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut s, mut e, mut ev, mut alphas) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for (k0, k1) in key_blocks(extent.keys, extent.block, extent.origin) {
         let b = k1 - k0;
         let mask = block_mask(&mut rng, extent, options, b);
@@ -487,17 +512,27 @@ fn tiled_forward<'s>(
             let Some((r0, r1)) = masking.rows(extent.queries, k0, k1) else {
                 continue;
             };
-            let (mut k_t, mut v_t) = (Array::from_vector(vec![]), Array::from_vector(vec![]));
             for i in 0..heads {
                 if options.first_in_group(i) {
                     let group = options.group(i);
-                    k_t = group_tile(k, n, group, k0, k1, extent, d_k).transpose();
-                    v_t = group_tile(v, n, group, k0, k1, extent, d_k);
+                    group_tile_into(&mut kv, k, n, group, k0, k1, extent, d_k);
+                    transpose_into(&kv, b, d_k, &mut k_t);
+                    group_tile_into(&mut v_t, v, n, group, k0, k1, extent, d_k);
                 }
-                let s = scores(q, &k_t, (n, i, r0, r1, k0, k1), extent, options, &masking)?;
-                let mut e = vec![0.0; (r1 - r0) * b];
-                let mut alphas = Vec::with_capacity(r1 - r0);
-                for (r, (row, e_row)) in s.data.chunks_exact(b).zip(e.chunks_exact_mut(b)).enumerate() {
+                scores_into(
+                    &mut s,
+                    &mut q_t,
+                    q,
+                    &k_t,
+                    (n, i, r0, r1, k0, k1),
+                    extent,
+                    options,
+                    &masking,
+                );
+                e.clear();
+                e.resize((r1 - r0) * b, 0.0);
+                alphas.clear();
+                for (r, (row, e_row)) in s.chunks_exact(b).zip(e.chunks_exact_mut(b)).enumerate() {
                     let t = r0 + r;
                     let at = (n * extent.queries + t) * heads + i;
                     let m_old = m[at];
@@ -518,8 +553,8 @@ fn tiled_forward<'s>(
                         }
                     }
                 }
-                let ev = matmul(&Array::from_matrix(e, r1 - r0, b), &v_t)?;
-                for (r, ev_row) in ev.data.chunks_exact(d_k).enumerate() {
+                matmul_into(&e, &v_t, &mut ev, r1 - r0, b, d_k);
+                for (r, ev_row) in ev.chunks_exact(d_k).enumerate() {
                     let start = (n * extent.queries + r0 + r) * width + i * d_k;
                     for (out, &x) in h[start..start + d_k].iter_mut().zip(ev_row) {
                         *out = *out * alphas[r] + x;
@@ -577,6 +612,11 @@ fn tiled_backward<'s>(
     let mut dq = vec![0.0; rows * width];
     let mut dk = vec![0.0; extent.examples * extent.keys * kv_width];
     let mut dv = vec![0.0; extent.examples * extent.keys * kv_width];
+    // one set of tiles, reused, as the forward's
+    let (mut k_t, mut k_tt, mut v_t, mut v_tt) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut q_t, mut p, mut dh_t, mut dp) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut kept, mut dropped, mut swapped, mut dv_t) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut dq_t, mut dk_t) = (Vec::new(), Vec::new());
     for (k0, k1) in key_blocks(extent.keys, extent.block, extent.origin) {
         let b = k1 - k0;
         let mask = block_mask(&mut rng, extent, options, b);
@@ -585,17 +625,25 @@ fn tiled_backward<'s>(
             let Some((r0, r1)) = masking.rows(extent.queries, k0, k1) else {
                 continue;
             };
-            let empty = || Array::from_vector(vec![]);
-            let (mut k_t, mut k_tt, mut v_t) = (empty(), empty(), empty());
             for i in 0..heads {
                 let (group, first) = (options.group(i), options.first_in_group(i));
                 if first {
-                    k_t = group_tile(k, n, group, k0, k1, extent, d_k);
-                    k_tt = k_t.transpose();
-                    v_t = group_tile(v, n, group, k0, k1, extent, d_k);
+                    group_tile_into(&mut k_t, k, n, group, k0, k1, extent, d_k);
+                    transpose_into(&k_t, b, d_k, &mut k_tt);
+                    group_tile_into(&mut v_t, v, n, group, k0, k1, extent, d_k);
+                    transpose_into(&v_t, b, d_k, &mut v_tt);
                 }
-                let mut p = scores(q, &k_tt, (n, i, r0, r1, k0, k1), extent, options, &masking)?;
-                for (r, row) in p.data.chunks_exact_mut(b).enumerate() {
+                scores_into(
+                    &mut p,
+                    &mut q_t,
+                    q,
+                    &k_tt,
+                    (n, i, r0, r1, k0, k1),
+                    extent,
+                    options,
+                    &masking,
+                );
+                for (r, row) in p.chunks_exact_mut(b).enumerate() {
                     let at = (n * extent.queries + r0 + r) * heads + i;
                     // a row no key is allowed to (m = -inf, l = 0) reads m as 0 and l as 1, so its P
                     // is exp(-inf) / 1 = 0, as the forward divides its H; a no-op for every other row
@@ -610,45 +658,50 @@ fn tiled_backward<'s>(
                         *x /= sum;
                     }
                 }
-                let dh_t = tile(dh, n * extent.queries + r0, n * extent.queries + r1, i * d_k, d_k);
-                let mut dp = matmul(&dh_t, &v_t.transpose())?;
-                let dv_t = match &mask {
+                let rows_t = r1 - r0;
+                tile_into(
+                    &mut dh_t,
+                    dh,
+                    n * extent.queries + r0,
+                    n * extent.queries + r1,
+                    i * d_k,
+                    d_k,
+                );
+                matmul_into(&dh_t, &v_tt, &mut dp, rows_t, d_k, b);
+                match &mask {
                     Some(mask) => {
-                        let mut kept = Vec::with_capacity((r1 - r0) * b);
+                        kept.clear();
                         for t in r0..r1 {
                             let start = ((n * heads + i) * extent.queries + t) * b;
                             kept.extend(mask[start..start + b].iter().map(|&x| x / options.keep()));
                         }
-                        let dropped = Array::from_matrix(
-                            p.data.iter().zip(&kept).map(|(&pv, &kv)| pv * kv).collect(),
-                            r1 - r0,
-                            b,
-                        );
-                        for (x, &kv) in dp.data.iter_mut().zip(&kept) {
+                        dropped.clear();
+                        dropped.extend(p.iter().zip(&kept).map(|(&pv, &kv)| pv * kv));
+                        for (x, &kv) in dp.iter_mut().zip(&kept) {
                             *x *= kv;
                         }
-                        matmul(&dropped.transpose(), &dh_t)?
+                        transpose_into(&dropped, rows_t, b, &mut swapped);
                     }
-                    None => matmul(&p.transpose(), &dh_t)?,
-                };
-                let mut ds = p.data;
-                for (r, (ds_row, dp_row)) in ds.chunks_exact_mut(b).zip(dp.data.chunks_exact(b)).enumerate() {
+                    None => transpose_into(&p, rows_t, b, &mut swapped),
+                }
+                matmul_into(&swapped, &dh_t, &mut dv_t, b, rows_t, d_k);
+                // dS, in P's buffer
+                for (r, (ds_row, dp_row)) in p.chunks_exact_mut(b).zip(dp.chunks_exact(b)).enumerate() {
                     let term = row_terms[(n * extent.queries + r0 + r) * heads + i];
                     for (x, &dpv) in ds_row.iter_mut().zip(dp_row) {
                         *x *= dpv - term;
                     }
                 }
-                let ds = Array::from_matrix(ds, r1 - r0, b);
-                let q_t = tile(q, n * extent.queries + r0, n * extent.queries + r1, i * d_k, d_k);
-                let dq_t = matmul(&ds, &k_t)?;
-                for (r, row) in dq_t.data.chunks_exact(d_k).enumerate() {
+                matmul_into(&p, &k_t, &mut dq_t, rows_t, b, d_k);
+                for (r, row) in dq_t.chunks_exact(d_k).enumerate() {
                     let start = (n * extent.queries + r0 + r) * width + i * d_k;
                     for (out, &x) in dq[start..start + d_k].iter_mut().zip(row) {
                         *out += x;
                     }
                 }
-                let dk_t = matmul(&ds.transpose(), &q_t)?;
-                for (j, (dk_row, dv_row)) in dk_t.data.chunks_exact(d_k).zip(dv_t.data.chunks_exact(d_k)).enumerate() {
+                transpose_into(&p, rows_t, b, &mut swapped);
+                matmul_into(&swapped, &q_t, &mut dk_t, b, rows_t, d_k);
+                for (j, (dk_row, dv_row)) in dk_t.chunks_exact(d_k).zip(dv_t.chunks_exact(d_k)).enumerate() {
                     let start = (n * extent.keys + k0 + j) * kv_width + group * d_k;
                     if first {
                         dk[start..start + d_k].copy_from_slice(dk_row);

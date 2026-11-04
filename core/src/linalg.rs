@@ -230,6 +230,14 @@ unsafe fn dot_product_avx2_fma(a: &[f64], b: &[f64]) -> f64 {
     dot_product_tail(a, b, i, combine_lanes(lanes))
 }
 
+/// `a @ b` for row-major `(r1, c1)` and `(c1, c2)`, into `out`, which it resizes, so a caller running
+/// many small products allocates once: `matmul`'s kernel and bits.
+pub(crate) fn matmul_into(a: &[f64], b: &[f64], out: &mut Vec<f64>, r1: usize, c1: usize, c2: usize) {
+    out.clear();
+    out.resize(r1 * c2, 0.0);
+    matmul_2d::<OVERWRITE>(a, b, out, r1, c1, c2);
+}
+
 /// `tiled_row_range` below, with threaded row-splitting on top. Up to `LONG_K_BLOCK` rows of `b`, in
 /// blocks of rows sized so one block of `a` is about 16 KB. Past that, in slabs of `k`
 /// (`slabbed_panel`), each serving all of a chunk's rows from cache: with row blocks a 16 KB block
