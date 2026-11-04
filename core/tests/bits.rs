@@ -160,6 +160,7 @@ fn families() -> BTreeMap<&'static str, String> {
                 Activation::Gelu => "activation gelu forward and hidden delta 13 x 29 -> 37",
                 Activation::GeluTanh => "activation gelu_tanh forward and hidden delta 13 x 29 -> 37",
                 Activation::Silu => "activation silu forward and hidden delta 13 x 29 -> 37",
+                Activation::Sigmoid => unreachable!("batch norm's, not a hidden layer's"),
             },
             hash(&arrays),
         );

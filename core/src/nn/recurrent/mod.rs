@@ -23,15 +23,16 @@
 //! where `t`, the commitment's target, is `q` unless a target is given (indrajala-ml's
 //! code-consolidation workplan, D1: a duplicate code's state pulled to its representative's code).
 //!
-//! with `sigmoid(x) = 1 / (1 + exp(-x))` and `tanh(x) = 1 - 2 / (exp(2x) + 1)` (the workplan's W15),
-//! `exp` Rust's `f64::exp`, as `exp` ([`crate::ops::unary`]) is. The products are the crate's (`matmul`,
-//! `matmul_nt`, `matmul_add`, as the dense layer's ops call them: `affine_forward_batch`,
-//! `linear_forward_batch`, `dense::downstream_batch`, `dense::accumulate_gradient_batch`,
-//! `linear_accumulate_gradient_batch`), so their bits are those ops'; numpy's products are BLAS's,
-//! not these. Every sum that isn't a product is a left fold from `0.0` in index order (numpy's
-//! `np.cumsum`), the softmax is `unary::softmax`, and every elementwise expression is numpy's,
-//! grouped as written above, so the steps between products are numpy's by bits. The codes' search
-//! and their backward pass have no product: they are numpy's by bits.
+//! with `sigmoid(x) = 1 / (1 + exp(-x))` and `tanh(x) = 1 - 2 / (exp(2x) + 1)` (the workplan's
+//! W15), `exp` the crate's correctly rounded one ([`crate::num::exp`]), as `ops::unary`'s `exp` is.
+//! The products are the crate's (`matmul`, `matmul_nt`, `matmul_add`, as the dense layer's ops call
+//! them: `affine_forward_batch`, `linear_forward_batch`, `dense::downstream_batch`,
+//! `dense::accumulate_gradient_batch`, `linear_accumulate_gradient_batch`), so their bits are those
+//! ops'; numpy's products are BLAS's, not these. Every sum that isn't a product is a left fold from
+//! `0.0` in index order (numpy's `np.cumsum`), the softmax is `unary::softmax`, and every
+//! elementwise expression is numpy's, grouped as written above, so the steps between products are
+//! numpy's by bits. The codes' search and their backward pass have no product: they are numpy's by
+//! bits.
 
 pub mod factored;
 
