@@ -17,20 +17,30 @@ layer_forward_batch 30 x 784, b5	41a0ffa16f7e9661 150
 layer_norm_forward_batch 4 x 3 tokens x 8	e40a0789ef0b47f4 204
 matmul 256 x 256 @ 256 x 256 (threaded)	0ac54c85d42109e7 65536
 matmul 37 x 29 @ 29 x 13	4efe754dc914e0e6 481
+matmul long k 130 x 70 x 512	fe905b3a782c2cd4 66560
+matmul long k 3 x 100 x 517	2c5ac4187a1a7c84 1551
 matmul long k 3 x 300 x 37	44d3b24a1ec08792 111
+matmul long k 33 x 80 x 530	88c2f0f83e3e98ad 17490
 matmul long k 5 x 64 x 21	cdfd07043fed0ed9 105
 matmul long k 5 x 65 x 21	2ea243f253cd9dac 105
+matmul long k 64 x 100 x 37	31e559f5620ceb1f 2368
 matmul long k 64 x 2048 x 16	ee76618c4f675289 1024
 matmul long k 7 x 512 x 800	436e55fa24c45443 5600
+matmul long k 70 x 300 x 21	3e8a9226a88ef9af 1470
 matmul long k 9 x 1025 x 18	049580c6a4d992e6 162
 matmul matrix @ vector 30 x 784	40064de6f9502152 30
 matmul vector @ matrix 30 x 784	c7c04b9ea0c5d19e 784
 matmul_add 30 x 33 @ 33 x 13	046db239f4e4bb9a 390
+matmul_add long k 130 x 70 x 512	735c006fb2f1be63 66560
+matmul_add long k 3 x 100 x 517	b6ae1c340915d2b0 1551
 matmul_add long k 3 x 300 x 37	db0ae2787b93feb4 111
+matmul_add long k 33 x 80 x 530	e5888effa3751b68 17490
 matmul_add long k 5 x 64 x 21	c1a6304b08c149ef 105
 matmul_add long k 5 x 65 x 21	061b81292ececa9a 105
+matmul_add long k 64 x 100 x 37	ea9f504be9e96ada 2368
 matmul_add long k 64 x 2048 x 16	d0fe826c13408fd7 1024
 matmul_add long k 7 x 512 x 800	736566da3e2eaede 5600
+matmul_add long k 70 x 300 x 21	1ad9a52691368045 1470
 matmul_add long k 9 x 1025 x 18	6219d49b04d57646 162
 matmul_long_k 8 x 4100 @ 4100 x 75	db182ed827d9ddcc 600
 matmul_nt 33 x 5408, 31 x 5408	94f53cf05f627cb3 1023
