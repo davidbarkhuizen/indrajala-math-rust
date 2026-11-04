@@ -36,6 +36,8 @@ from indrajala_math_rust import (
     set_matmul_threading,
     set_threads,
     sum_axis0,
+)
+from indrajala_math_rust import (
     threads as thread_budget,
 )
 
