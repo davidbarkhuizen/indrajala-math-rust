@@ -365,6 +365,7 @@ fn matmul_transposed_add_is_matmul_add_of_the_transpose() {
         (64, 100, 37),
         (3, 100, 517),
         (70, 300, 21),
+        (130, 70, 511),
         (130, 70, 512),
         (256, 256, 256),
     ] {

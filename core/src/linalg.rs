@@ -336,10 +336,14 @@ pub fn matmul_add(c: &Array, a: &Array, b: &Array) -> Result<Array, Error> {
     Ok(Array::from_matrix(out, r1, c2))
 }
 
+/// `b` from this wide keeps `matmul_transposed_add`'s copy. The copy is about `1 / n` of the product's
+/// work, so a wide `b` has little to gain, and it can lose: at `m` 512 `d`'s stride is 4096 bytes, one L1
+/// set and few L2 sets, which cost a `d` 512 epoch 3% on a 4-way 256 KB L2.
+const TRANSPOSED_DIRECT_BELOW_N: usize = 512;
+
 /// `c + d.T @ b` for `d` (`K, M`), `b` (`K, N`) and `c` (`M, N`): `matmul_add(c, &d.transpose(), b)` bit for
-/// bit, with no transpose. The accumulate of every token-wise and batched layer is this product, and its
-/// transpose was as much as a third of the product's own time; reading `d` directly, each `k`'s
-/// multipliers are also contiguous.
+/// bit, with no transpose while `b` is narrow, where it was as much as a third of the accumulate of every
+/// token-wise and batched layer.
 pub fn matmul_transposed_add(c: &Array, d: &Array, b: &Array) -> Result<Array, Error> {
     let (Shape::Matrix(k, m), Shape::Matrix(b_k, n)) = (d.shape, b.shape) else {
         return Err(shape_error(d.shape, b.shape));
@@ -353,6 +357,9 @@ pub fn matmul_transposed_add(c: &Array, d: &Array, b: &Array) -> Result<Array, E
             Shape::Matrix(m, n),
             c.shape
         )));
+    }
+    if n >= TRANSPOSED_DIRECT_BELOW_N {
+        return matmul_add(c, &d.transpose(), b);
     }
     let mut out = c.data.clone();
     matmul_2d_steps::<ADD>(&d.data, &b.data, &mut out, (m, k, n), (1, m));
