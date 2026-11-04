@@ -770,6 +770,25 @@ def test_an_unreadable_environment_gives_the_default(value):
     assert int(stdout) == int(default)
 
 
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="fork")
+def test_a_forked_child_threads_its_products_and_gets_the_same_bits(reset_matmul_threading):
+    # the parent's pool has workers, and a child has none of them: a pool that kept them hangs here
+    code = """
+import os, signal, struct
+import indrajala_math_rust as pa
+a, b = pa.Array([[float(i + j) for j in range(64)] for i in range(64)]), pa.Array([[float(i - j) for j in range(64)] for i in range(64)])
+pa.set_matmul_threading(4, 1)
+want = (a @ b).tolist()
+child = os.fork()
+if child == 0:
+    signal.alarm(60)
+    os._exit(0 if (a @ b).tolist() == want else 1)
+_, status = os.waitpid(child, 0)
+raise SystemExit(os.waitstatus_to_exitcode(status))
+"""
+    assert subprocess.run([sys.executable, "-W", "ignore", "-c", code], check=False).returncode == 0
+
+
 def test_policy_override_and_row_cap(reset_matmul_threading):
     set_matmul_threading(3, 1)
     assert matmul_threads_for(*CONV_TAIL_BATCH_32) == 3

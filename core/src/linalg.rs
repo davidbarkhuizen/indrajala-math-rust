@@ -5,6 +5,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::array::{Array, Shape};
+use crate::sys::pool::for_each_part;
 use crate::sys::threads::threads;
 use crate::Error;
 
@@ -236,9 +237,8 @@ pub(crate) fn matmul_into(a: &[f64], b: &[f64], out: &mut Vec<f64>, r1: usize, c
 /// was 4 rows at `K` = 512, each block reading `b` again ((32, 512) @ (512, 5408): `b` 22 MB read 8
 /// times, 15 ms against 5), and 1 row past `K` = 1,024, so the 2-row tile never ran on a token-wise
 /// gradient (`(d, N*T) @ (N*T, d)`; a sequence epoch 12% slower). Splits the output's row range across
-/// `std::thread::scope` workers - safe without `'static` data (each worker borrows `a_data`/
-/// `b_data` read-only and writes into its own disjoint slice of `out`, via `split_at_mut`) - only
-/// once there's enough total work to pay for it (`matmul_thread_count`). Splitting by
+/// the pool's threads (`sys::pool`; each borrows `a_data`/`b_data` read-only and writes into its own
+/// disjoint slice of `out`) - only once there's enough total work to pay for it (`matmul_thread_count`). Splitting by
 /// row (not by `k` or `col`) needs no cross-thread reduction: each worker owns complete output
 /// rows end to end, so results are bit-identical to the single-threaded path regardless of thread
 /// count or scheduling - summation order per output row is unaffected by which thread computes it.
@@ -419,17 +419,10 @@ where
     }
 
     let rows_per_thread = rows.div_ceil(thread_count);
-    let compute = &compute;
-    std::thread::scope(|scope| {
-        let mut remaining_out = out;
-        let mut row_start = 0;
-        while row_start < rows {
-            let row_end = (row_start + rows_per_thread).min(rows);
-            let (chunk, rest) = remaining_out.split_at_mut((row_end - row_start) * cols);
-            remaining_out = rest;
-            scope.spawn(move || compute(chunk, row_start, row_end));
-            row_start = row_end;
-        }
+    let chunks: Vec<&mut [f64]> = out.chunks_mut(rows_per_thread * cols).collect();
+    for_each_part(thread_count, chunks, |index, chunk| {
+        let row_start = index * rows_per_thread;
+        compute(chunk, row_start, (row_start + rows_per_thread).min(rows));
     });
 }
 
@@ -1162,33 +1155,21 @@ pub fn matmul_long_k(a: &Array, b: &Array) -> Result<Array, Error> {
         .step_by(chunks_per_thread)
         .map(|chunk| (chunk * 16, ((chunk + chunks_per_thread) * 16).min(n)))
         .collect();
-    let columns = |(col_start, col_end): (usize, usize)| -> Vec<f64> {
-        let width = col_end - col_start;
-        let mut part = vec![0.0; m * width];
+    let mut parts: Vec<Vec<f64>> = column_ranges
+        .iter()
+        .map(|&(col_start, col_end)| vec![0.0; m * (col_end - col_start)])
+        .collect();
+    let threads = column_ranges.len();
+    for_each_part(threads, parts.iter_mut().collect(), |index, part: &mut Vec<f64>| {
+        let (col_start, col_end) = column_ranges[index];
         let panel = Panel {
             col_start,
             col_end,
-            out_stride: width,
+            out_stride: col_end - col_start,
             ..Panel::whole(0, m, k, n, m)
         };
-        slabbed_panel(&a.data, &b.data, &mut part, panel, k_block);
-        part
-    };
-    let parts: Vec<Vec<f64>> = if column_ranges.len() == 1 {
-        vec![columns(column_ranges[0])]
-    } else {
-        std::thread::scope(|scope| {
-            let columns = &columns;
-            let handles: Vec<_> = column_ranges
-                .iter()
-                .map(|&range| scope.spawn(move || columns(range)))
-                .collect();
-            handles
-                .into_iter()
-                .map(|handle| handle.join().expect("matmul_long_k worker panicked"))
-                .collect()
-        })
-    };
+        slabbed_panel(&a.data, &b.data, part, panel, k_block);
+    });
     let mut out = vec![0.0; m * n];
     for (&(col_start, col_end), part) in column_ranges.iter().zip(&parts) {
         let width = col_end - col_start;

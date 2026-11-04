@@ -285,6 +285,17 @@ impl Drop for Pool {
     }
 }
 
+/// Runs `work(index, part)` for every part, once each, on the process's pool, up to `threads` threads:
+/// how a threaded kernel hands out its disjoint pieces of an output, `&mut` slices among them. Each part
+/// is moved out of its own lock, the pieces being few and each worth far more than that.
+pub fn for_each_part<T: Send>(threads: usize, parts: Vec<T>, work: impl Fn(usize, T) + Sync) {
+    let parts: Vec<Mutex<Option<T>>> = parts.into_iter().map(|part| Mutex::new(Some(part))).collect();
+    global().for_each_chunk(parts.len(), threads, &|index| {
+        let part = lock(&parts[index]).take().expect("a chunk runs once");
+        work(index, part);
+    });
+}
+
 /// The process's pool, and the process it was made in.
 struct Global {
     pid: u32,
