@@ -6,7 +6,7 @@
 //! and writes as numpy's `bit_generator.state`, so a state moves between numpy and the crate.
 
 use crate::array::{Array, Shape};
-use crate::random::legacy::{bernoulli_values, shaped, DoubleSource};
+use crate::random::legacy::{shaped, DoubleSource};
 use crate::Error;
 
 /// numpy's default pool: four 32-bit words.
@@ -165,6 +165,17 @@ impl DoubleSource for Pcg64 {
     }
 }
 
+/// The smallest 53-bit draw `n` with `n / 2^53 >= p`. Scaling by a power of two is exact, and so is
+/// `ceil`, whose result the cast saturates: a negative `p` gives 0, every draw at or above it, and
+/// `p >= 1` gives a value no draw reaches. No draw compares `>=` a NaN.
+fn bits_threshold(p: f64) -> u64 {
+    if p.is_nan() {
+        u64::MAX
+    } else {
+        (p * 9_007_199_254_740_992.0).ceil() as u64
+    }
+}
+
 /// numpy's `bit_generator.state` for PCG64, as plain fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GeneratorState {
@@ -199,8 +210,22 @@ impl Generator {
     }
 
     /// The dropout mask the fused `layer_dropout_forward*` draw with this generator.
+    ///
+    /// Each entry is [`bernoulli_values`](crate::random::legacy::bernoulli_values)'s `next_double() >= drop_probability`, compared on the
+    /// draw's 53 bits: `n / 2^53 >= p` is exactly `n >= ceil(p * 2^53)`, and the conversion and float
+    /// compare were a large part of an attention layer's own time (the crate performance workplan,
+    /// stage 7).
     pub fn draw_bernoulli_mask(&mut self, drop_probability: f64, size: usize) -> Vec<f64> {
-        bernoulli_values(&mut self.pcg, drop_probability, size)
+        let threshold = bits_threshold(drop_probability);
+        (0..size)
+            .map(|_| {
+                if self.pcg.next_u64() >> 11 >= threshold {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect()
     }
 
     /// `rng.random(shape)`: doubles in `[0, 1)`, filled in C order.
@@ -249,5 +274,50 @@ impl Generator {
         };
         self.has_uint32 = state.has_uint32;
         self.uinteger = state.uinteger;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::random::legacy::bernoulli_values;
+
+    /// The integer compare against the float compare it replaces, draw for draw and with the
+    /// generator left in the same state, at probabilities on and beside a draw's own values.
+    #[test]
+    fn mask_matches_the_float_compare() {
+        const TWO_53: f64 = 9_007_199_254_740_992.0;
+        let mut probabilities = vec![
+            0.0,
+            -0.0,
+            0.1,
+            0.5,
+            0.9,
+            1.0,
+            2.0,
+            -1.0,
+            f64::MIN_POSITIVE,
+            5e-324,
+            1.0 / TWO_53,
+            1.5 / TWO_53,
+            1.0 - 1.0 / TWO_53,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ];
+        // a draw's exact value as the probability, and the floats either side of it
+        let generator = || Generator::from_seed_sequence(&SeedSequence::from_words(&[11], &[]));
+        let mut source = generator();
+        for _ in 0..64 {
+            let u = source.pcg.next_double();
+            probabilities.extend([u, u.next_down(), u.next_up()]);
+        }
+        for p in probabilities {
+            let (mut a, mut b) = (generator(), generator());
+            let mask = a.draw_bernoulli_mask(p, 256);
+            let expected = bernoulli_values(&mut b.pcg, p, 256);
+            assert_eq!(mask, expected, "probability {p}");
+            assert_eq!(a.pcg.next_u64(), b.pcg.next_u64(), "probability {p}");
+        }
     }
 }
