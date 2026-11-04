@@ -12,7 +12,7 @@ use indrajala_math::linalg::{matmul, matmul_add, matmul_long_k, matmul_nt, matmu
 use indrajala_math::nn::attention::{self, cross};
 use indrajala_math::nn::conv::{self, max_pool_forward_batch};
 use indrajala_math::nn::norm::layer_norm;
-use indrajala_math::nn::recurrent::gru_forward;
+use indrajala_math::nn::recurrent::{codes_forward, gru_forward};
 use indrajala_math::nn::{dense, gated};
 use indrajala_math::num::activation::Activation;
 use indrajala_math::ops::unary::{self, erf, exp};
@@ -45,6 +45,10 @@ fn matrix(rng: &mut Generator, rows: usize, cols: usize) -> Array {
 
 fn vector(rng: &mut Generator, n: usize) -> Array {
     rng.uniform(-1.0, 1.0, Shape::Vector(n)).unwrap()
+}
+
+fn index_array(indices: &[usize]) -> Array {
+    Array::from_matrix(indices.iter().map(|&i| i as f64).collect(), indices.len(), 1)
 }
 
 fn families() -> BTreeMap<&'static str, String> {
@@ -348,6 +352,31 @@ fn families() -> BTreeMap<&'static str, String> {
         let name: &'static str = Box::leak(format!("matmul_nt past L2 {m} x {k} x {n}").into_boxed_str());
         out.insert(name, hash(&[&matmul_nt(&a, &b).unwrap()]));
     }
+    // the nearest code: every lane remainder, a chain shorter and longer than a lane group, ties
+    // (duplicate codes, lowest index) and NaN distances (the first, in code order); indices as well
+    // as the codes, since a duplicate's code has the same bits as the one it ties with
+    for (rows, count, size) in [(9, 1, 3), (9, 3, 8), (9, 4, 1), (37, 5, 16), (37, 8, 32), (37, 23, 7)] {
+        let (h, e) = (matrix(g, rows, size), matrix(g, count, size));
+        let (q, indices) = codes_forward(&h, &e).unwrap();
+        let name: &'static str = format!("codes_forward {rows} x {size}, {count} codes").leak();
+        out.insert(name, hash(&[&q, &index_array(&indices)]));
+    }
+    let h = matrix(g, 37, 7);
+    let mut e = matrix(g, 23, 7).data().to_vec();
+    e.copy_within(5 * 7..6 * 7, 6 * 7); // code 6 ties with 5, across a lane group's boundary
+    e.copy_within(9 * 7..10 * 7, 10 * 7); // code 10 ties with 9, inside one
+    let e_ties = Array::from_matrix(e.clone(), 23, 7);
+    let mut h_ties = h.data().to_vec();
+    h_ties[..7].copy_from_slice(&e[5 * 7..6 * 7]); // a distance of exactly 0, tied
+    let h_ties = Array::from_matrix(h_ties, 37, 7);
+    let (q, indices) = codes_forward(&h_ties, &e_ties).unwrap();
+    out.insert("codes_forward ties", hash(&[&q, &index_array(&indices)]));
+    e[14 * 7 + 3] = f64::NAN; // in the fourth lane group's third lane
+    e[21 * 7] = f64::NAN; // and a later one, past the first
+    let e_nan = Array::from_matrix(e, 23, 7);
+    let (q, indices) = codes_forward(&h, &e_nan).unwrap();
+    out.insert("codes_forward NaN distances", hash(&[&q, &index_array(&indices)]));
+
     out
 }
 
