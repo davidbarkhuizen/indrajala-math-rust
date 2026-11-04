@@ -487,30 +487,96 @@ fn codes_shape(h: &Array, e: &Array, context: &str) -> Result<(usize, usize, usi
 /// first NaN distance if any, as `np.argmin`. Returns `(q, indices)`, the codes, a copy, and
 /// their indices.
 pub fn codes_forward(h: &Array, e: &Array) -> Result<(Array, Vec<usize>), Error> {
-    let (rows, _, size) = codes_shape(h, e, "codes_forward")?;
-    let mut indices = Vec::with_capacity(rows);
+    let (rows, count, size) = codes_shape(h, e, "codes_forward")?;
+    let packed = packed_codes(&e.data, count, size);
+    let mut indices = vec![0; rows];
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        // Safety: AVX2 was just detected
+        unsafe { nearest_codes_avx2(&h.data, &e.data, &packed, size, &mut indices) };
+    } else {
+        nearest_codes(&h.data, &e.data, &packed, size, &mut indices);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    nearest_codes(&h.data, &e.data, &packed, size, &mut indices);
     let mut q = Vec::with_capacity(h.data.len());
-    for row in h.data.chunks_exact(size) {
+    for &best in &indices {
+        q.extend_from_slice(&e.data[best * size..(best + 1) * size]);
+    }
+    Ok((Array::from_matrix(q, rows, size), indices))
+}
+
+/// Codes `codes_forward` measures at once, a lane each.
+const CODE_LANES: usize = 4;
+
+/// `e`'s whole groups of `CODE_LANES` codes, by feature: group, then feature, then lane.
+fn packed_codes(e: &[f64], count: usize, size: usize) -> Vec<f64> {
+    let groups = count / CODE_LANES;
+    let mut packed = Vec::with_capacity(groups * size * CODE_LANES);
+    for group in 0..groups {
+        for j in 0..size {
+            packed.extend((0..CODE_LANES).map(|lane| e[(group * CODE_LANES + lane) * size + j]));
+        }
+    }
+    packed
+}
+
+/// Each row of `h`'s nearest code, into `indices`. A code's distance is a chain over the features,
+/// but the chains of different codes are independent, so a group of them runs in lanes, each exactly the
+/// scalar fold; the distances are then read in code order, for the tie's and the first NaN's rule.
+/// The crate performance workplan, stage 7.
+#[inline(always)]
+fn nearest_codes(h: &[f64], e: &[f64], packed: &[f64], size: usize, indices: &mut [usize]) {
+    let group_size = size * CODE_LANES;
+    let grouped = packed.len() / size;
+    for (row, index) in h.chunks_exact(size).zip(indices.iter_mut()) {
         let mut best = 0;
         let mut best_distance = f64::INFINITY;
-        for (k, code) in e.data.chunks_exact(size).enumerate() {
-            let distance = row.iter().zip(code).fold(0.0, |acc, (&hv, &ev)| {
-                let difference = hv - ev;
-                acc + difference * difference
-            });
+        let mut consider = |k: usize, distance: f64| -> bool {
             if distance.is_nan() {
                 best = k;
-                break;
+                return false;
             }
             if k == 0 || distance < best_distance {
                 best = k;
                 best_distance = distance;
             }
+            true
+        };
+        'codes: {
+            for (group, codes) in packed.chunks_exact(group_size).enumerate() {
+                let mut distances = [0.0; CODE_LANES];
+                for (&hv, lanes) in row.iter().zip(codes.as_chunks::<CODE_LANES>().0) {
+                    for (acc, &ev) in distances.iter_mut().zip(lanes) {
+                        let difference = hv - ev;
+                        *acc += difference * difference;
+                    }
+                }
+                for (lane, &distance) in distances.iter().enumerate() {
+                    if !consider(group * CODE_LANES + lane, distance) {
+                        break 'codes;
+                    }
+                }
+            }
+            for (k, code) in e.chunks_exact(size).enumerate().skip(grouped) {
+                let distance = row.iter().zip(code).fold(0.0, |acc, (&hv, &ev)| {
+                    let difference = hv - ev;
+                    acc + difference * difference
+                });
+                if !consider(k, distance) {
+                    break 'codes;
+                }
+            }
         }
-        indices.push(best);
-        q.extend_from_slice(&e.data[best * size..(best + 1) * size]);
+        *index = best;
     }
-    Ok((Array::from_matrix(q, rows, size), indices))
+}
+
+/// `nearest_codes` with four lanes. AVX2 alone: no FMA, whose fused `acc + d * d` would round once.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn nearest_codes_avx2(h: &[f64], e: &[f64], packed: &[f64], size: usize, indices: &mut [usize]) {
+    nearest_codes(h, e, packed, size, indices);
 }
 
 /// `CodesArrayLayer.backward_batch` after `codes_forward` gave `q` and `indices`: with `D = h -
