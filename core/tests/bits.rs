@@ -348,6 +348,14 @@ fn families() -> BTreeMap<&'static str, String> {
         let name: &'static str = Box::leak(format!("matmul_nt past L2 {m} x {k} x {n}").into_boxed_str());
         out.insert(name, hash(&[&matmul_nt(&a, &b).unwrap()]));
     }
+
+    // a @ b.T with b past each machine's L2 share, in groups of its rows, with tails of each
+    let g = &mut rng(20261107);
+    for (m, k, n) in [(70, 700, 333), (130, 512, 130), (9, 4099, 65)] {
+        let (a, b) = (matrix(g, m, k), matrix(g, n, k));
+        let name: &'static str = Box::leak(format!("matmul_nt by groups {m} x {k} x {n}").into_boxed_str());
+        out.insert(name, hash(&[&matmul_nt(&a, &b).unwrap()]));
+    }
     out
 }
 

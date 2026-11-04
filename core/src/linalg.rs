@@ -468,6 +468,7 @@ pub fn matmul_nt(a: &Array, b: &Array) -> Result<Array, Error> {
     let _census = crate::census::enter("matmul_nt", m, k, n);
     let mut out = vec![0.0; m * n];
     let slab = nt_slab(k, n);
+    let group = nt_group(k, n);
     for_each_row_range(&mut out, m, n, m * k * n, |chunk, row_start, row_end| {
         if let Some(slab) = slab {
             if matmul_nt_in_slabs(&a.data, &b.data, chunk, (row_start, row_end), (k, n), slab) {
@@ -483,12 +484,12 @@ pub fn matmul_nt(a: &Array, b: &Array) -> Result<Array, Error> {
         #[cfg(target_arch = "x86_64")]
         {
             if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-                row = unsafe { matmul_nt_blocks_avx2_fma(&a.data, &b.data, chunk, row_start, row_end, k, n) };
+                row = unsafe { matmul_nt_blocks_avx2_fma(&a.data, &b.data, chunk, (row_start, row_end), k, n, group) };
             }
         }
         // NEON is part of aarch64's baseline: its blocks always run there
         #[cfg(target_arch = "aarch64")]
-        let row = unsafe { matmul_nt_blocks_neon(&a.data, &b.data, chunk, row_start, row_end, k, n) };
+        let row = unsafe { matmul_nt_blocks_neon(&a.data, &b.data, chunk, (row_start, row_end), k, n, group) };
         // the rows left over after the last full block, or every row without the vector blocks
         for row in row..row_end {
             let a_row = &a.data[row * k..(row + 1) * k];
@@ -541,6 +542,21 @@ fn nt_slab(k: usize, n: usize) -> Option<usize> {
     };
     let slab = slab / 4 * 4;
     (slab >= 4 && slab < k).then_some(slab)
+}
+
+/// `matmul_nt`'s rows of `b` a block of `a`'s rows goes past: all of them, or, once `b` is past half the L2
+/// share, this many, with all of `a` past each group. `b` is then read about once a group, not once
+/// for every 4 rows of `a`, and no chain is split. The crate performance workplan's probe: -3% to -34% at
+/// `m` 2048 on four kinds of core, at most +1%, and small groups lose (twice as slow at 2).
+const NT_GROUP: usize = 64;
+
+fn nt_group(k: usize, n: usize) -> usize {
+    let past_half_the_l2 = n * k * std::mem::size_of::<f64>() > crate::sys::cpu_info::CpuInfo::get().l2_per_core / 2;
+    if n > NT_GROUP && past_half_the_l2 {
+        NT_GROUP
+    } else {
+        n
+    }
 }
 
 /// A chunk's rows of `a @ b.T` with `k` in slabs, each output's 4 lanes stored between them: a slab of
@@ -700,37 +716,47 @@ unsafe fn matmul_nt_blocks_avx2_fma(
     a_data: &[f64],
     b_data: &[f64],
     chunk: &mut [f64],
-    row_start: usize,
-    row_end: usize,
+    (row_start, row_end): (usize, usize),
     k: usize,
     n: usize,
+    group: usize,
 ) -> usize {
-    let mut row = row_start;
-    while row + NT_A_ROWS <= row_end {
-        let a_block = &a_data[row * k..(row + NT_A_ROWS) * k];
-        let out_block = &mut chunk[(row - row_start) * n..(row - row_start + NT_A_ROWS) * n];
-        let mut col = 0;
-        while col + NT_B_ROWS <= n {
-            let tile =
-                dot_product_tile_avx2_fma::<NT_A_ROWS, NT_B_ROWS>(a_block, &b_data[col * k..(col + NT_B_ROWS) * k], k);
-            for r in 0..NT_A_ROWS {
-                out_block[r * n + col..r * n + col + NT_B_ROWS].copy_from_slice(&tile[r]);
-            }
-            col += NT_B_ROWS;
-        }
-        if col < n {
-            for r in 0..NT_A_ROWS {
-                dot_products_into(
-                    &b_data[col * k..n * k],
+    let mut tiled_end = row_start;
+    let mut group_start = 0;
+    while group_start < n {
+        let group_end = (group_start + group).min(n);
+        let mut row = row_start;
+        while row + NT_A_ROWS <= row_end {
+            let a_block = &a_data[row * k..(row + NT_A_ROWS) * k];
+            let out_block = &mut chunk[(row - row_start) * n..(row - row_start + NT_A_ROWS) * n];
+            let mut col = group_start;
+            while col + NT_B_ROWS <= group_end {
+                let tile = dot_product_tile_avx2_fma::<NT_A_ROWS, NT_B_ROWS>(
+                    a_block,
+                    &b_data[col * k..(col + NT_B_ROWS) * k],
                     k,
-                    &a_block[r * k..(r + 1) * k],
-                    &mut out_block[r * n + col..(r + 1) * n],
                 );
+                for r in 0..NT_A_ROWS {
+                    out_block[r * n + col..r * n + col + NT_B_ROWS].copy_from_slice(&tile[r]);
+                }
+                col += NT_B_ROWS;
             }
+            if col < group_end {
+                for r in 0..NT_A_ROWS {
+                    dot_products_into(
+                        &b_data[col * k..group_end * k],
+                        k,
+                        &a_block[r * k..(r + 1) * k],
+                        &mut out_block[r * n + col..r * n + group_end],
+                    );
+                }
+            }
+            row += NT_A_ROWS;
         }
-        row += NT_A_ROWS;
+        tiled_end = row;
+        group_start = group_end;
     }
-    row
+    tiled_end
 }
 
 /// `tile[r][c] = dot_product(b_rows[c], a_rows[r])` for `RA` consecutive `k`-wide rows of `a_rows` and `RB` of
@@ -873,40 +899,47 @@ unsafe fn matmul_nt_blocks_neon(
     a_data: &[f64],
     b_data: &[f64],
     chunk: &mut [f64],
-    row_start: usize,
-    row_end: usize,
+    (row_start, row_end): (usize, usize),
     k: usize,
     n: usize,
+    group: usize,
 ) -> usize {
-    let mut row = row_start;
-    while row + NEON_NT_A_ROWS <= row_end {
-        let a_block = &a_data[row * k..(row + NEON_NT_A_ROWS) * k];
-        let out_block = &mut chunk[(row - row_start) * n..(row - row_start + NEON_NT_A_ROWS) * n];
-        let mut col = 0;
-        while col + NEON_NT_B_ROWS <= n {
-            let tile = dot_product_tile_neon::<NEON_NT_A_ROWS, NEON_NT_B_ROWS>(
-                a_block,
-                &b_data[col * k..(col + NEON_NT_B_ROWS) * k],
-                k,
-            );
-            for r in 0..NEON_NT_A_ROWS {
-                out_block[r * n + col..r * n + col + NEON_NT_B_ROWS].copy_from_slice(&tile[r]);
-            }
-            col += NEON_NT_B_ROWS;
-        }
-        if col < n {
-            for r in 0..NEON_NT_A_ROWS {
-                dot_products_into(
-                    &b_data[col * k..n * k],
+    let mut tiled_end = row_start;
+    let mut group_start = 0;
+    while group_start < n {
+        let group_end = (group_start + group).min(n);
+        let mut row = row_start;
+        while row + NEON_NT_A_ROWS <= row_end {
+            let a_block = &a_data[row * k..(row + NEON_NT_A_ROWS) * k];
+            let out_block = &mut chunk[(row - row_start) * n..(row - row_start + NEON_NT_A_ROWS) * n];
+            let mut col = group_start;
+            while col + NEON_NT_B_ROWS <= group_end {
+                let tile = dot_product_tile_neon::<NEON_NT_A_ROWS, NEON_NT_B_ROWS>(
+                    a_block,
+                    &b_data[col * k..(col + NEON_NT_B_ROWS) * k],
                     k,
-                    &a_block[r * k..(r + 1) * k],
-                    &mut out_block[r * n + col..(r + 1) * n],
                 );
+                for r in 0..NEON_NT_A_ROWS {
+                    out_block[r * n + col..r * n + col + NEON_NT_B_ROWS].copy_from_slice(&tile[r]);
+                }
+                col += NEON_NT_B_ROWS;
             }
+            if col < group_end {
+                for r in 0..NEON_NT_A_ROWS {
+                    dot_products_into(
+                        &b_data[col * k..group_end * k],
+                        k,
+                        &a_block[r * k..(r + 1) * k],
+                        &mut out_block[r * n + col..r * n + group_end],
+                    );
+                }
+            }
+            row += NEON_NT_A_ROWS;
         }
-        row += NEON_NT_A_ROWS;
+        tiled_end = row;
+        group_start = group_end;
     }
-    row
+    tiled_end
 }
 
 /// `nt_slab_avx2_fma` on NEON. Safety: as there, but for NEON, aarch64's baseline.

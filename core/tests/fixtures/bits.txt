@@ -44,6 +44,9 @@ matmul_add long k 70 x 300 x 21	1ad9a52691368045 1470
 matmul_add long k 9 x 1025 x 18	6219d49b04d57646 162
 matmul_long_k 8 x 4100 @ 4100 x 75	db182ed827d9ddcc 600
 matmul_nt 33 x 5408, 31 x 5408	94f53cf05f627cb3 1023
+matmul_nt by groups 130 x 512 x 130	3ece946f14ee7747 16900
+matmul_nt by groups 70 x 700 x 333	5ac11daf9a4c867c 23310
+matmul_nt by groups 9 x 4099 x 65	2d582454d756d8a7 585
 matmul_nt past L2 13 x 2051 x 35	630e12d6335a6d47 455
 matmul_nt past L2 3 x 8197 x 7	cef873eeb0ddf99f 21
 matmul_nt past L2 64 x 5408 x 32	674e8dd574f33e78 2048
