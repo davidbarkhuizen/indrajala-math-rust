@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 /// module is placed on purpose.
 fn layer(module: &str) -> Option<u8> {
     match module {
-        "array" | "error" | "Array" | "Shape" | "Error" => Some(0),
+        "array" | "census" | "error" | "Array" | "Shape" | "Error" => Some(0),
         "num" => Some(1),
         "ops" | "linalg" | "random" => Some(2),
         "nn" => Some(3),

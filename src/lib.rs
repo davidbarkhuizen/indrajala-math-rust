@@ -3,6 +3,8 @@ use pyo3::prelude::*;
 // The modules follow the core's tree (indrajala-ml's crate structure workplan, stage 3); each
 // registers its own functions and classes, under their flat Python names (D3).
 mod array;
+#[cfg(feature = "census")]
+mod census;
 mod data;
 mod error;
 mod linalg;
@@ -32,6 +34,8 @@ fn indrajala_math_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     nn::register(m)?;
     program::register(m)?;
     data::register(m)?;
+    #[cfg(feature = "census")]
+    census::register(m)?;
     random::legacy::seed_at_import();
     Ok(())
 }

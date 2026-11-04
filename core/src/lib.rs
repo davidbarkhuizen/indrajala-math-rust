@@ -24,6 +24,10 @@
 // workplan, D1; tests/layers.rs checks it): `program` and `data` over `nn`, over `ops`, `linalg`
 // and `random`, over `num`, over `Array` and `Error`.
 mod array;
+#[cfg(feature = "census")]
+pub mod census;
+#[cfg(not(feature = "census"))]
+mod census;
 pub mod data;
 mod error;
 pub mod linalg;

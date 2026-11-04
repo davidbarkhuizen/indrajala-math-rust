@@ -11,6 +11,10 @@ documentation = "https://docs.rs/indrajala-math"
 keywords = ["neural-network", "matrix", "deterministic", "simd", "numpy"]
 categories = ["science", "mathematics"]
 
+[features]
+# A build for measuring which kernels run at which shapes (src/census.rs): never in a release.
+census = []
+
 [lints.clippy]
 # The kernels index several fixed-size accumulators and tiles in lockstep with one loop
 # variable (acc[r][j], b_tile[j]), mirroring the math; iterator chains would obscure it.
