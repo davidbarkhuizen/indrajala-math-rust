@@ -150,8 +150,12 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// A sysfs tree: per CPU, its sibling list and each cache's (level, type, size, shared list).
-    fn tree(name: &str, cpus: &[(&str, &[(u8, &str, &str, &str)])]) -> PathBuf {
+    /// A cache's (level, type, size, shared list), and a CPU's sibling list with its caches.
+    type Cache<'a> = (u8, &'a str, &'a str, &'a str);
+    type Cpu<'a> = (&'a str, &'a [Cache<'a>]);
+
+    /// A sysfs tree of these CPUs.
+    fn tree(name: &str, cpus: &[Cpu]) -> PathBuf {
         let root = std::env::temp_dir().join(format!("indrajala-cpu-info-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         for (cpu, (siblings, caches)) in cpus.iter().enumerate() {
@@ -176,7 +180,7 @@ mod tests {
         let cpus: Vec<(String, String, String)> = (0..8)
             .map(|c| (c.to_string(), c.to_string(), "0-7".to_string()))
             .collect();
-        let caches: Vec<[(u8, &str, &str, &str); 3]> = cpus
+        let caches: Vec<[Cache; 3]> = cpus
             .iter()
             .map(|(_, own, all)| {
                 [
@@ -186,7 +190,7 @@ mod tests {
                 ]
             })
             .collect();
-        let spec: Vec<(&str, &[(u8, &str, &str, &str)])> = cpus
+        let spec: Vec<Cpu> = cpus
             .iter()
             .zip(&caches)
             .map(|((s, _, _), c)| (s.as_str(), &c[..]))
@@ -200,7 +204,7 @@ mod tests {
 
     #[test]
     fn smt_siblings_count_once_and_share_their_cache() {
-        let spec: Vec<(&str, &[(u8, &str, &str, &str)])> = vec![
+        let spec: Vec<Cpu> = vec![
             (
                 "0-1",
                 &[
@@ -223,9 +227,9 @@ mod tests {
     #[test]
     fn a_hybrid_machine_reports_its_smallest_share() {
         // two P-cores with SMT, 1,280 KB each; four E-cores sharing 2 MB
-        let p0: &[(u8, &str, &str, &str)] = &[(1, "Data", "48K", "0-1"), (2, "Unified", "1280K", "0-1")];
-        let p1: &[(u8, &str, &str, &str)] = &[(1, "Data", "48K", "2-3"), (2, "Unified", "1280K", "2-3")];
-        let spec: Vec<(&str, &[(u8, &str, &str, &str)])> = vec![
+        let p0: &[Cache] = &[(1, "Data", "48K", "0-1"), (2, "Unified", "1280K", "0-1")];
+        let p1: &[Cache] = &[(1, "Data", "48K", "2-3"), (2, "Unified", "1280K", "2-3")];
+        let spec: Vec<Cpu> = vec![
             ("0-1", p0),
             ("0-1", p0),
             ("2-3", p1),
