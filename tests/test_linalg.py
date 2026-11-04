@@ -29,6 +29,7 @@ from indrajala_math_rust import (
     layer_sgd_step,
     matmul_threads_for,
     outer,
+    set_kernel_overrides,
     set_matmul_threading,
     sum_axis0,
 )
@@ -537,6 +538,12 @@ def reset_matmul_threading():
     set_matmul_threading(0, 0)
 
 
+@pytest.fixture
+def reset_kernel_overrides():
+    yield
+    set_kernel_overrides(0, 0)
+
+
 def _under_each_thread_count(compute):
     # compute() unthreaded, then with every thread count at threshold 1 so even small products
     # split; returns the unthreaded result and each threaded one
@@ -605,6 +612,17 @@ def test_thread_count_cannot_change_accumulate_gradient_batch_bits(reset_matmul_
     )
     for threads, result in threaded.items():
         assert result == unthreaded, threads
+
+
+@pytest.mark.parametrize("m, k, n", [(5, 65, 21), (9, 300, 37), (4, 1025, 18), (7, 64, 16)])
+@pytest.mark.parametrize("k_block", [1, 16, 65, 4096])
+def test_the_slab_size_cannot_change_a_products_bits(reset_kernel_overrides, m, k, n, k_block):
+    delta, X, grad_w, grad_b = _accumulate_case(m, k, n)
+    product = (delta.T @ X).tolist()
+    accumulated = layer_accumulate_gradient_batch(delta, X, grad_w, grad_b)[0].tolist()
+    set_kernel_overrides(0, k_block)
+    assert (delta.T @ X).tolist() == product
+    assert layer_accumulate_gradient_batch(delta, X, grad_w, grad_b)[0].tolist() == accumulated
 
 
 def test_accumulate_gradient_batch_rejects_a_mismatched_grad_w():

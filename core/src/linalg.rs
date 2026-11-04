@@ -230,9 +230,12 @@ unsafe fn dot_product_avx2_fma(a: &[f64], b: &[f64]) -> f64 {
     dot_product_tail(a, b, i, combine_lanes(lanes))
 }
 
-/// `tiled_row_range` below in blocks of rows sized so one block of `a` is about 16 KB (1-row
-/// blocks were 2-3x slower where `K` is in the hundreds, e.g. `(32, 512) @ (512, 5408)`), with
-/// threaded row-splitting on top. Splits the output's row range across
+/// `tiled_row_range` below, with threaded row-splitting on top. Up to `LONG_K_BLOCK` rows of `b`, in
+/// blocks of rows sized so one block of `a` is about 16 KB. Past that, in slabs of `k`
+/// (`slabbed_panel`), each serving all of a chunk's rows from cache: with row blocks a 16 KB block
+/// was 4 rows at `K` = 512, each block reading `b` again ((32, 512) @ (512, 5408): `b` 22 MB read 8
+/// times, 15 ms against 5), and 1 row past `K` = 1,024, so the 2-row tile never ran on a token-wise
+/// gradient (`(d, N*T) @ (N*T, d)`; a sequence epoch 12% slower). Splits the output's row range across
 /// `std::thread::scope` workers - safe without `'static` data (each worker borrows `a_data`/
 /// `b_data` read-only and writes into its own disjoint slice of `out`, via `split_at_mut`) - only
 /// once there's enough total work to pay for it (`matmul_thread_count`). Splitting by
@@ -249,9 +252,26 @@ unsafe fn dot_product_avx2_fma(a: &[f64], b: &[f64]) -> f64 {
 /// question.
 ///
 /// `MODE` as in `tiled_row_range`: `OVERWRITE`, or `ADD`, where `out` holds `c` on entry and `c + a
-/// @ b` on return.
+/// @ b` on return. `OVERWRITE` is given zeros in `out`: a slab's chain starts from what's stored.
 fn matmul_2d<const MODE: u8>(a_data: &[f64], b_data: &[f64], out: &mut [f64], r1: usize, c1: usize, c2: usize) {
     let _census = crate::census::enter("matmul_2d", r1, c1, c2);
+    let k_block = overridden_or(&LONG_K_BLOCK_OVERRIDE, LONG_K_BLOCK);
+    if c1 > k_block {
+        for_each_row_range(out, r1, c2, r1 * c1 * c2, |chunk, row_start, row_end| {
+            let panel = Panel::whole(row_start, row_end, c1, c2, row_end - row_start);
+            if MODE == ADD {
+                // each chain is the product's alone, and joins `c` once finished: one rounding
+                let mut product = vec![0.0; chunk.len()];
+                slabbed_panel(a_data, b_data, &mut product, panel, k_block);
+                for (value, finished) in chunk.iter_mut().zip(&product) {
+                    *value += *finished;
+                }
+            } else {
+                slabbed_panel(a_data, b_data, chunk, panel, k_block);
+            }
+        });
+        return;
+    }
     const A_BLOCK_BYTES: usize = 16 * 1024;
     let rows_per_block = (A_BLOCK_BYTES / (c1 * std::mem::size_of::<f64>()).max(1)).max(1);
     for_each_row_range(out, r1, c2, r1 * c1 * c2, |chunk, row_start, row_end| {
@@ -691,7 +711,28 @@ unsafe fn dot_product_tile_neon<const RA: usize, const RB: usize>(
 /// downstream (`(N*P, 8) @ (8, 72)`) 10-15% faster single-example and at 26x26x8 stride 2.
 const NARROW_ROWS_PER_BLOCK: usize = 4;
 
-/// Rows of `b` per slab in `matmul_long_k`. In an MNIST conv-conv mini-batch 32 epoch the
+/// `panel`'s outputs of `a @ b` into `out`, which holds zeros, running over `k` in slabs of `k_block`
+/// rows of `b`. Each output's chain resumes from its stored partial (a stored double is exact, so
+/// its value is unchanged), and a slab serves every row and column tile from cache before the next.
+fn slabbed_panel(a_data: &[f64], b_data: &[f64], out: &mut [f64], panel: Panel, k_block: usize) {
+    let mut k_start = 0;
+    while k_start < panel.k {
+        let k_end = k_start.saturating_add(k_block).min(panel.k);
+        tiled_row_range::<RESUME>(
+            a_data,
+            b_data,
+            out,
+            Panel {
+                k_start,
+                k_end,
+                ..panel
+            },
+        );
+        k_start = k_end;
+    }
+}
+
+/// Rows of `b` per slab in `matmul_2d` and `matmul_long_k`. In an MNIST conv-conv mini-batch 32 epoch the
 /// second-conv accumulate (`(8, 18432) @ (18432, 72)`, `b` 10.6 MB, past the 4 MB L3) went 5.4-5.9
 /// → 2.6 ms a call (64-1024 all within 5%, 4096 3.2 ms), conv-pool-conv's (`b` 2.2 MB) 750 → 580-630
 /// µs, and the single-example first conv 29 → 23 µs; small single-example shapes pay 0.1-0.5 µs.
@@ -700,9 +741,10 @@ const LONG_K_BLOCK: usize = 64;
 static NARROW_ROWS_PER_BLOCK_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 static LONG_K_BLOCK_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 
-/// Benchmark hook: the conv downstream's rows per block and `matmul_long_k`'s slab rows (0 = the
-/// default, `NARROW_ROWS_PER_BLOCK` and `LONG_K_BLOCK`), process-wide until reset with `(0, 0)`. A
-/// slab of `K` rows or more runs `matmul_long_k` unblocked. Kept as instrumentation, so a later
+/// Benchmark hook: the conv downstream's rows per block and the slab rows of `matmul_2d` and
+/// `matmul_long_k` (0 = the default, `NARROW_ROWS_PER_BLOCK` and `LONG_K_BLOCK`), process-wide until
+/// reset with `(0, 0)`. A slab of `K` rows or more runs `matmul_long_k` unblocked, and `matmul_2d` by
+/// its row blocks. Kept as instrumentation, so a later
 /// change can re-measure these choices in one build; like `set_matmul_threading`, it can't change
 /// any output's value, which the tests check.
 pub fn set_kernel_overrides(narrow_rows_per_block: usize, long_k_block: usize) {
@@ -724,11 +766,8 @@ pub fn narrow_rows_per_block() -> usize {
 }
 
 /// `a @ b` for `a` (`M, K`) with few rows and a long `K`, and a narrow `b` (`K, N`): the conv
-/// accumulate, `(O, N*P) @ (N*P, C*k*k)`, the same bits as `matmul`. Each output chain runs over
-/// `K` in slabs of `LONG_K_BLOCK` rows of `b`, resuming from its stored partial (a stored double
-/// is exact, so the chain's value is unchanged), so a slab serves every row and column tile from
-/// cache before the next; one pass over all of `K` per tile read `b` from memory 4 times over
-/// where it passed the L3. Threaded over 16-wide column chunks of `b`, not rows: each thread
+/// accumulate, `(O, N*P) @ (N*P, C*k*k)`, the same bits as `matmul`, in `slabbed_panel`'s slabs; one
+/// pass over all of `K` per tile read `b` from memory 4 times over where it passed the L3. Threaded over 16-wide column chunks of `b`, not rows: each thread
 /// computes every row for its columns into its own buffer, so `b` is still read about once (row
 /// threading made every thread read all of it, and gained nothing from the slabs).
 pub fn matmul_long_k(a: &Array, b: &Array) -> Result<Array, Error> {
@@ -744,24 +783,13 @@ pub fn matmul_long_k(a: &Array, b: &Array) -> Result<Array, Error> {
     let columns = |(col_start, col_end): (usize, usize)| -> Vec<f64> {
         let width = col_end - col_start;
         let mut part = vec![0.0; m * width];
-        let mut k_start = 0;
-        while k_start < k {
-            let k_end = k_start.saturating_add(k_block).min(k);
-            let panel = Panel {
-                row_start: 0,
-                row_end: m,
-                rows_per_block: m,
-                col_start,
-                col_end,
-                k_start,
-                k_end,
-                k,
-                n,
-                out_stride: width,
-            };
-            tiled_row_range::<RESUME>(&a.data, &b.data, &mut part, panel);
-            k_start = k_end;
-        }
+        let panel = Panel {
+            col_start,
+            col_end,
+            out_stride: width,
+            ..Panel::whole(0, m, k, n, m)
+        };
+        slabbed_panel(&a.data, &b.data, &mut part, panel, k_block);
         part
     };
     let parts: Vec<Vec<f64>> = if column_ranges.len() == 1 {
