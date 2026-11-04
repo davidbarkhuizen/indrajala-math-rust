@@ -4,3 +4,4 @@
 
 pub mod cpu_info;
 pub mod pool;
+pub mod threads;
