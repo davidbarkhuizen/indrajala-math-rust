@@ -70,6 +70,37 @@ fn exp_into_and_in_place_give_exps_bits() {
 }
 
 #[test]
+fn the_sigmoid_activation_is_the_dense_layers_sigmoid_by_bits() {
+    use indrajala_math::num::activation::Activation;
+    // 37 values, past the vector lanes' tails, from saturation to saturation
+    let z: Vec<f64> = (0..37).map(|i| f64::from(i) * 0.9 - 16.0).collect();
+    let mut expected = z.clone();
+    indrajala_math::num::exp::sigmoid_in_place(&mut expected);
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&Activation::Sigmoid.apply(&z)), bits(&expected));
+    // its derivative, from z, is ops::mask::sigmoid's from a
+    let d: Vec<f64> = (0..37).map(|i| f64::from(i) * 0.31 - 5.0).collect();
+    let mask =
+        indrajala_math::ops::mask::sigmoid(&Array::from_vector(d.clone()), &Array::from_vector(expected.clone()))
+            .unwrap();
+    assert_eq!(bits(&Activation::Sigmoid.mask(&d, &z)), bits(mask.data()));
+    // apply_in_place is apply, for every activation
+    for activation in [
+        Activation::Relu,
+        Activation::Gelu,
+        Activation::GeluTanh,
+        Activation::Silu,
+        Activation::Sigmoid,
+    ] {
+        let mut in_place = z.clone();
+        activation.apply_in_place(&mut in_place);
+        assert_eq!(bits(&in_place), bits(&activation.apply(&z)));
+    }
+    // the hidden layers' ops don't take it by name
+    assert!(Activation::from_name("sigmoid").is_err());
+}
+
+#[test]
 fn small_products_and_a_transpose_run_their_scalar_paths() {
     let a = Array::from_matrix((0..12).map(f64::from).collect(), 3, 4);
     let b = Array::from_matrix((0..20).map(f64::from).collect(), 4, 5);

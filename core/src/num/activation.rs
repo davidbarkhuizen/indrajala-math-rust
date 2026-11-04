@@ -28,6 +28,10 @@
 //! ReLU's derivative reads the layer's output (`a > 0`), the others' their input `z`: what the
 //! forward keeps is [`Activation::keeps_preactivation`]'s answer, and a hidden delta's `cached`
 //! operand is `a` for ReLU and `z` for the rest.
+//!
+//! The sigmoid is batch norm's (ReLU or sigmoid, [`crate::nn::norm::batch_norm`]), so the family
+//! has one enum. [`Activation::from_name`] doesn't name it: the hidden layers' activation ops take
+//! the FFN family only, and a dense layer's sigmoid is the plain [`crate::nn::dense`] ops'.
 
 use crate::num::erf::erf;
 use crate::num::exp::tanh_in_place;
@@ -55,6 +59,9 @@ pub enum Activation {
     GeluTanh,
     /// `z * sigmoid(z)` (SiLU, or Swish with beta 1): SwiGLU's gate.
     Silu,
+    /// `1 / (1 + exp(-z))`, the dense layers' sigmoid: batch norm's other activation. Its
+    /// derivative `s * (1 - s)` is taken from `z` (the sigmoid recomputed), as the others' are.
+    Sigmoid,
 }
 
 impl Activation {
@@ -90,10 +97,24 @@ impl Activation {
                 let s = sigmoid_of(z);
                 z.iter().zip(s.iter()).map(|(&v, &sv)| v * sv).collect()
             }
+            Self::Sigmoid => sigmoid_of(z),
         }
     }
 
-    /// `downstream` times the derivative, read from `cached` (`a` for ReLU, `z` for the GELUs).
+    /// [`Activation::apply`] in place, the bits the same: ReLU and the sigmoid without a copy
+    /// (batch norm's), the others through `apply`.
+    pub fn apply_in_place(self, values: &mut [f64]) {
+        match self {
+            Self::Relu => values.iter_mut().for_each(|v| *v = relu(*v)),
+            Self::Sigmoid => sigmoid_in_place(values),
+            Self::Gelu | Self::GeluTanh | Self::Silu => {
+                let out = self.apply(values);
+                values.copy_from_slice(&out);
+            }
+        }
+    }
+
+    /// `downstream` times the derivative, read from `cached` (`a` for ReLU, `z` for the rest).
     /// ReLU's is `d if a > 0 else 0`, the fused ops' mask as it always was. The two slices have
     /// the same length (the callers check the shapes).
     pub fn mask(self, downstream: &[f64], cached: &[f64]) -> Vec<f64> {
@@ -122,6 +143,14 @@ impl Activation {
                     .iter()
                     .zip(cached.iter().zip(s.iter()))
                     .map(|(&d, (&z, &sv))| d * (sv * (1.0 + z * (1.0 - sv))))
+                    .collect()
+            }
+            Self::Sigmoid => {
+                let s = sigmoid_of(cached);
+                downstream
+                    .iter()
+                    .zip(s.iter())
+                    .map(|(&d, &sv)| d * sv * (1.0 - sv))
                     .collect()
             }
         }

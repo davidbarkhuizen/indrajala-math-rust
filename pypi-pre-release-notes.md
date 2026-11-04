@@ -179,6 +179,11 @@ result's bits (D5).
   | `program::window_program_learn` | `program::learn` |
   | `batch_norm::linear_forward`, `linear_forward_batch`, `linear_accumulate_gradient_batch` | `nn::dense::` (same names) |
 
+- **`num::activation::Activation` gains `Sigmoid`**, batch norm's activation, so the crate has
+  one activation enum (it replaces batch norm's private one). A `match` on `Activation` needs the
+  new arm. `from_name` doesn't name it: the hidden layers' activation ops take the FFN family only.
+  It also gains `apply_in_place`, with the same bits as `apply`.
+
 ## Release process
 
 - Releases to crates.io now use trusted publishing, with no stored token (#84). The API is

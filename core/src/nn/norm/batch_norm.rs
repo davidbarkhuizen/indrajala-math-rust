@@ -18,34 +18,17 @@
 //! `sum_axis0` is for a dense batch. So given the same inputs they compute numpy's bits.
 
 use crate::array::{Array, Shape};
-use crate::num::exp::sigmoid_in_place;
-use crate::num::scalar::relu;
+use crate::num::activation::Activation;
 use crate::Error;
 
-/// A batch-norm layer's activation, fused into it as into a dense layer.
-#[derive(Clone, Copy)]
-enum Activation {
-    Sigmoid,
-    Relu,
-}
-
-impl Activation {
-    fn parse(name: &str, context: &str) -> Result<Self, Error> {
-        match name {
-            "sigmoid" => Ok(Activation::Sigmoid),
-            "relu" => Ok(Activation::Relu),
-            _ => Err(Error::invalid(format!(
-                "{context} requires activation 'sigmoid' or 'relu', got {name:?}"
-            ))),
-        }
-    }
-
-    /// `dense`'s sigmoid and ReLU, in place.
-    fn apply(self, values: &mut [f64]) {
-        match self {
-            Activation::Sigmoid => sigmoid_in_place(values),
-            Activation::Relu => values.iter_mut().for_each(|v| *v = relu(*v)),
-        }
+/// A batch-norm layer's activation, fused into it as into a dense layer: ReLU or the sigmoid.
+fn activation_named(name: &str, context: &str) -> Result<Activation, Error> {
+    match name {
+        "sigmoid" => Ok(Activation::Sigmoid),
+        "relu" => Ok(Activation::Relu),
+        _ => Err(Error::invalid(format!(
+            "{context} requires activation 'sigmoid' or 'relu', got {name:?}"
+        ))),
     }
 }
 
@@ -171,7 +154,7 @@ pub fn forward(
     positions: usize,
 ) -> Result<Array, Error> {
     let context = "batch_norm_forward";
-    let activation = Activation::parse(activation, context)?;
+    let activation = activation_named(activation, context)?;
     require_positions(positions, context)?;
     let channels = gamma.data.len();
     let width = match x.shape {
@@ -198,7 +181,7 @@ pub fn forward(
         let xhat = (v - running_mean.data[j]) / std[j];
         gamma.data[j] * xhat + beta.data[j]
     });
-    activation.apply(&mut data);
+    activation.apply_in_place(&mut data);
     Ok(Array { data, shape: x.shape })
 }
 
@@ -228,7 +211,7 @@ pub fn forward_batch(
     group_size: Option<usize>,
 ) -> Result<(Array, Array, Array, Array, Array, Array, Array), Error> {
     let context = "batch_norm_forward_batch";
-    let activation = Activation::parse(activation, context)?;
+    let activation = activation_named(activation, context)?;
     require_positions(positions, context)?;
     let channels = gamma.data.len();
     let rows = batch_rows(x, channels, positions, context)?;
@@ -268,7 +251,7 @@ pub fn forward_batch(
         let group_std: Vec<f64> = group_var.iter().map(|&v| (v + epsilon).sqrt()).collect();
         let group_xhat = map_channels(&group_d, c, p, |v, j| v / group_std[j]);
         let mut group_a = map_channels(&group_xhat, c, p, |v, j| gamma.data[j] * v + beta.data[j]);
-        activation.apply(&mut group_a);
+        activation.apply_in_place(&mut group_a);
         a.extend(group_a);
 
         for j in 0..c {
