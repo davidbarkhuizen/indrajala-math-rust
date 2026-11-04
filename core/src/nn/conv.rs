@@ -21,6 +21,7 @@
 use crate::array::{Array, Shape};
 use crate::linalg::{matmul_long_k, matmul_thread_count, narrow_rows_per_block, tiled_row_range, Panel, OVERWRITE};
 use crate::num::scalar::relu;
+use crate::sys::pool::for_each_part;
 use crate::Error;
 
 /// The shape arithmetic for one conv or pool layer, built once by the Python layer and passed to
@@ -300,11 +301,10 @@ pub fn downstream_batch(w: &Array, delta_batch: &Array, geometry: &Geometry) -> 
     if examples_per_thread >= n {
         downstream(0, &mut dx);
     } else {
-        let downstream = &downstream;
-        std::thread::scope(|scope| {
-            for (chunk, out) in dx.chunks_mut(examples_per_thread * g.input_size).enumerate() {
-                scope.spawn(move || downstream(chunk * examples_per_thread, out));
-            }
+        let parts: Vec<&mut [f64]> = dx.chunks_mut(examples_per_thread * g.input_size).collect();
+        let threads = parts.len();
+        for_each_part(threads, parts, |chunk, out| {
+            downstream(chunk * examples_per_thread, out)
         });
     }
     Ok(batch_output(dx, n, g.input_size, is_vector))
