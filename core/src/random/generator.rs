@@ -214,16 +214,15 @@ impl Generator {
     /// Each entry is [`bernoulli_values`](crate::random::legacy::bernoulli_values)'s `next_double() >= drop_probability`, compared on the
     /// draw's 53 bits: `n / 2^53 >= p` is exactly `n >= ceil(p * 2^53)`, and the conversion and float
     /// compare were a large part of an attention layer's own time (the crate performance workplan,
-    /// stage 7).
+    /// stage 7). The entry is built from the compare's bits: an `if` compiled to a branch on a
+    /// nearly random bit, and cost attention 3-10% more than the float compare (run `k29-mask`).
     pub fn draw_bernoulli_mask(&mut self, drop_probability: f64, size: usize) -> Vec<f64> {
         let threshold = bits_threshold(drop_probability);
+        let one = 1.0_f64.to_bits();
         (0..size)
             .map(|_| {
-                if self.pcg.next_u64() >> 11 >= threshold {
-                    1.0
-                } else {
-                    0.0
-                }
+                let kept = u64::from(self.pcg.next_u64() >> 11 >= threshold);
+                f64::from_bits(kept.wrapping_neg() & one)
             })
             .collect()
     }
