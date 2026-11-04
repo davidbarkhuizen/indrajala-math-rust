@@ -36,7 +36,7 @@ from indrajala_math_rust import (
     set_matmul_threading,
     set_threads,
     sum_axis0,
-    threads,
+    threads as thread_budget,
 )
 
 
@@ -723,25 +723,25 @@ def test_policy_threads_the_batch_512_products_all_or_nothing(reset_matmul_threa
         shape: matmul_threads_for(*shape) for shape in (DENSE_BATCH_512, CONV_ACCUMULATE_512, CONV_TAIL_BATCH_512)
     }
     assert len(set(counts.values())) == 1, counts
-    assert counts[CONV_TAIL_BATCH_512] == threads()
+    assert counts[CONV_TAIL_BATCH_512] == thread_budget()
 
 
 def test_the_budget_is_at_most_8_and_the_process_s_cpus_by_default():
     # the CPUs this process may run on (sched_getaffinity, Linux only), else every CPU
     cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
-    assert 1 <= threads() <= min(cpus, 8)
+    assert 1 <= thread_budget() <= min(cpus, 8)
 
 
 def test_set_threads_is_the_ceiling_until_it_is_reset(reset_threads):
-    default = threads()
+    default = thread_budget()
     set_threads(3)
-    assert threads() == 3
+    assert thread_budget() == 3
     assert matmul_threads_for(*CONV_TAIL_BATCH_512) == 3
     assert matmul_threads_for(*CONV_TAIL_BATCH_32) == 1  # under the threshold, whatever the budget
     set_threads(1)
     assert matmul_threads_for(*CONV_TAIL_BATCH_512) == 1
     set_threads(0)
-    assert threads() == default
+    assert thread_budget() == default
 
 
 def test_the_test_hook_overrides_the_budget(reset_threads, reset_matmul_threading):
