@@ -107,8 +107,28 @@ const ORDINARY_BELOW: u64 = SUBNORMAL_BELOW & (u64::MAX >> 1);
 #[cfg(target_arch = "x86_64")]
 const ROUND_MAGIC: f64 = 6755399441055744.0;
 
-// `exp_body`'s fast path in AVX2, four lanes at a time; the tables' pairs `[low, high]` gathered by
-// index. Safety: the CPU has AVX2 and FMA; as `exp_lanes`.
+// A table's `[low, high]` pairs at four indices, as `(lows, highs)`: each lane's pair loaded whole,
+// where two gathers would each touch all four rows. Safety: the CPU has AVX2; every index and the
+// one after it are in `table`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn table_pairs(
+    table: *const f64,
+    indices: std::arch::x86_64::__m256i,
+) -> (std::arch::x86_64::__m256d, std::arch::x86_64::__m256d) {
+    use std::arch::x86_64::*;
+
+    let mut at = [0_i64; 4];
+    _mm256_storeu_si256(at.as_mut_ptr().cast(), indices);
+    let pair = |lane: usize| _mm_loadu_pd(table.add(at[lane] as usize));
+    let front = _mm256_insertf128_pd::<1>(_mm256_castpd128_pd256(pair(0)), pair(2));
+    let back = _mm256_insertf128_pd::<1>(_mm256_castpd128_pd256(pair(1)), pair(3));
+    (_mm256_unpacklo_pd(front, back), _mm256_unpackhi_pd(front, back))
+}
+
+// `exp_body`'s fast path in AVX2, four lanes at a time, the tables' pairs from `table_pairs`.
+// Safety: the CPU has AVX2 and FMA; as `exp_lanes`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn exp_lanes_avx2(src: *const f64, dst: *mut f64, len: usize) -> usize {
@@ -136,15 +156,8 @@ unsafe fn exp_lanes_avx2(src: *const f64, dst: *mut f64, len: usize) -> usize {
         );
         let i1 = _mm256_slli_epi64::<1>(_mm256_and_si256(jt, epi(0x3f)));
         let i0 = _mm256_slli_epi64::<1>(_mm256_and_si256(_mm256_srli_epi64::<6>(jt), epi(0x3f)));
-        let one = epi(1);
-        let (xl, xh) = (
-            _mm256_i64gather_pd::<8>(t0, i0),
-            _mm256_i64gather_pd::<8>(t0, _mm256_add_epi64(i0, one)),
-        );
-        let (cl, ch) = (
-            _mm256_i64gather_pd::<8>(t1, i1),
-            _mm256_i64gather_pd::<8>(t1, _mm256_add_epi64(i1, one)),
-        );
+        let (xl, xh) = table_pairs(t0, i0);
+        let (cl, ch) = table_pairs(t1, i1);
         let th = _mm256_mul_pd(ch, xh);
         let tl = _mm256_add_pd(
             _mm256_add_pd(_mm256_mul_pd(ch, xl), _mm256_mul_pd(cl, xh)),
