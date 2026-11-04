@@ -35,8 +35,18 @@ pub(super) fn linear_preactivation(w: &Array, x: &Array, b: &Array) -> Result<Ar
 /// x 5408, batch 1). Each row of `X @ W.T` is the same `dot_product` calls as `W @ x`, so row `i`
 /// here is bit-identical to `linear_preactivation(w, X[i], b)`.
 pub(super) fn linear_preactivation_batch(w: &Array, x: &Array, b: &Array) -> Result<Array, Error> {
-    let z = matmul_nt(x, w)?;
-    z.combine_with_array(b, |a, bv| a + bv, "add")
+    let mut z = matmul_nt(x, w)?;
+    match (z.shape, b.shape) {
+        (Shape::Matrix(_, cols), Shape::Vector(n)) if cols == n => {
+            for row in z.data.chunks_exact_mut(cols.max(1)) {
+                for (value, &bv) in row.iter_mut().zip(&b.data) {
+                    *value += bv;
+                }
+            }
+            Ok(z)
+        }
+        _ => z.combine_with_array(b, |a, bv| a + bv, "add"),
+    }
 }
 
 /// `ArrayLayer.forward`: `sigmoid(self.W @ x + self.b)`, `x`/`b` both 1D.

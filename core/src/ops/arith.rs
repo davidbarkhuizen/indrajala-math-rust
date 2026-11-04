@@ -24,10 +24,8 @@ pub(crate) fn broadcast_row(
     op: impl Fn(f64, f64) -> f64,
 ) -> Vec<f64> {
     let mut out = Vec::with_capacity(rows * cols);
-    for row in 0..rows {
-        for col in 0..cols {
-            out.push(op(matrix[row * cols + col], vector[col]));
-        }
+    for row in matrix.chunks_exact(cols.max(1)) {
+        out.extend(row.iter().zip(vector).map(|(&m, &v)| op(m, v)));
     }
     out
 }

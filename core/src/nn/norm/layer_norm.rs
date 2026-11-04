@@ -42,6 +42,55 @@ fn require_shape(array: &Array, shape: Shape, name: &str, context: &str) -> Resu
     Ok(())
 }
 
+/// `normalize`'s rows. Only the two folds are chains; the rest is one correctly rounded operation per
+/// value, the same bits in any lane width, with `xhat`'s row holding the centred values until `s` is known.
+#[inline(always)]
+fn normalize_rows(
+    x: &[f64],
+    gamma: &[f64],
+    beta: &[f64],
+    epsilon: f64,
+    a: &mut [f64],
+    xhat: &mut [f64],
+    std: &mut [f64],
+) {
+    let d = gamma.len();
+    let rows = x
+        .chunks_exact(d)
+        .zip(a.chunks_exact_mut(d))
+        .zip(xhat.chunks_exact_mut(d));
+    for (((row, a_row), xhat_row), std_value) in rows.zip(std) {
+        let mu = fold(row.iter().copied()) / d as f64;
+        for (c, &v) in xhat_row.iter_mut().zip(row) {
+            *c = v - mu;
+        }
+        let var = fold(xhat_row.iter().map(|&v| v * v)) / d as f64;
+        let s = (var + epsilon).sqrt();
+        for xh in xhat_row.iter_mut() {
+            *xh /= s;
+        }
+        for ((a_value, &xh), (&g, &b)) in a_row.iter_mut().zip(&*xhat_row).zip(gamma.iter().zip(beta)) {
+            *a_value = g * xh + b;
+        }
+        *std_value = s;
+    }
+}
+
+/// `normalize_rows` with four lanes. AVX2 alone: no FMA, whose fused `g * xh + b` would round once.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn normalize_rows_avx2(
+    x: &[f64],
+    gamma: &[f64],
+    beta: &[f64],
+    epsilon: f64,
+    a: &mut [f64],
+    xhat: &mut [f64],
+    std: &mut [f64],
+) {
+    normalize_rows(x, gamma, beta, epsilon, a, xhat, std);
+}
+
 /// The forward pass over `x`'s rows: `(a, xhat, std)`, `a` and `xhat` in `x`'s shape and `std`
 /// one value per row.
 fn normalize(
@@ -54,21 +103,17 @@ fn normalize(
     let d = gamma.data.len();
     let rows = feature_rows(x, d, "x", context)?;
     require_shape(beta, Shape::Vector(d), "beta", context)?;
-    let mut a = Vec::with_capacity(x.data.len());
-    let mut xhat = Vec::with_capacity(x.data.len());
-    let mut std = Vec::with_capacity(rows);
-    for row in x.data.chunks_exact(d) {
-        let mu = fold(row.iter().copied()) / d as f64;
-        let c: Vec<f64> = row.iter().map(|&v| v - mu).collect();
-        let var = fold(c.iter().map(|&v| v * v)) / d as f64;
-        let s = (var + epsilon).sqrt();
-        for (j, &cj) in c.iter().enumerate() {
-            let xh = cj / s;
-            xhat.push(xh);
-            a.push(gamma.data[j] * xh + beta.data[j]);
-        }
-        std.push(s);
+    let mut a = vec![0.0; x.data.len()];
+    let mut xhat = vec![0.0; x.data.len()];
+    let mut std = vec![0.0; rows];
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        unsafe { normalize_rows_avx2(&x.data, &gamma.data, &beta.data, epsilon, &mut a, &mut xhat, &mut std) };
+    } else {
+        normalize_rows(&x.data, &gamma.data, &beta.data, epsilon, &mut a, &mut xhat, &mut std);
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    normalize_rows(&x.data, &gamma.data, &beta.data, epsilon, &mut a, &mut xhat, &mut std);
     Ok((
         Array {
             data: a,
