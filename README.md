@@ -76,7 +76,7 @@ or `OverflowError`; `src/num.rs` reads an activation by its Python name. The Pyt
 | `indrajala_math_rust.pyi` | type stub for the whole Python API (packaged with `py.typed`) |
 | `src/array.rs` | `RustArray`: construction, `zeros`, `shape`, `.T`, indexing and contiguous slicing, `reshape`, `copy`, `tolist` |
 | `src/ops/arith.rs` | elementwise `+ - * /` and in-place `+= -=` |
-| `src/linalg.rs` | `@` (matmul), `outer`; `set_matmul_threading(max_threads, threshold_flops)`, a test/benchmark override of the matmul threading (0 = default); `matmul_threads_for(m, k, n)`, the thread count the policy picks for an `(m, k) @ (k, n)` product |
+| `src/linalg.rs` | `@` (matmul), `outer`; `set_threads(n)` and `threads()`, the process's thread budget (`INDRAJALA_THREADS`, default its physical cores, at most 8); `set_matmul_threading(max_threads, threshold_flops)`, a test/benchmark override of the matmul threading (0 = default); `matmul_threads_for(m, k, n)`, the thread count the policy picks for an `(m, k) @ (k, n)` product |
 | `src/ops/unary.rs` | `exp`, `erf`, `sum_axis0`, `argmax`, `array_relu`, `array_softmax` |
 | `src/ops/mask.rs` | `array_activation_mask`, `array_sigmoid_mask`, `array_dropout_mask` (a hidden delta from a downstream the layer is handed, before a layer with no `W`) |
 | `src/random/legacy.rs` | `seed`, `random`, `uniform`, `bernoulli_mask`: numpy's legacy `np.random` (MT19937) in a separate state; after `seed(s)`, bit-identical to numpy's draws after `np.random.seed(s)` |
