@@ -622,7 +622,9 @@ def reset_nt_slab():
 
 
 # rows and columns past the register tiles, and `k` past a multiple of 4
-@pytest.mark.parametrize("m, k, n", [(1, 37, 1), (3, 37, 3), (4, 40, 2), (5, 41, 3), (9, 99, 8), (6, 1302, 5), (64, 900, 31)])
+@pytest.mark.parametrize(
+    "m, k, n", [(1, 37, 1), (3, 37, 3), (4, 40, 2), (5, 41, 3), (9, 99, 8), (6, 1302, 5), (64, 900, 31)]
+)
 @pytest.mark.parametrize("slab", [4, 8, 36, 64, 1024])
 def test_the_slab_cannot_change_matmul_nt_bits(reset_nt_slab, reset_matmul_threading, m, k, n, slab):
     rng = np.random.default_rng(m * 10000 + k * 10 + n)

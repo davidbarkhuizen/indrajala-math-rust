@@ -32,7 +32,13 @@ impl CpuInfo {
         static INFO: OnceLock<CpuInfo> = OnceLock::new();
         INFO.get_or_init(|| {
             let logical = std::thread::available_parallelism().map_or(1, |n| n.get());
-            CpuInfo::read(Path::new("/sys/devices/system/cpu"), logical)
+            // miri's isolation has no file system; it needs only figures that hold, and these do
+            let root = if cfg!(miri) {
+                Path::new("")
+            } else {
+                Path::new("/sys/devices/system/cpu")
+            };
+            CpuInfo::read(root, logical)
         })
     }
 
@@ -95,6 +101,9 @@ fn text(path: &Path) -> Option<String> {
 }
 
 fn sub_directories(dir: &Path) -> Vec<std::path::PathBuf> {
+    if dir.as_os_str().is_empty() || cfg!(miri) {
+        return Vec::new();
+    }
     fs::read_dir(dir)
         .map(|entries| entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect())
         .unwrap_or_default()
