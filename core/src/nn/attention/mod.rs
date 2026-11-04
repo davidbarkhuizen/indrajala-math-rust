@@ -474,6 +474,7 @@ fn tiled_forward<'s>(
 ) -> Result<(Array, Array, Array), Error> {
     let [q, k, v] = qkv;
     let (heads, d_k, width) = (options.heads, options.key_size, options.width());
+    let _census = crate::census::enter("attend_forward", extent.examples * extent.queries, heads, d_k);
     let rows = extent.examples * extent.queries;
     let mut m = vec![f64::NEG_INFINITY; rows * heads];
     let mut l = vec![0.0; rows * heads];
@@ -561,6 +562,7 @@ fn tiled_backward<'s>(
 ) -> Result<(Array, Array, Array), Error> {
     let [q, k, v, h, m, l] = saved;
     let (heads, d_k, width, s) = (options.heads, options.key_size, options.width(), options.scale());
+    let _census = crate::census::enter("attend_backward", extent.examples * extent.queries, heads, d_k);
     let kv_width = options.kv_width();
     let rows = extent.examples * extent.queries;
     let row_terms: Vec<f64> = dh

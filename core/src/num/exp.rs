@@ -60,6 +60,7 @@ unsafe fn exp_fma(x: f64) -> f64 {
 /// the fast path's ordinary range (`|x| <= 2^-54`, a subnormal or infinite result, NaN), is redone
 /// by `exp` itself. Returns how many values were redone.
 pub fn exp_into(values: &[f64], out: &mut [f64]) -> usize {
+    let _census = crate::census::enter("exp", values.len(), 0, 0);
     assert_eq!(values.len(), out.len(), "exp_into: values and out differ in length");
     // SAFETY: both hold values.len() values, and a borrow and a mutable borrow can't overlap.
     unsafe { exp_lanes(values.as_ptr(), out.as_mut_ptr(), values.len()) }
@@ -68,6 +69,7 @@ pub fn exp_into(values: &[f64], out: &mut [f64]) -> usize {
 /// [`exp_into`] with `values` as its own `out`: each vector is loaded before its results are
 /// stored, and a redone lane reads its input from the loaded vector.
 pub fn exp_in_place(values: &mut [f64]) -> usize {
+    let _census = crate::census::enter("exp", values.len(), 0, 0);
     let data = values.as_mut_ptr();
     // SAFETY: `data` holds values.len() values; the kernels read each vector before writing it.
     unsafe { exp_lanes(data, data, values.len()) }

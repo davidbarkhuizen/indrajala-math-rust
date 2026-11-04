@@ -186,6 +186,7 @@ pub fn forward_batch(w: &Array, x: &Array, b: &Array, geometry: &Geometry) -> Re
     let (n, is_vector) = require_batch(x, geometry.input_size, "conv_forward_batch X")?;
     let g = geometry;
     let (p, k, fan_in) = (g.positions, g.kernel_size, g.fan_in);
+    let _census = crate::census::enter("conv_forward", n, p, fan_in);
 
     let w_t = w.transpose(); // (C*k*k, O)
     let mut cols = Vec::with_capacity(n * p * fan_in);
@@ -277,6 +278,7 @@ pub fn downstream_batch(w: &Array, delta_batch: &Array, geometry: &Geometry) -> 
     let (p, fan_in) = (g.positions, g.fan_in);
     let (n, is_vector) = require_batch(delta_batch, o * p, "conv_downstream_batch delta_batch")?;
 
+    let _census = crate::census::enter("conv_downstream", n, p * o, fan_in);
     let mut dx = vec![0.0; n * g.input_size];
     let examples_per_thread = n.div_ceil(matmul_thread_count(n, n * p * o * fan_in));
     let downstream = |first: usize, out: &mut [f64]| {

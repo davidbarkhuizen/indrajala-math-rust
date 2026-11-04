@@ -31,6 +31,11 @@ indrajala-math = { path = "core", version = "0.1.0" }
 # block in array.rs.
 pyo3 = { version = "0.29", features = ["extension-module", "multiple-pymethods"] }
 
+[features]
+# indrajala-math's census: `maturin build --release --features census` (indrajala-ml's
+# scripts/measurement/shape_census.py reads it). Never in a release.
+census = ["indrajala-math/census"]
+
 [lints.clippy]
 # The kernels index several fixed-size accumulators and tiles in lockstep with one loop
 # variable (acc[r][j], b_tile[j]), mirroring the math; iterator chains would obscure it.

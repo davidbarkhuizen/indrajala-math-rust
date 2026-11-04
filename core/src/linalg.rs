@@ -99,6 +99,7 @@ fn dot_product(a: &[f64], b: &[f64]) -> f64 {
 /// 30-row `W`) overlap too. The matrix @ vector case goes through it, and `matmul_nt`'s tiles
 /// keep its grouping, so a batched forward's rows stay bit-identical to the single-example forward.
 fn dot_products_into(rows: &[f64], k: usize, v: &[f64], out: &mut [f64]) {
+    let _census = crate::census::enter("dot_products", out.len(), k, 1);
     #[cfg_attr(
         not(any(target_arch = "x86_64", target_arch = "aarch64")),
         expect(unused_mut, reason = "only the vector blocks move it")
@@ -250,6 +251,7 @@ unsafe fn dot_product_avx2_fma(a: &[f64], b: &[f64]) -> f64 {
 /// `MODE` as in `tiled_row_range`: `OVERWRITE`, or `ADD`, where `out` holds `c` on entry and `c + a
 /// @ b` on return.
 fn matmul_2d<const MODE: u8>(a_data: &[f64], b_data: &[f64], out: &mut [f64], r1: usize, c1: usize, c2: usize) {
+    let _census = crate::census::enter("matmul_2d", r1, c1, c2);
     const A_BLOCK_BYTES: usize = 16 * 1024;
     let rows_per_block = (A_BLOCK_BYTES / (c1 * std::mem::size_of::<f64>()).max(1)).max(1);
     for_each_row_range(out, r1, c2, r1 * c1 * c2, |chunk, row_start, row_end| {
@@ -384,6 +386,7 @@ pub fn matmul_nt(a: &Array, b: &Array) -> Result<Array, Error> {
             a.shape, b.shape
         )));
     }
+    let _census = crate::census::enter("matmul_nt", m, k, n);
     let mut out = vec![0.0; m * n];
     for_each_row_range(&mut out, m, n, m * k * n, |chunk, row_start, row_end| {
         #[cfg(not(target_arch = "aarch64"))]
@@ -730,6 +733,7 @@ pub fn narrow_rows_per_block() -> usize {
 /// threading made every thread read all of it, and gained nothing from the slabs).
 pub fn matmul_long_k(a: &Array, b: &Array) -> Result<Array, Error> {
     let (m, k, n) = product_shape(a, b)?;
+    let _census = crate::census::enter("matmul_long_k", m, k, n);
     let k_block = overridden_or(&LONG_K_BLOCK_OVERRIDE, LONG_K_BLOCK);
     let chunks = n.div_ceil(16).max(1);
     let chunks_per_thread = chunks.div_ceil(matmul_thread_count(chunks, m * k * n));

@@ -94,6 +94,7 @@ impl Array {
                 shape: self.shape,
             },
             Shape::Matrix(rows, cols) => {
+                let _census = crate::census::enter("transpose", rows, cols, 0);
                 // In 8 x 8 blocks, so each block reads 8 source lines and writes 8 whole output
                 // lines. A row-by-row loop writes a line per element at a stride of `rows`; at
                 // 512 rows that stride is 4 KB, every write lands in the same L1 set, and the
