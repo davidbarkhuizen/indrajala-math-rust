@@ -315,6 +315,42 @@ pub fn matmul_add(c: &Array, a: &Array, b: &Array) -> Result<Array, Error> {
     Ok(Array::from_matrix(out, r1, c2))
 }
 
+/// `c + d.T @ b` for `d` (`K, M`), `b` (`K, N`) and `c` (`M, N`): `matmul_add(c, &d.transpose(), b)` bit for
+/// bit, with no transpose. The accumulate of every token-wise and batched layer is this product, and its
+/// transpose was as much as a third of the product's own time; reading `d` directly, each `k`'s
+/// multipliers are also contiguous.
+pub fn matmul_transposed_add(c: &Array, d: &Array, b: &Array) -> Result<Array, Error> {
+    let (Shape::Matrix(k, m), Shape::Matrix(b_k, n)) = (d.shape, b.shape) else {
+        return Err(shape_error(d.shape, b.shape));
+    };
+    if k != b_k {
+        return Err(shape_error(d.shape, b.shape));
+    }
+    if c.shape != Shape::Matrix(m, n) {
+        return Err(Error::InvalidArgument(format!(
+            "cannot add a product of shape {:?} to an array of shape {:?}",
+            Shape::Matrix(m, n),
+            c.shape
+        )));
+    }
+    let _census = crate::census::enter("matmul_transposed_add", m, k, n);
+    let k_block = overridden_or(&LONG_K_BLOCK_OVERRIDE, LONG_K_BLOCK);
+    let mut out = c.data.clone();
+    for_each_row_range(&mut out, m, n, m * k * n, |chunk, row_start, row_end| {
+        let panel = Panel {
+            a_row_step: 1,
+            a_k_step: m,
+            ..Panel::whole(row_start, row_end, k, n, row_end - row_start)
+        };
+        let mut product = vec![0.0; chunk.len()];
+        slabbed_panel(&d.data, &b.data, &mut product, panel, k_block);
+        for (value, finished) in chunk.iter_mut().zip(&product) {
+            *value += *finished;
+        }
+    });
+    Ok(Array::from_matrix(out, m, n))
+}
+
 static MAX_THREADS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 static THRESHOLD_FLOPS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 
@@ -1064,7 +1100,7 @@ fn packed_panel(a_data: &[f64], b_data: &[f64], out: &mut [f64], panel: Panel, k
                     ..panel
                 };
                 tiled_row_range::<RESUME>(
-                    &a_data[k_start..],
+                    &a_data[k_start * panel.a_k_step..],
                     &packed[tile * slab_rows * COLUMNS..],
                     &mut out[(block_start - row_start) * out_stride + col - col_start..],
                     slab,
@@ -1199,6 +1235,10 @@ pub(crate) struct Panel {
     pub k: usize,
     pub n: usize,
     pub out_stride: usize,
+    /// `a[row, kk]` is at `row * a_row_step + kk * a_k_step`: `k` and 1 for a row-major `a`; 1 and `M`
+    /// to read `a` from its row-major transpose. Only `RESUME` calls take other steps.
+    pub a_row_step: usize,
+    pub a_k_step: usize,
 }
 
 impl Panel {
@@ -1216,6 +1256,8 @@ impl Panel {
             k,
             n,
             out_stride: n,
+            a_row_step: k,
+            a_k_step: 1,
         }
     }
 }
@@ -1260,14 +1302,14 @@ pub(crate) fn tiled_row_range<const MODE: u8>(a_data: &[f64], b_data: &[f64], ou
 
 #[cfg_attr(target_arch = "aarch64", expect(dead_code, reason = "NEON replaces it on aarch64"))]
 fn tiled_row_range_scalar<const MODE: u8>(a_data: &[f64], b_data: &[f64], out: &mut [f64], panel: Panel) {
-    let Panel { k, n, .. } = panel;
+    let Panel { n, .. } = panel;
     for row in panel.row_start..panel.row_end {
-        let a_row = &a_data[row * k + panel.k_start..row * k + panel.k_end];
         for col in panel.col_start..panel.col_end {
             let out_value = &mut out[(row - panel.row_start) * panel.out_stride + col - panel.col_start];
             let mut sum = if MODE == RESUME { *out_value } else { 0.0f64 };
-            for (i, &a_value) in a_row.iter().enumerate() {
-                sum = a_value.mul_add(b_data[(panel.k_start + i) * n + col], sum);
+            for kk in panel.k_start..panel.k_end {
+                let a_value = a_data[row * panel.a_row_step + kk * panel.a_k_step];
+                sum = a_value.mul_add(b_data[kk * n + col], sum);
             }
             *out_value = if MODE == ADD { *out_value + sum } else { sum };
         }
@@ -1303,19 +1345,22 @@ unsafe fn tiled_row_range_avx2_fma<const MODE: u8>(a_data: &[f64], b_data: &[f64
         k,
         n,
         out_stride,
+        a_row_step,
+        a_k_step,
     } = panel;
     // only RESUME computes part of a product; the others take the whole panel's columns, `k` and
     // stride as known structure, which kept the whole-product callers 5-7% faster than runtime
     // offsets (single-example conv forward and downstream)
-    let (col_start, col_end, k_start, k_end, out_stride) = if MODE == RESUME {
-        (col_start, col_end, k_start, k_end, out_stride)
+    let (col_start, col_end, k_start, k_end, out_stride, a_row_step, a_k_step) = if MODE == RESUME {
+        (col_start, col_end, k_start, k_end, out_stride, a_row_step, a_k_step)
     } else {
-        (0, n, 0, k, n)
+        (0, n, 0, k, n, k, 1)
     };
     let a_ptr = a_data.as_ptr();
     let b_ptr = b_data.as_ptr();
     let out_ptr = out.as_mut_ptr();
     let out_at = move |row: usize, col: usize| out_ptr.add((row - row_start) * out_stride + col - col_start);
+    let a_at = move |row: usize, kk: usize| *a_ptr.add(row * a_row_step + kk * a_k_step);
     let mut block_start = row_start;
     while block_start < row_end {
         let block_end = (block_start + rows_per_block).min(row_end);
@@ -1338,7 +1383,7 @@ unsafe fn tiled_row_range_avx2_fma<const MODE: u8>(a_data: &[f64], b_data: &[f64
                         _mm256_loadu_pd(b_row.add(12)),
                     ];
                     for r in 0..TILE_ROWS {
-                        let a_vec = _mm256_set1_pd(*a_ptr.add((row + r) * k + kk));
+                        let a_vec = _mm256_set1_pd(a_at(row + r, kk));
                         for j in 0..4 {
                             acc[r][j] = _mm256_fmadd_pd(a_vec, b_tile[j], acc[r][j]);
                         }
@@ -1353,9 +1398,10 @@ unsafe fn tiled_row_range_avx2_fma<const MODE: u8>(a_data: &[f64], b_data: &[f64
             }
             for row in row..block_end {
                 let mut acc = [0, 4, 8, 12].map(|offset| chain_start::<MODE>(out_at(row, col + offset)));
-                for (i, &a_value) in a_data[row * k + k_start..row * k + k_end].iter().enumerate() {
+                for kk in k_start..k_end {
+                    let a_value = a_at(row, kk);
                     let a_vec = _mm256_set1_pd(a_value);
-                    let b_row = b_ptr.add((k_start + i) * n + col);
+                    let b_row = b_ptr.add(kk * n + col);
                     acc[0] = _mm256_fmadd_pd(a_vec, _mm256_loadu_pd(b_row), acc[0]);
                     acc[1] = _mm256_fmadd_pd(a_vec, _mm256_loadu_pd(b_row.add(4)), acc[1]);
                     acc[2] = _mm256_fmadd_pd(a_vec, _mm256_loadu_pd(b_row.add(8)), acc[2]);
@@ -1370,12 +1416,9 @@ unsafe fn tiled_row_range_avx2_fma<const MODE: u8>(a_data: &[f64], b_data: &[f64
         while col + 4 <= col_end {
             for row in block_start..block_end {
                 let mut acc = chain_start::<MODE>(out_at(row, col));
-                for (i, &a_value) in a_data[row * k + k_start..row * k + k_end].iter().enumerate() {
-                    acc = _mm256_fmadd_pd(
-                        _mm256_set1_pd(a_value),
-                        _mm256_loadu_pd(b_ptr.add((k_start + i) * n + col)),
-                        acc,
-                    );
+                for kk in k_start..k_end {
+                    let a_value = a_at(row, kk);
+                    acc = _mm256_fmadd_pd(_mm256_set1_pd(a_value), _mm256_loadu_pd(b_ptr.add(kk * n + col)), acc);
                 }
                 store_lanes::<MODE>(out_at(row, col), acc);
             }
@@ -1385,8 +1428,9 @@ unsafe fn tiled_row_range_avx2_fma<const MODE: u8>(a_data: &[f64], b_data: &[f64
             for row in block_start..block_end {
                 let out_value = out_at(row, col);
                 let mut sum = if MODE == RESUME { *out_value } else { 0.0f64 };
-                for (i, &a_value) in a_data[row * k + k_start..row * k + k_end].iter().enumerate() {
-                    sum = a_value.mul_add(*b_ptr.add((k_start + i) * n + col), sum);
+                for kk in k_start..k_end {
+                    let a_value = a_at(row, kk);
+                    sum = a_value.mul_add(*b_ptr.add(kk * n + col), sum);
                 }
                 *out_value = if MODE == ADD { *out_value + sum } else { sum };
             }
@@ -1451,17 +1495,20 @@ unsafe fn tiled_row_range_neon<const MODE: u8>(a_data: &[f64], b_data: &[f64], o
         k,
         n,
         out_stride,
+        a_row_step,
+        a_k_step,
     } = panel;
     // as the AVX2 path: only RESUME computes part of a product
-    let (col_start, col_end, k_start, k_end, out_stride) = if MODE == RESUME {
-        (col_start, col_end, k_start, k_end, out_stride)
+    let (col_start, col_end, k_start, k_end, out_stride, a_row_step, a_k_step) = if MODE == RESUME {
+        (col_start, col_end, k_start, k_end, out_stride, a_row_step, a_k_step)
     } else {
-        (0, n, 0, k, n)
+        (0, n, 0, k, n, k, 1)
     };
     let a_ptr = a_data.as_ptr();
     let b_ptr = b_data.as_ptr();
     let out_ptr = out.as_mut_ptr();
     let out_at = move |row: usize, col: usize| out_ptr.add((row - row_start) * out_stride + col - col_start);
+    let a_at = move |row: usize, kk: usize| *a_ptr.add(row * a_row_step + kk * a_k_step);
     let mut block_start = row_start;
     while block_start < row_end {
         let block_end = (block_start + rows_per_block).min(row_end);
@@ -1479,7 +1526,7 @@ unsafe fn tiled_row_range_neon<const MODE: u8>(a_data: &[f64], b_data: &[f64], o
                     let b_row = b_ptr.add(kk * n + col);
                     let b_tile: [_; 8] = std::array::from_fn(|j| vld1q_f64(b_row.add(2 * j)));
                     for r in 0..NEON_TILE_ROWS {
-                        let a_vec = vdupq_n_f64(*a_ptr.add((row + r) * k + kk));
+                        let a_vec = vdupq_n_f64(a_at(row + r, kk));
                         for j in 0..8 {
                             acc[r][j] = vfmaq_f64(acc[r][j], a_vec, b_tile[j]);
                         }
@@ -1494,9 +1541,10 @@ unsafe fn tiled_row_range_neon<const MODE: u8>(a_data: &[f64], b_data: &[f64], o
             }
             for row in row..block_end {
                 let mut acc: [_; 8] = std::array::from_fn(|j| chain_start_neon::<MODE>(out_at(row, col + 2 * j)));
-                for (i, &a_value) in a_data[row * k + k_start..row * k + k_end].iter().enumerate() {
+                for kk in k_start..k_end {
+                    let a_value = a_at(row, kk);
                     let a_vec = vdupq_n_f64(a_value);
-                    let b_row = b_ptr.add((k_start + i) * n + col);
+                    let b_row = b_ptr.add(kk * n + col);
                     for (j, acc_lanes) in acc.iter_mut().enumerate() {
                         *acc_lanes = vfmaq_f64(*acc_lanes, a_vec, vld1q_f64(b_row.add(2 * j)));
                     }
@@ -1510,8 +1558,9 @@ unsafe fn tiled_row_range_neon<const MODE: u8>(a_data: &[f64], b_data: &[f64], o
         while col + 2 <= col_end {
             for row in block_start..block_end {
                 let mut acc = chain_start_neon::<MODE>(out_at(row, col));
-                for (i, &a_value) in a_data[row * k + k_start..row * k + k_end].iter().enumerate() {
-                    acc = vfmaq_f64(acc, vdupq_n_f64(a_value), vld1q_f64(b_ptr.add((k_start + i) * n + col)));
+                for kk in k_start..k_end {
+                    let a_value = a_at(row, kk);
+                    acc = vfmaq_f64(acc, vdupq_n_f64(a_value), vld1q_f64(b_ptr.add(kk * n + col)));
                 }
                 store_lanes_neon::<MODE>(out_at(row, col), acc);
             }
@@ -1521,8 +1570,9 @@ unsafe fn tiled_row_range_neon<const MODE: u8>(a_data: &[f64], b_data: &[f64], o
             for row in block_start..block_end {
                 let out_value = out_at(row, col);
                 let mut sum = if MODE == RESUME { *out_value } else { 0.0f64 };
-                for (i, &a_value) in a_data[row * k + k_start..row * k + k_end].iter().enumerate() {
-                    sum = a_value.mul_add(*b_ptr.add((k_start + i) * n + col), sum);
+                for kk in k_start..k_end {
+                    let a_value = a_at(row, kk);
+                    sum = a_value.mul_add(*b_ptr.add(kk * n + col), sum);
                 }
                 *out_value = if MODE == ADD { *out_value + sum } else { sum };
             }

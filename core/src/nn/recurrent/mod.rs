@@ -25,7 +25,7 @@
 //!
 //! with `sigmoid(x) = 1 / (1 + exp(-x))` and `tanh(x) = 1 - 2 / (exp(2x) + 1)` (the workplan's
 //! W15), `exp` the crate's correctly rounded one ([`crate::num::exp`]), as `ops::unary`'s `exp` is.
-//! The products are the crate's (`matmul`, `matmul_nt`, `matmul_add`, as the dense layer's ops call
+//! The products are the crate's (`matmul`, `matmul_nt`, `matmul_transposed_add`, as the dense layer's ops call
 //! them: `affine_forward_batch`, `linear_forward_batch`, `dense::downstream_batch`,
 //! `dense::accumulate_gradient_batch`, `linear_accumulate_gradient_batch`), so their bits are those
 //! ops'; numpy's products are BLAS's, not these. Every sum that isn't a product is a left fold from
@@ -37,7 +37,7 @@
 pub mod factored;
 
 use crate::array::{Array, Shape};
-use crate::linalg::{matmul, matmul_add, matmul_nt};
+use crate::linalg::{matmul, matmul_nt, matmul_transposed_add};
 use crate::nn::dense;
 use crate::nn::dense::affine_forward_batch;
 use crate::num::exp::{exp_in_place, sigmoid_in_place, tanh_in_place};
@@ -151,7 +151,7 @@ pub fn state_input_backward(
     require_shape(grad_p, p.shape, "grad_p", context)?;
     require_shape(state, Shape::Matrix(rows, state_size), "state", context)?;
     let sums = token_sums(delta, tokens, features);
-    Ok((matmul(&sums, p)?, matmul_add(grad_p, &sums.transpose(), state)?))
+    Ok((matmul(&sums, p)?, matmul_transposed_add(grad_p, &sums, state)?))
 }
 
 /// The FiLM state input's forward pass (indrajala-ml's audit-remedies workplan, D9; Perez et al.
@@ -235,8 +235,8 @@ pub fn state_input_film_backward(
     Ok((
         Array::from_matrix(dx, rows, width),
         state_delta,
-        matmul_add(grad_p, &sums.transpose(), state)?,
-        matmul_add(grad_g, &product_sums.transpose(), state)?,
+        matmul_transposed_add(grad_p, &sums, state)?,
+        matmul_transposed_add(grad_g, &product_sums, state)?,
     ))
 }
 
@@ -443,8 +443,8 @@ pub fn gru_backward(
     let da_rz = Array::from_matrix(da_rz, rows, 2 * s);
 
     let (new_grad_w, new_grad_b) = dense::accumulate_gradient_batch(&da, u, grad_w, grad_b)?;
-    let grad_u_rz = matmul_add(&row_block(grad_u, s, 0, 2 * s), &da_rz.transpose(), c)?;
-    let grad_u_h = matmul_add(&row_block(grad_u, s, 2 * s, 3 * s), &da_h.transpose(), rc)?;
+    let grad_u_rz = matmul_transposed_add(&row_block(grad_u, s, 0, 2 * s), &da_rz, c)?;
+    let grad_u_h = matmul_transposed_add(&row_block(grad_u, s, 2 * s, 3 * s), &da_h, rc)?;
     let mut new_grad_u = grad_u_rz.data;
     new_grad_u.extend(grad_u_h.data);
 

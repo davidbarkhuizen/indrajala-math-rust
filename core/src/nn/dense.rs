@@ -6,7 +6,7 @@
 //! reference this crate is checked against.
 
 use crate::array::{Array, Shape};
-use crate::linalg::{matmul, matmul_add, matmul_nt};
+use crate::linalg::{matmul, matmul_nt, matmul_transposed_add};
 use crate::num::activation::Activation;
 use crate::ops::arith::require_same_shape;
 use crate::ops::arith::same_shape_elementwise;
@@ -189,7 +189,7 @@ pub fn accumulate_gradient_batch(
     grad_b: &Array,
 ) -> Result<(Array, Array), Error> {
     // grad_w + delta_batch.T @ X in the product's own store, bit-identical to the separate add
-    let new_grad_w = matmul_add(grad_w, &delta_batch.transpose(), input_activation_batch)?;
+    let new_grad_w = matmul_transposed_add(grad_w, delta_batch, input_activation_batch)?;
     let grad_b_update = sum_axis0(delta_batch)?;
     let new_grad_b = grad_b.combine_with_array(&grad_b_update, |g, u| g + u, "add")?;
     Ok((new_grad_w, new_grad_b))
@@ -370,5 +370,5 @@ pub fn linear_accumulate_gradient_batch(
     input_activation_batch: &Array,
     grad_w: &Array,
 ) -> Result<Array, Error> {
-    matmul_add(grad_w, &delta_batch.transpose(), input_activation_batch)
+    matmul_transposed_add(grad_w, delta_batch, input_activation_batch)
 }
