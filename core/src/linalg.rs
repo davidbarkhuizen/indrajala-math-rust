@@ -720,9 +720,12 @@ unsafe fn dot_product_tile_neon<const RA: usize, const RB: usize>(
 const NARROW_ROWS_PER_BLOCK: usize = 4;
 
 /// `panel`'s outputs of `a @ b` into `out`, which holds zeros, running over `k` in slabs of `k_block`
-/// rows of `b`. Each output's chain resumes from its stored partial (a stored double is exact, so
+/// rows of `b`, packed when it has `PACKED_ROWS` rows (`packed_panel`). Each output's chain resumes from its stored partial (a stored double is exact, so
 /// its value is unchanged), and a slab serves every row and column tile from cache before the next.
 fn slabbed_panel(a_data: &[f64], b_data: &[f64], out: &mut [f64], panel: Panel, k_block: usize) {
+    if panel.row_end - panel.row_start >= PACKED_ROWS {
+        return packed_panel(a_data, b_data, out, panel, k_block.saturating_mul(2));
+    }
     let mut k_start = 0;
     while k_start < panel.k {
         let k_end = k_start.saturating_add(k_block).min(panel.k);
@@ -736,6 +739,76 @@ fn slabbed_panel(a_data: &[f64], b_data: &[f64], out: &mut [f64], panel: Panel, 
                 ..panel
             },
         );
+        k_start = k_end;
+    }
+}
+
+/// From this many rows, a slab of `b` is worth copying (`packed_panel`): each 16-column tile then
+/// serves at least 32 register tiles. On jebel, a Ryzen 3700U and an i7-1255U's P-cores, packing lost
+/// to plain slabs below it (`(8, 2048) @ (2048, 64)`, `(30, 512) @ (512, 784)`) and won at and above it,
+/// whatever `n` (`scripts/measurement/blocking_probe.rs`, and the crate performance workplan's K7b).
+const PACKED_ROWS: usize = 64;
+
+/// `slabbed_panel` for many rows: each slab of `b` copied to a contiguous buffer, 16 columns at a
+/// time, then `PACKED_ROWS` rows of `a` at a time through every tile. A wide `b`'s rows lie a page or
+/// more apart, at 512, 1,024 and 2,048 columns exactly a power of two, so without the copy a tile's
+/// loads miss the prefetchers and share their cache sets; many rows of `a` have the same stride, so
+/// a block keeps its part of the slab in cache across tiles. (2048, 512) @ (512, 2048) is 3.3x faster
+/// than without both on jebel, 3.8x on the Ryzen. A copy and a loop order: the same chains in the same
+/// order, so the same bits. The kernels take a tile as a 16-column `b` of the slab's rows, and `a`
+/// from the slab's first `k`, so its rows still step by `k`.
+fn packed_panel(a_data: &[f64], b_data: &[f64], out: &mut [f64], panel: Panel, k_block: usize) {
+    const COLUMNS: usize = 16;
+    let Panel {
+        k,
+        n,
+        col_start,
+        col_end,
+        row_start,
+        row_end,
+        out_stride,
+        ..
+    } = panel;
+    let slab_rows = k_block.min(k);
+    let tiles = (col_end - col_start).div_ceil(COLUMNS);
+    let mut packed = vec![0.0; slab_rows * tiles * COLUMNS];
+    let mut k_start = 0;
+    while k_start < k {
+        let k_end = k_start.saturating_add(k_block).min(k);
+        // row by row of `b`, so the copy itself reads in order
+        for kk in k_start..k_end {
+            for tile in 0..tiles {
+                let col = col_start + tile * COLUMNS;
+                let width = COLUMNS.min(col_end - col);
+                let at = (tile * slab_rows + kk - k_start) * COLUMNS;
+                packed[at..at + width].copy_from_slice(&b_data[kk * n + col..kk * n + col + width]);
+            }
+        }
+        let mut block_start = row_start;
+        while block_start < row_end {
+            let block_end = (block_start + PACKED_ROWS).min(row_end);
+            for tile in 0..tiles {
+                let col = col_start + tile * COLUMNS;
+                let slab = Panel {
+                    row_start: block_start,
+                    row_end: block_end,
+                    rows_per_block: PACKED_ROWS,
+                    col_start: 0,
+                    col_end: COLUMNS.min(col_end - col),
+                    k_start: 0,
+                    k_end: k_end - k_start,
+                    n: COLUMNS,
+                    ..panel
+                };
+                tiled_row_range::<RESUME>(
+                    &a_data[k_start..],
+                    &packed[tile * slab_rows * COLUMNS..],
+                    &mut out[(block_start - row_start) * out_stride + col - col_start..],
+                    slab,
+                );
+            }
+            block_start = block_end;
+        }
         k_start = k_end;
     }
 }

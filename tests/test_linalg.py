@@ -614,7 +614,10 @@ def test_thread_count_cannot_change_accumulate_gradient_batch_bits(reset_matmul_
         assert result == unthreaded, threads
 
 
-@pytest.mark.parametrize("m, k, n", [(5, 65, 21), (9, 300, 37), (4, 1025, 18), (7, 64, 16)])
+@pytest.mark.parametrize(
+    "m, k, n",
+    [(5, 65, 21), (9, 300, 37), (4, 1025, 18), (7, 64, 16), (64, 100, 37), (65, 70, 16), (130, 90, 517), (200, 65, 4)],
+)
 @pytest.mark.parametrize("k_block", [1, 16, 65, 4096])
 def test_the_slab_size_cannot_change_a_products_bits(reset_kernel_overrides, m, k, n, k_block):
     delta, X, grad_w, grad_b = _accumulate_case(m, k, n)
