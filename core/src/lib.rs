@@ -22,7 +22,7 @@
 
 // The modules in layers, each using only its own and those below (indrajala-ml's crate structure
 // workplan, D1; tests/layers.rs checks it): `program` and `data` over `nn`, over `ops`, `linalg`
-// and `random`, over `num`, over `Array` and `Error`.
+// and `random`, over `num` and `sys`, over `Array` and `Error`.
 mod array;
 #[cfg(feature = "census")]
 pub mod census;
@@ -36,6 +36,7 @@ pub mod num;
 pub mod ops;
 pub mod program;
 pub mod random;
+pub mod sys;
 
 pub use array::{Array, Shape};
 pub use error::Error;
