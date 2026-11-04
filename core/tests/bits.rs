@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use indrajala_math::linalg::{matmul, matmul_add, matmul_long_k, matmul_nt, outer};
+use indrajala_math::linalg::{matmul, matmul_add, matmul_long_k, matmul_nt, matmul_transposed_add, outer};
 use indrajala_math::nn::attention::{self, cross};
 use indrajala_math::nn::conv::{self, max_pool_forward_batch};
 use indrajala_math::nn::norm::layer_norm;
@@ -349,6 +349,31 @@ fn families() -> BTreeMap<&'static str, String> {
         out.insert(name, hash(&[&matmul_nt(&a, &b).unwrap()]));
     }
     out
+}
+
+/// Reading `d` through steps changes no chain, on each side of the slab, packing and threading thresholds.
+#[test]
+fn matmul_transposed_add_is_matmul_add_of_the_transpose() {
+    let g = &mut rng(20261106);
+    for (m, k, n) in [
+        (1, 1, 1),
+        (3, 7, 5),
+        (30, 33, 13),
+        (16, 64, 35),
+        (32, 32, 5408),
+        (30, 65, 17),
+        (64, 100, 37),
+        (3, 100, 517),
+        (70, 300, 21),
+        (130, 70, 511),
+        (130, 70, 512),
+        (256, 256, 256),
+    ] {
+        let (c, d, b) = (matrix(g, m, n), matrix(g, k, m), matrix(g, k, n));
+        let direct = matmul_transposed_add(&c, &d, &b).unwrap();
+        let through_the_copy = matmul_add(&c, &d.transpose(), &b).unwrap();
+        assert_eq!(hash(&[&direct]), hash(&[&through_the_copy]), "{m} x {k} x {n}");
+    }
 }
 
 #[test]
