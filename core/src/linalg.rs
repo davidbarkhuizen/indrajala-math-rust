@@ -262,11 +262,28 @@ pub(crate) fn matmul_into(a: &[f64], b: &[f64], out: &mut Vec<f64>, r1: usize, c
 /// `MODE` as in `tiled_row_range`: `OVERWRITE`, or `ADD`, where `out` holds `c` on entry and `c + a
 /// @ b` on return. `OVERWRITE` is given zeros in `out`: a slab's chain starts from what's stored.
 fn matmul_2d<const MODE: u8>(a_data: &[f64], b_data: &[f64], out: &mut [f64], r1: usize, c1: usize, c2: usize) {
+    matmul_2d_steps::<MODE>(a_data, b_data, out, (r1, c1, c2), (c1, 1));
+}
+
+/// `matmul_2d` for `(r1, c1, c2)`, reading `a[row, k]` at `row * a_steps.0 + k * a_steps.1`: `OVERWRITE`
+/// always takes a row-major `a`, `(c1, 1)`.
+#[inline]
+fn matmul_2d_steps<const MODE: u8>(
+    a_data: &[f64],
+    b_data: &[f64],
+    out: &mut [f64],
+    (r1, c1, c2): (usize, usize, usize),
+    (a_row_step, a_k_step): (usize, usize),
+) {
     let _census = crate::census::enter("matmul_2d", r1, c1, c2);
     let k_block = overridden_or(&LONG_K_BLOCK_OVERRIDE, LONG_K_BLOCK);
     if c1 > k_block {
         for_each_row_range(out, r1, c2, r1 * c1 * c2, |chunk, row_start, row_end| {
-            let panel = Panel::whole(row_start, row_end, c1, c2, row_end - row_start);
+            let panel = Panel {
+                a_row_step,
+                a_k_step,
+                ..Panel::whole(row_start, row_end, c1, c2, row_end - row_start)
+            };
             if MODE == ADD {
                 // each chain is the product's alone, and joins `c` once finished: one rounding
                 let mut product = vec![0.0; chunk.len()];
@@ -287,7 +304,11 @@ fn matmul_2d<const MODE: u8>(a_data: &[f64], b_data: &[f64], out: &mut [f64], r1
             a_data,
             b_data,
             chunk,
-            Panel::whole(row_start, row_end, c1, c2, rows_per_block),
+            Panel {
+                a_row_step,
+                a_k_step,
+                ..Panel::whole(row_start, row_end, c1, c2, rows_per_block)
+            },
         );
     });
 }
@@ -333,21 +354,8 @@ pub fn matmul_transposed_add(c: &Array, d: &Array, b: &Array) -> Result<Array, E
             c.shape
         )));
     }
-    let _census = crate::census::enter("matmul_transposed_add", m, k, n);
-    let k_block = overridden_or(&LONG_K_BLOCK_OVERRIDE, LONG_K_BLOCK);
     let mut out = c.data.clone();
-    for_each_row_range(&mut out, m, n, m * k * n, |chunk, row_start, row_end| {
-        let panel = Panel {
-            a_row_step: 1,
-            a_k_step: m,
-            ..Panel::whole(row_start, row_end, k, n, row_end - row_start)
-        };
-        let mut product = vec![0.0; chunk.len()];
-        slabbed_panel(&d.data, &b.data, &mut product, panel, k_block);
-        for (value, finished) in chunk.iter_mut().zip(&product) {
-            *value += *finished;
-        }
-    });
+    matmul_2d_steps::<ADD>(&d.data, &b.data, &mut out, (m, k, n), (1, m));
     Ok(Array::from_matrix(out, m, n))
 }
 
@@ -1236,7 +1244,7 @@ pub(crate) struct Panel {
     pub n: usize,
     pub out_stride: usize,
     /// `a[row, kk]` is at `row * a_row_step + kk * a_k_step`: `k` and 1 for a row-major `a`; 1 and `M`
-    /// to read `a` from its row-major transpose. Only `RESUME` calls take other steps.
+    /// to read `a` from its row-major transpose. `OVERWRITE` takes only the former.
     pub a_row_step: usize,
     pub a_k_step: usize,
 }
@@ -1351,10 +1359,15 @@ unsafe fn tiled_row_range_avx2_fma<const MODE: u8>(a_data: &[f64], b_data: &[f64
     // only RESUME computes part of a product; the others take the whole panel's columns, `k` and
     // stride as known structure, which kept the whole-product callers 5-7% faster than runtime
     // offsets (single-example conv forward and downstream)
-    let (col_start, col_end, k_start, k_end, out_stride, a_row_step, a_k_step) = if MODE == RESUME {
-        (col_start, col_end, k_start, k_end, out_stride, a_row_step, a_k_step)
+    let (col_start, col_end, k_start, k_end, out_stride) = if MODE == RESUME {
+        (col_start, col_end, k_start, k_end, out_stride)
     } else {
-        (0, n, 0, k, n, k, 1)
+        (0, n, 0, k, n)
+    };
+    let (a_row_step, a_k_step) = if MODE == OVERWRITE {
+        (k, 1)
+    } else {
+        (a_row_step, a_k_step)
     };
     let a_ptr = a_data.as_ptr();
     let b_ptr = b_data.as_ptr();
@@ -1499,10 +1512,15 @@ unsafe fn tiled_row_range_neon<const MODE: u8>(a_data: &[f64], b_data: &[f64], o
         a_k_step,
     } = panel;
     // as the AVX2 path: only RESUME computes part of a product
-    let (col_start, col_end, k_start, k_end, out_stride, a_row_step, a_k_step) = if MODE == RESUME {
-        (col_start, col_end, k_start, k_end, out_stride, a_row_step, a_k_step)
+    let (col_start, col_end, k_start, k_end, out_stride) = if MODE == RESUME {
+        (col_start, col_end, k_start, k_end, out_stride)
     } else {
-        (0, n, 0, k, n, k, 1)
+        (0, n, 0, k, n)
+    };
+    let (a_row_step, a_k_step) = if MODE == OVERWRITE {
+        (k, 1)
+    } else {
+        (a_row_step, a_k_step)
     };
     let a_ptr = a_data.as_ptr();
     let b_ptr = b_data.as_ptr();
