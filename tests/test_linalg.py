@@ -8,6 +8,8 @@ strictly stronger check than a two-way Rust-vs-numpy comparison alone.
 import os
 import random
 import struct
+import subprocess
+import sys
 from fractions import Fraction
 
 import numpy as np
@@ -32,7 +34,9 @@ from indrajala_math_rust import (
     set_kernel_overrides,
     set_matmul_nt_slab,
     set_matmul_threading,
+    set_threads,
     sum_axis0,
+    threads,
 )
 
 
@@ -540,6 +544,12 @@ def reset_matmul_threading():
 
 
 @pytest.fixture
+def reset_threads():
+    yield
+    set_threads(0)
+
+
+@pytest.fixture
 def reset_kernel_overrides():
     yield
     set_kernel_overrides(0, 0)
@@ -707,17 +717,55 @@ def test_policy_runs_the_conv_mini_batch_32_tail_on_one_thread(reset_matmul_thre
 
 def test_policy_threads_the_batch_512_products_all_or_nothing(reset_matmul_threading):
     # they gained end to end (or came out even); no 2- or 4-thread middle ground
-    # (the count itself is the machine's parallelism, capped at 8)
+    # (the count itself is the process's budget)
     set_matmul_threading(0, 0)
     counts = {
         shape: matmul_threads_for(*shape) for shape in (DENSE_BATCH_512, CONV_ACCUMULATE_512, CONV_TAIL_BATCH_512)
     }
     assert len(set(counts.values())) == 1, counts
-    assert 1 <= counts[CONV_TAIL_BATCH_512] <= 8
+    assert counts[CONV_TAIL_BATCH_512] == threads()
+
+
+def test_the_budget_is_at_most_8_and_the_process_s_cpus_by_default():
     # the CPUs this process may run on (sched_getaffinity, Linux only), else every CPU
     cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
-    if cpus >= 2:
-        assert counts[CONV_TAIL_BATCH_512] >= 2
+    assert 1 <= threads() <= min(cpus, 8)
+
+
+def test_set_threads_is_the_ceiling_until_it_is_reset(reset_threads):
+    default = threads()
+    set_threads(3)
+    assert threads() == 3
+    assert matmul_threads_for(*CONV_TAIL_BATCH_512) == 3
+    assert matmul_threads_for(*CONV_TAIL_BATCH_32) == 1  # under the threshold, whatever the budget
+    set_threads(1)
+    assert matmul_threads_for(*CONV_TAIL_BATCH_512) == 1
+    set_threads(0)
+    assert threads() == default
+
+
+def test_the_test_hook_overrides_the_budget(reset_threads, reset_matmul_threading):
+    set_threads(1)
+    set_matmul_threading(3, 1)
+    assert matmul_threads_for(*CONV_TAIL_BATCH_512) == 3
+
+
+@pytest.mark.parametrize(("value", "expected"), [("3", 3), ("1", 1)])
+def test_the_environment_sets_the_budget(value, expected):
+    code = "import indrajala_math_rust as pa; print(pa.threads())"
+    environment = {**os.environ, "INDRAJALA_THREADS": value}
+    stdout = subprocess.run([sys.executable, "-c", code], env=environment, check=True, capture_output=True).stdout
+    assert int(stdout) == expected
+
+
+@pytest.mark.parametrize("value", ["0", "two"])
+def test_an_unreadable_environment_gives_the_default(value):
+    code = "import indrajala_math_rust as pa; print(pa.threads())"
+    environment = {**os.environ, "INDRAJALA_THREADS": value}
+    stdout = subprocess.run([sys.executable, "-c", code], env=environment, check=True, capture_output=True).stdout
+    without = {key: item for key, item in os.environ.items() if key != "INDRAJALA_THREADS"}
+    default = subprocess.run([sys.executable, "-c", code], env=without, check=True, capture_output=True).stdout
+    assert int(stdout) == int(default)
 
 
 def test_policy_override_and_row_cap(reset_matmul_threading):

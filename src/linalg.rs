@@ -20,6 +20,19 @@ pub(crate) fn set_matmul_threading(max_threads: usize, threshold_flops: usize) {
     linalg::set_matmul_threading(max_threads, threshold_flops);
 }
 
+/// This process's thread budget from now on (`sys::threads`); 0 goes back to `INDRAJALA_THREADS`, else
+/// the machine's physical cores.
+#[pyfunction]
+pub(crate) fn set_threads(threads: usize) {
+    indrajala_math::sys::threads::set_threads(threads);
+}
+
+/// This process's thread budget.
+#[pyfunction]
+pub(crate) fn threads() -> usize {
+    indrajala_math::sys::threads::threads()
+}
+
 /// Test hook: the thread count the threaded matmuls would use for an `m x k @ k x n` product.
 #[pyfunction]
 pub(crate) fn matmul_threads_for(m: usize, k: usize, n: usize) -> usize {
@@ -60,6 +73,8 @@ pub fn outer(a: &RustArray, b: &RustArray) -> PyResult<RustArray> {
 
 /// Adds this module's functions and classes to the Python module, then its children's.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(set_threads, m)?)?;
+    m.add_function(wrap_pyfunction!(threads, m)?)?;
     m.add_function(wrap_pyfunction!(set_matmul_threading, m)?)?;
     m.add_function(wrap_pyfunction!(matmul_threads_for, m)?)?;
     m.add_function(wrap_pyfunction!(set_kernel_overrides, m)?)?;

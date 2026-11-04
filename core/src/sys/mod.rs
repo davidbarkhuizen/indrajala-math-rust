@@ -3,3 +3,4 @@
 //! only sets how a product is blocked and how many threads run it.
 
 pub mod cpu_info;
+pub mod threads;

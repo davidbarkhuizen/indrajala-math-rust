@@ -3,18 +3,10 @@
 //! every machine (AVX2/FMA and NEON kernels, a scalar fallback, the same bits).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
 
 use crate::array::{Array, Shape};
+use crate::sys::threads::threads;
 use crate::Error;
-
-/// `std::thread::available_parallelism()` itself measured at ~50us/call (not cached by the
-/// standard library) - queried once, lazily, and cached for the process's lifetime, since the
-/// machine's core count doesn't change at runtime.
-fn available_parallelism_cached() -> usize {
-    static CACHED: OnceLock<usize> = OnceLock::new();
-    *CACHED.get_or_init(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
-}
 
 /// The three matmul shape combinations `ArrayLayer`'s own formulas actually use - matrix @
 /// vector (`self.W @ x`), vector @ matrix (`self.W.T @ self.delta`, computed as `delta @ W` by
@@ -251,13 +243,9 @@ pub(crate) fn matmul_into(a: &[f64], b: &[f64], out: &mut Vec<f64>, r1: usize, c
 /// rows end to end, so results are bit-identical to the single-threaded path regardless of thread
 /// count or scheduling - summation order per output row is unaffected by which thread computes it.
 ///
-/// The flops check runs *before* anything else, including reading `available_parallelism_cached()`:
-/// measured directly, `std::thread::available_parallelism()` itself costs ~50us per call (not
-/// cached by the standard library, presumably a cgroup/proc filesystem read), which would have
-/// silently dominated every one of this codebase's actual small per-call matmuls (already
-/// measured in the tens of microseconds) if queried unconditionally on every dispatch. Cached
-/// once behind a `OnceLock` and read only when there's already enough work to justify the
-/// question.
+/// The flops check runs *before* anything else, including reading the thread budget: its first
+/// read asks `std::thread::available_parallelism()`, measured at ~50us a call, and reads sysfs, so a
+/// small product never pays for the question.
 ///
 /// `MODE` as in `tiled_row_range`: `OVERWRITE`, or `ADD`, where `out` holds `c` on entry and `c + a
 /// @ b` on return. `OVERWRITE` is given zeros in `out`: a slab's chain starts from what's stored.
@@ -380,7 +368,7 @@ pub fn set_matmul_threading(max_threads: usize, threshold_flops: usize) {
 }
 
 /// How many threads `for_each_row_range` uses for a `rows`-row product of `total_flops`: 1 below
-/// the threshold, otherwise `min(available_parallelism, 8, rows)`, all or nothing. Measured on
+/// the threshold, otherwise `min(the process's budget, rows)`, all or nothing. Measured on
 /// this laptop (4 cores / 8 threads), not portable:
 ///
 /// - 8M is where 8 threads start to beat 1 for `matmul_2d` and `matmul_nt` in isolation. The
@@ -396,7 +384,6 @@ pub fn set_matmul_threading(max_threads: usize, threshold_flops: usize) {
 /// thread, the MNIST conv mini-batch 512 epoch took 1.03-1.12 s against 0.84-0.88.
 pub(crate) fn matmul_thread_count(rows: usize, total_flops: usize) -> usize {
     const THREADING_THRESHOLD_FLOPS: usize = 8_000_000;
-    const MAX_THREADS: usize = 8;
 
     let threshold = match THRESHOLD_FLOPS_OVERRIDE.load(Ordering::Relaxed) {
         0 => THREADING_THRESHOLD_FLOPS,
@@ -406,7 +393,7 @@ pub(crate) fn matmul_thread_count(rows: usize, total_flops: usize) -> usize {
         return 1;
     }
     let max_threads = match MAX_THREADS_OVERRIDE.load(Ordering::Relaxed) {
-        0 => available_parallelism_cached().min(MAX_THREADS),
+        0 => threads(),
         overridden => overridden,
     };
     max_threads.min(rows).max(1)
