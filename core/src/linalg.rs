@@ -461,10 +461,16 @@ pub fn set_matmul_nt_slab(slab: usize) {
 /// with 1,280 KB, gained no more.
 const NT_SLAB_MAX_BYTES: usize = 128 * 1024;
 
+/// The shortest slab worth its stored lanes. Each output's 4 lanes are written back once a slab, 32
+/// bytes against the 8 x 4 a slab's rows read per output's row of `b`, so that traffic is 16 / slab of
+/// what's read: at `n` = 512 on jebel a slab would be 12 rows, and a `d` 512 epoch took 5x as long.
+const NT_SLAB_MIN: usize = 64;
+
 /// `matmul_nt`'s slab in `k`, or `None` for one pass over all of `k`: only once `b` is past half the
 /// L2 share, which streams it again for every block of rows, and then a quarter of that share of `b`
-/// a slab, at most `NT_SLAB_MAX_BYTES` (the crate performance workplan, K8: on jebel a slab reaching
-/// the L2 gained nothing, and on stone's P-cores slabbing a `b` that fits cost up to 10%).
+/// a slab, at most `NT_SLAB_MAX_BYTES` and at least `NT_SLAB_MIN` rows, or none at all (the crate
+/// performance workplan, K8: on jebel a slab reaching the L2 gained nothing, and on stone's P-cores
+/// slabbing a `b` that fits cost up to 10%).
 fn nt_slab(k: usize, n: usize) -> Option<usize> {
     const F64_BYTES: usize = std::mem::size_of::<f64>();
     let slab = match NT_SLAB_OVERRIDE.load(Ordering::Relaxed) {
@@ -474,7 +480,11 @@ fn nt_slab(k: usize, n: usize) -> Option<usize> {
             if n * k * F64_BYTES <= l2 / 2 {
                 return None;
             }
-            (l2 / 4).min(NT_SLAB_MAX_BYTES) / (n * F64_BYTES).max(1)
+            let slab = (l2 / 4).min(NT_SLAB_MAX_BYTES) / (n * F64_BYTES).max(1);
+            if slab < NT_SLAB_MIN {
+                return None;
+            }
+            slab
         }
         overridden => overridden,
     };
