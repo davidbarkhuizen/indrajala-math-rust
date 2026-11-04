@@ -49,7 +49,7 @@ jobs:
       - name: Install nightly with miri
         run: rustup toolchain install nightly --profile minimal --component miri,rust-src
       - name: Miri
-        run: cargo +nightly miri test -p indrajala-math --test contract --test numpy_streams
+        run: cargo +nightly miri test -p indrajala-math --test contract --test numpy_streams --test pool
 
   # The core's own tests, its bit fixtures among them, on every shipped platform's runner.
   rust:
