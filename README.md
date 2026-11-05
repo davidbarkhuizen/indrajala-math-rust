@@ -107,6 +107,17 @@ and must stay numerically identical to it. Likewise each function in
 `core/src/nn/conv.rs` mirrors a method of `indrajala_ml/model/layers/numpy/conv_array_layer.py`/`max_pool_array_layer.py`, each `linear_*` function one of its `LinearConvArrayLayer`, each `linear_*` function in `core/src/nn/dense.rs` and each function in `core/src/nn/norm/batch_norm.rs` one of `linear_array_layer.py`/`batch_norm_array_layer.py`, and each function in `core/src/nn/tokens.rs`, `core/src/nn/norm/layer_norm.rs`, `core/src/nn/attention/` and `core/src/nn/recurrent/` one of `token_array_layer.py`, `layer_norm_array_layer.py`, `attention_array_layer.py` or `recurrent_array_layer.py`. Conv tensors cross the boundary as matrices
 (`Array` stays 1D/2D); `core/src/nn/conv.rs`'s module comment gives the layouts.
 
+## Threads
+
+A product large enough to pay for it (8M flops or more today) runs on several threads; anything smaller stays on the caller's.
+
+- **One budget a process:** `set_threads(n)`, else `INDRAJALA_THREADS`, read once, else the physical cores within the CPUs the process may run on, at most 8. `threads()` shows what took effect. An unreadable `INDRAJALA_THREADS` counts as unset, and `set_threads(0)` goes back to the default. Several processes on one host each take their own budget, so a launcher running a pool of them should set 1 a worker.
+- **Bits don't depend on it.** Work is split by output (rows, column chunks, examples), never inside a sum, so results are the same at every thread count, on every machine.
+- **The pool** (`core/src/sys/pool.rs`) has no dependencies. Workers start on first use, only as many as a call can use, poll for 50 µs after a job, then sleep. A call wakes only the workers it needs, and works too; chunks are claimed from a counter. A chunk's panic reaches the caller. A call from inside a chunk, or beside another thread's call, runs inline. A forked child makes its own pool.
+- `set_matmul_threading(max_threads, threshold_flops)` overrides the budget and the threshold for tests and benchmarks.
+
+Not threaded yet: the tiled attention, the window program, conv's forward and the row-wise ops. indrajala-ml's parked crate performance workplan holds that work.
+
 ## Same bits on every machine
 
 A network on this backend trains to the same bits on x86_64 and aarch64 (indrajala-ml's
