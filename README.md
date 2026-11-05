@@ -74,7 +74,7 @@ or `OverflowError`; `src/num.rs` reads an activation by its Python name. The Pyt
 | --- | --- |
 | `src/lib.rs` | module definition; `ping()` toolchain check |
 | `indrajala_math_rust.pyi` | type stub for the whole Python API (packaged with `py.typed`) |
-| `src/array.rs` | `RustArray`: construction, `zeros`, `shape`, `.T`, indexing and contiguous slicing, `reshape`, `copy`, `tolist` |
+| `src/array.rs` | `RustArray`: construction (from lists, `from_rows`, and `from_buffer`, a memcpy from a C-contiguous float64 buffer), `zeros`, `shape`, `.T`, indexing and contiguous slicing, `reshape`, `copy`, `tolist` |
 | `src/ops/arith.rs` | elementwise `+ - * /` and in-place `+= -=` |
 | `src/linalg.rs` | `@` (matmul), `outer`; `set_threads(n)` and `threads()`, the process's thread budget (`INDRAJALA_THREADS`, default its physical cores, at most 8); `set_matmul_threading(max_threads, threshold_flops)`, a test/benchmark override of the matmul threading (0 = default); `matmul_threads_for(m, k, n)`, the thread count the policy picks for an `(m, k) @ (k, n)` product |
 | `src/ops/unary.rs` | `exp`, `erf`, `sum_axis0`, `argmax`, `array_relu`, `array_softmax` |
@@ -82,6 +82,7 @@ or `OverflowError`; `src/num.rs` reads an activation by its Python name. The Pyt
 | `src/random/legacy.rs` | `seed`, `random`, `uniform`, `bernoulli_mask`: numpy's legacy `np.random` (MT19937) in a separate state; after `seed(s)`, bit-identical to numpy's draws after `np.random.seed(s)` |
 | `src/random/generator.rs` | `SeedSequence`, `Generator`, `default_rng`: numpy's `default_rng` (`Generator(PCG64(SeedSequence(seed)))`), each generator its own state; bit-identical to numpy's draws from the same seed, with numpy's `bit_generator.state` as its `state` |
 | `src/data/mnist.rs` | `decode_mnist_pixels`: raw MNIST records to normalised pixels |
+| `src/data/planes.rs` | `one_hot_planes(ids, cells, channels)`: a byte a cell to the channel-major one-hot input a conv layer reads, built in Rust (the NES plan's D13) |
 | `src/nn/dense.rs` | `layer_*`: one call per `ArrayLayer` method (forward, deltas, downstream, gradient accumulate), single-example and `_batch`; `affine_forward*` and the `layer_*hidden_delta_skip*` ops of residual blocks (`(body_delta @ body_W + skip) * f'(a)`, the layer before a block's fork); `layer_activation_*` take the hidden layer's activation by name (`"relu"`, `"gelu"`, `"gelu_tanh"`, `"silu"`), the forward returning `(a, z)` with `z` only where the derivative reads it (all but ReLU); `linear_*`, `LinearArrayLayer`'s bias-free forward and accumulate |
 | `src/nn/dropout.rs` | `layer_dropout_*`: the dropout layer's forwards, which draw their mask from an optional `rng: Generator`, else from `random::legacy`'s global, and its hidden deltas and their skip variants |
 | `src/nn/softmax.rs` | `layer_softmax_*`: the softmax output layer's forward and output delta |
