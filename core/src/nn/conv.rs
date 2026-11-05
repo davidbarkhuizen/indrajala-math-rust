@@ -173,8 +173,10 @@ fn deltas_by_channel(delta: &Array, n: usize, o: usize, p: usize) -> Array {
 /// at N = 32 the whole-batch `cols`, product and `A` are 1.4-1.6 MB each, past L2, and zeroing
 /// them and then scattering into `A` made the op cost 1.5-2.8x its N single-example calls. Here
 /// only `cols` and `A` are batch-sized, and each is written once, in order; the example's slab
-/// of `cols` and its 43 KB product are still in cache when they are read. The product runs on
-/// one thread: threading the whole batch's product over its rows made no difference at N = 512.
+/// of `cols` and its 43 KB product are still in cache when they are read. Threading the whole
+/// batch's product over its rows made no difference at N = 512, so threads take whole examples
+/// instead, as `downstream_batch`'s do: each runs this per-example body over its own examples,
+/// writing its own rows of `cols` and `A`, so no output's value depends on the split.
 #[inline]
 pub fn forward_batch(w: &Array, x: &Array, b: &Array, geometry: &Geometry) -> Result<(Array, Array), Error> {
     let o = channel_count(w, geometry, "conv_forward_batch")?;
@@ -186,36 +188,34 @@ pub fn forward_batch(w: &Array, x: &Array, b: &Array, geometry: &Geometry) -> Re
     }
     let (n, is_vector) = require_batch(x, geometry.input_size, "conv_forward_batch X")?;
     let g = geometry;
-    let (p, k, fan_in) = (g.positions, g.kernel_size, g.fan_in);
+    let (p, fan_in) = (g.positions, g.fan_in);
     let _census = crate::census::enter("conv_forward", n, p, fan_in);
 
     let w_t = w.transpose(); // (C*k*k, O)
-    let mut cols = Vec::with_capacity(n * p * fan_in);
-    let mut by_position = vec![0.0; p * o]; // one example's (P, O)
-    let mut a = Vec::with_capacity(n * o * p);
-    for example in 0..n {
-        let input = &x.data[example * g.input_size..(example + 1) * g.input_size];
-        for out_row in 0..g.out_height {
-            for out_col in 0..g.out_width {
-                for c in 0..g.input_channels {
-                    for kr in 0..k {
-                        let start = g.input_index(c, out_row, out_col, kr, 0);
-                        cols.extend_from_slice(&input[start..start + k]);
-                    }
+    let mut cols = vec![0.0; n * p * fan_in];
+    let mut a = vec![0.0; n * o * p];
+    let examples = |first: usize, cols_out: &mut [f64], a_out: &mut [f64]| {
+        let mut by_position = vec![0.0; p * o]; // one example's (P, O)
+        let slabs = cols_out.chunks_mut(p * fan_in).zip(a_out.chunks_mut(o * p));
+        for (offset, (example_cols, example_a)) in slabs.enumerate() {
+            let example = first + offset;
+            let input = &x.data[example * g.input_size..(example + 1) * g.input_size];
+            im2col(example_cols, input, g);
+            tiled_row_range::<OVERWRITE>(
+                example_cols,
+                &w_t.data,
+                &mut by_position,
+                Panel::whole(0, p, fan_in, o, 1),
+            );
+            for (channel, plane) in example_a.chunks_mut(p).enumerate() {
+                let bias = b.data[channel];
+                for (position, value) in plane.iter_mut().enumerate() {
+                    *value = relu(by_position[position * o + channel] + bias);
                 }
             }
         }
-        tiled_row_range::<OVERWRITE>(
-            &cols[example * p * fan_in..],
-            &w_t.data,
-            &mut by_position,
-            Panel::whole(0, p, fan_in, o, 1),
-        );
-        for channel in 0..o {
-            let bias = b.data[channel];
-            a.extend((0..p).map(|position| relu(by_position[position * o + channel] + bias)));
-        }
-    }
+    };
+    by_examples(n, n * p * o * fan_in, p * fan_in, o * p, &mut cols, &mut a, examples);
     let cols = Array::from_matrix(cols, n * p, fan_in);
     Ok((batch_output(a, n, o * p, is_vector), cols))
 }
@@ -230,36 +230,80 @@ pub fn linear_forward_batch(w: &Array, x: &Array, geometry: &Geometry) -> Result
     let o = channel_count(w, geometry, "conv_linear_forward_batch")?;
     let (n, is_vector) = require_batch(x, geometry.input_size, "conv_linear_forward_batch X")?;
     let g = geometry;
-    let (p, k, fan_in) = (g.positions, g.kernel_size, g.fan_in);
+    let (p, fan_in) = (g.positions, g.fan_in);
 
     let w_t = w.transpose(); // (C*k*k, O)
-    let mut cols = Vec::with_capacity(n * p * fan_in);
-    let mut by_position = vec![0.0; p * o]; // one example's (P, O)
-    let mut a = Vec::with_capacity(n * o * p);
-    for example in 0..n {
-        let input = &x.data[example * g.input_size..(example + 1) * g.input_size];
-        for out_row in 0..g.out_height {
-            for out_col in 0..g.out_width {
-                for c in 0..g.input_channels {
-                    for kr in 0..k {
-                        let start = g.input_index(c, out_row, out_col, kr, 0);
-                        cols.extend_from_slice(&input[start..start + k]);
-                    }
+    let mut cols = vec![0.0; n * p * fan_in];
+    let mut a = vec![0.0; n * o * p];
+    let examples = |first: usize, cols_out: &mut [f64], a_out: &mut [f64]| {
+        let mut by_position = vec![0.0; p * o]; // one example's (P, O)
+        let slabs = cols_out.chunks_mut(p * fan_in).zip(a_out.chunks_mut(o * p));
+        for (offset, (example_cols, example_a)) in slabs.enumerate() {
+            let example = first + offset;
+            let input = &x.data[example * g.input_size..(example + 1) * g.input_size];
+            im2col(example_cols, input, g);
+            tiled_row_range::<OVERWRITE>(
+                example_cols,
+                &w_t.data,
+                &mut by_position,
+                Panel::whole(0, p, fan_in, o, 1),
+            );
+            for (channel, plane) in example_a.chunks_mut(p).enumerate() {
+                for (position, value) in plane.iter_mut().enumerate() {
+                    *value = by_position[position * o + channel];
                 }
             }
         }
-        tiled_row_range::<OVERWRITE>(
-            &cols[example * p * fan_in..],
-            &w_t.data,
-            &mut by_position,
-            Panel::whole(0, p, fan_in, o, 1),
-        );
-        for channel in 0..o {
-            a.extend((0..p).map(|position| by_position[position * o + channel]));
-        }
-    }
+    };
+    by_examples(n, n * p * o * fan_in, p * fan_in, o * p, &mut cols, &mut a, examples);
     let cols = Array::from_matrix(cols, n * p, fan_in);
     Ok((batch_output(a, n, o * p, is_vector), cols))
+}
+
+/// One example's im2col: its `(P, C*k*k)` rows of `cols` (`out`), in `W`-row column order.
+#[inline]
+fn im2col(out: &mut [f64], input: &[f64], g: &Geometry) {
+    let k = g.kernel_size;
+    let mut at = 0;
+    for out_row in 0..g.out_height {
+        for out_col in 0..g.out_width {
+            for c in 0..g.input_channels {
+                for kr in 0..k {
+                    let start = g.input_index(c, out_row, out_col, kr, 0);
+                    out[at..at + k].copy_from_slice(&input[start..start + k]);
+                    at += k;
+                }
+            }
+        }
+    }
+}
+
+/// The forward ops' threading: `examples(first, cols, a)` over all `n` examples at once, or, for a
+/// batch whose `flops` pay for threads (`matmul_thread_count`'s rule), over disjoint runs of whole
+/// examples, each with its own rows of `cols` (`cols_per` an example) and `A` (`a_per`).
+#[inline]
+fn by_examples(
+    n: usize,
+    flops: usize,
+    cols_per: usize,
+    a_per: usize,
+    cols: &mut [f64],
+    a: &mut [f64],
+    examples: impl Fn(usize, &mut [f64], &mut [f64]) + Sync,
+) {
+    let examples_per_thread = n.div_ceil(matmul_thread_count(n, flops)).max(1);
+    if examples_per_thread >= n {
+        examples(0, cols, a);
+        return;
+    }
+    let parts: Vec<(&mut [f64], &mut [f64])> = cols
+        .chunks_mut(examples_per_thread * cols_per)
+        .zip(a.chunks_mut(examples_per_thread * a_per))
+        .collect();
+    let threads = parts.len();
+    for_each_part(threads, parts, |chunk, (cols_out, a_out)| {
+        examples(chunk * examples_per_thread, cols_out, a_out)
+    });
 }
 
 /// `ConvArrayLayer._downstream`: per example, `dcols = D @ W`, `D` the example's deltas regrouped to

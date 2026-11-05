@@ -250,19 +250,47 @@ THREADED_CASES = [((28, 28, 1, 3, 8, 1), 256), ((13, 13, 8, 3, 32, 1), 32)]
 
 
 def test_the_threaded_cases_are_over_the_threading_threshold():
-    # the backward ops' products at these cases split across threads at the default
-    # threshold (8 threads allowed on any machine), so a threshold change can't silently drop them.
-    # The forward runs per example on one thread; its whole-batch product is checked too, as the
-    # size its cases were chosen for
+    # every op's product at these cases splits across threads at the default threshold (8
+    # threads allowed on any machine), so a threshold change can't silently drop them. The forward
+    # and the downstream split over whole examples, at the same flops
     set_matmul_threading(8, 0)
     try:
         for shape, n in THREADED_CASES:
             assert (shape, n) in FORWARD_EXTRA_CASES and (shape, n) in BACKWARD_EXTRA_CASES
             g = _geometry(shape)
             rows, channel_count = n * g.positions, shape[4]
-            assert matmul_threads_for(rows, g.fan_in, channel_count) == 8  # forward, whole batch
-            assert matmul_threads_for(n, g.positions * channel_count, g.fan_in) == 8  # downstream, over examples
+            assert matmul_threads_for(n, g.positions * channel_count, g.fan_in) == 8  # forward and downstream
             assert matmul_threads_for(channel_count, rows, g.fan_in) == 8  # accumulate
+    finally:
+        set_matmul_threading(0, 0)
+
+
+# (shape, N) for the forward ops' threads: THREADED_CASES, and the NES plan's first conv on its
+# tile input (13 x 16 cells, 32 one-hot channels, 16 kernels of 3) at its batch, 256, with N not
+# a multiple of most thread counts at 37
+FORWARD_THREAD_CASES = [*THREADED_CASES, ((13, 16, 32, 3, 16, 1), 256), ((13, 16, 32, 3, 16, 1), 37)]
+
+
+@pytest.mark.parametrize("shape, n", FORWARD_THREAD_CASES)
+def test_conv_forward_ops_give_the_same_bits_at_every_thread_count(shape, n):
+    # both forward ops split over whole examples (the NES plan's D11): at 1 to 8 threads, at the
+    # default threshold and at threshold 1 (every split taken), A and cols are the one-thread bits
+    W, b, _X, _delta = _random_case(5, shape)
+    g = _geometry(shape)
+    W, b = Array(W.tolist()), Array(b.tolist())
+    X = Array(np.random.default_rng(6).uniform(-1.0, 1.0, (n, g.input_size)).tolist())
+
+    def compute():
+        A, cols = conv_forward_batch(W, X, b, g)
+        A_linear, cols_linear = conv_linear_forward_batch(W, X, g)
+        return [A.tolist(), cols.tolist(), A_linear.tolist(), cols_linear.tolist()]
+
+    try:
+        set_matmul_threading(1, 2**62)
+        one_thread = compute()
+        for threads, threshold in itertools.product(range(1, 9), [0, 1]):
+            set_matmul_threading(threads, threshold)
+            assert compute() == one_thread, (threads, threshold)
     finally:
         set_matmul_threading(0, 0)
 

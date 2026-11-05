@@ -116,7 +116,7 @@ A product large enough to pay for it (8M flops or more today) runs on several th
 - **The pool** (`core/src/sys/pool.rs`) has no dependencies. Workers start on first use, only as many as a call can use, poll for 50 µs after a job, then sleep. A call wakes only the workers it needs, and works too; chunks are claimed from a counter. A chunk's panic reaches the caller. A call from inside a chunk, or beside another thread's call, runs inline. A forked child makes its own pool.
 - `set_matmul_threading(max_threads, threshold_flops)` overrides the budget and the threshold for tests and benchmarks.
 
-Not threaded yet: the tiled attention, the window program, conv's forward and the row-wise ops. indrajala-ml's parked crate performance workplan holds that work.
+Not threaded yet: the tiled attention, the window program and the row-wise ops. indrajala-ml's parked crate performance workplan holds that work. Conv's forward is threaded over whole examples, as its downstream is (the NES plan's D11, in indrajala-research).
 
 ## Same bits on every machine
 
