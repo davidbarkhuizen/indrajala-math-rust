@@ -1,3 +1,4 @@
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PySlice, PyTuple};
@@ -126,6 +127,29 @@ impl RustArray {
             return Err(PyValueError::new_err("every row must have the same length"));
         }
         Ok(RustArray::from_matrix(flat, n_rows, n_cols))
+    }
+
+    /// A 1D or 2D array copied from any C-contiguous float64 buffer (a numpy `float64` array, by
+    /// the buffer protocol): one memcpy, where `Array(...)` and `from_rows` read element by
+    /// element as Python floats (the NES plan's D13). Same values as `Array(x.tolist())`; any
+    /// other dtype, layout or number of dimensions is refused, never converted.
+    #[staticmethod]
+    fn from_buffer(py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let buffer = PyBuffer::<f64>::get(data)?;
+        if !buffer.is_c_contiguous() {
+            return Err(PyValueError::new_err("from_buffer needs a C-contiguous buffer"));
+        }
+        let shape = buffer.shape().to_vec();
+        let values = buffer.to_vec(py)?;
+        match shape[..] {
+            [_] => Ok(RustArray::from_vector(values)),
+            [rows, cols] if rows > 0 => Ok(RustArray::from_matrix(values, rows, cols)),
+            [_, _] => Err(PyValueError::new_err("cannot construct a 2D array from zero rows")),
+            _ => Err(PyValueError::new_err(format!(
+                "from_buffer takes 1 or 2 dimensions; got {}",
+                shape.len()
+            ))),
+        }
     }
 
     /// Row `i` of a 2D array as a new 1D array (a copy: this core has no views).
