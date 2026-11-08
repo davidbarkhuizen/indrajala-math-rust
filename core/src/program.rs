@@ -18,10 +18,19 @@
 //! The parameters come with each call, one flat list in the network's parameter order (D2): each
 //! op's in turn, then each factor's pooling query, cell `w`, `u`, `b`, codes (if snapped) and
 //! initial state (which the program doesn't read: the caller snaps the initial state).
+//!
+//! A window of array layers (indrajala-ml's array window workplan, D7) reads one observation a
+//! window, flat: conv, pool and flat dense ops (a flat dense layer is a token-wise one of one
+//! token), its StateInputs adding the state as one token, and a given loss's output op, whose delta
+//! is the caller's gradient at the window's outputs (`Deltas::Given`). Its poolings read `tokens`
+//! tokens (one), not `columns`. A training call may restart rows at given windows from the initial
+//! state's snap (`Restarts`).
 
 use crate::array::{Array, Shape};
 use crate::nn::attention;
 use crate::nn::attention::BLOCK;
+use crate::nn::conv;
+use crate::nn::conv::Geometry;
 use crate::nn::dense;
 use crate::nn::dense::affine_forward_batch;
 use crate::nn::norm::layer_norm;
@@ -103,6 +112,20 @@ pub enum Op {
         /// the drop probability
         p: f64,
     },
+    /// a ReLU conv layer, `conv::forward_batch`; parameters `W`, `b` (indrajala-ml's array window
+    /// workplan, D7)
+    Conv {
+        /// its input's and kernel's geometry
+        geometry: Geometry,
+    },
+    /// a max pool, `conv::max_pool_forward_batch` (`geometry.kernel_size` the pool's size)
+    MaxPool {
+        /// its input's and pool's geometry
+        geometry: Geometry,
+    },
+    /// a given loss's affine output layer, `dense::affine_forward_batch`; parameters `W`, `b`; its
+    /// delta the caller's gradient at the window's outputs (`Deltas::Given`)
+    GivenOutput,
 }
 
 impl Op {
@@ -111,8 +134,12 @@ impl Op {
         match self {
             Op::StateInput { scale: true, .. } => 2,
             Op::Embedding | Op::Position | Op::StateInput { .. } => 1,
-            Op::Fork | Op::Add | Op::Split | Op::Branch | Op::Merge | Op::Dropout { .. } => 0,
-            Op::LayerNorm { .. } | Op::TokenDense { .. } | Op::TokenOutput { .. } => 2,
+            Op::Fork | Op::Add | Op::Split | Op::Branch | Op::Merge | Op::Dropout { .. } | Op::MaxPool { .. } => 0,
+            Op::LayerNorm { .. }
+            | Op::TokenDense { .. }
+            | Op::TokenOutput { .. }
+            | Op::Conv { .. }
+            | Op::GivenOutput => 2,
             Op::Attention { .. } => 8,
         }
     }
@@ -140,6 +167,8 @@ impl Op {
 pub struct WindowProgram {
     ops: Vec<Op>,
     columns: usize,
+    /// the tokens the poolings read: `columns` for a token window, 1 for an array window
+    tokens: usize,
     /// the op whose input each factor's pooling reads
     reads: Vec<usize>,
     sizes: Vec<usize>,
@@ -175,6 +204,7 @@ impl WindowProgram {
     pub fn new(
         ops: Vec<Op>,
         columns: usize,
+        tokens: usize,
         reads: Reads,
         sizes: Vec<usize>,
         snapped: Vec<bool>,
@@ -193,10 +223,10 @@ impl WindowProgram {
                 sizes.len()
             )));
         }
-        if columns == 0 || sizes.is_empty() || sizes.len() != snapped.len() || sizes.contains(&0) {
+        if columns == 0 || tokens == 0 || sizes.is_empty() || sizes.len() != snapped.len() || sizes.contains(&0) {
             return Err(Error::invalid(format!(
-                "{context} requires columns >= 1 and one snapped flag per factor size, each size 1 or more, \
-                 got columns {columns}, sizes {sizes:?}, snapped {snapped:?}"
+                "{context} requires columns and tokens >= 1 and one snapped flag per factor size, each size 1 or \
+                 more, got columns {columns}, tokens {tokens}, sizes {sizes:?}, snapped {snapped:?}"
             )));
         }
         let mut adds = vec![0; ops.len()];
@@ -247,14 +277,22 @@ impl WindowProgram {
         let splits_branched = open
             .iter()
             .all(|block| !matches!(block, Open::Split(split) if branches[*split].is_empty()));
-        if !forks_closed || !splits_branched || !matches!(ops.last(), Some(Op::TokenOutput { .. })) {
+        let output_last = matches!(ops.last(), Some(Op::TokenOutput { .. } | Op::GivenOutput));
+        let output_once = ops
+            .iter()
+            .filter(|op| matches!(op, Op::TokenOutput { .. } | Op::GivenOutput))
+            .count()
+            == 1;
+        if !forks_closed || !splits_branched || !output_last || !output_once {
             return Err(Error::invalid(format!(
-                "{context} requires every fork closed by an add, every split with a branch and a token_output op last"
+                "{context} requires every fork closed by an add, every split with a branch and one output op, \
+                 token_output or given_output, last"
             )));
         }
         Ok(WindowProgram {
             ops,
             columns,
+            tokens,
             reads,
             sizes,
             snapped,
@@ -313,6 +351,14 @@ enum Cache {
     Film {
         gamma: Array,
     },
+    /// a conv layer's im2col columns
+    Conv {
+        cols: Array,
+    },
+    /// a max pool's chosen slots
+    MaxPool {
+        argmax: Array,
+    },
 }
 
 /// One window's forward pass, what its backward pass reads: each op's result (as the per-layer
@@ -341,6 +387,8 @@ impl WindowTape {
                 }
                 Cache::Dropout { mask } => mask.data.len(),
                 Cache::Film { gamma } => gamma.data.len(),
+                Cache::Conv { cols } => cols.data.len(),
+                Cache::MaxPool { argmax } => argmax.data.len(),
             })
             .sum();
         self.activations.iter().map(|a| a.data.len()).sum::<usize>() + caches + self.step.floats()
@@ -502,6 +550,17 @@ impl WindowProgram {
                     Some(token_rows(a, *tokens, p[0], p[1], forward)?)
                 }
                 Op::TokenOutput { tokens } => Some(token_rows(a, *tokens, p[0], p[1], softmax::forward_batch)?),
+                Op::Conv { geometry } => {
+                    let (out, cols) = conv::forward_batch(p[0], a, p[1], geometry)?;
+                    cache = Cache::Conv { cols };
+                    Some(out)
+                }
+                Op::MaxPool { geometry } => {
+                    let (out, argmax) = conv::max_pool_forward_batch(a, geometry)?;
+                    cache = Cache::MaxPool { argmax };
+                    Some(out)
+                }
+                Op::GivenOutput => Some(affine_forward_batch(p[0], a, p[1])?),
                 Op::Attention {
                     heads,
                     causal,
@@ -582,7 +641,7 @@ impl WindowProgram {
             &codes,
             temperatures,
             couplings,
-            self.columns,
+            self.tokens,
             self.cross,
             context,
         )?;
@@ -593,6 +652,23 @@ impl WindowProgram {
             )));
         }
         Ok(tape)
+    }
+
+    /// The factors' temperatures in a call, one a factor (None: every factor hard).
+    fn check_temperatures(
+        &self,
+        temperatures: Option<Vec<Option<f64>>>,
+        context: &str,
+    ) -> Result<Vec<Option<f64>>, Error> {
+        let temperatures = temperatures.unwrap_or_else(|| vec![None; self.sizes.len()]);
+        if temperatures.len() != self.sizes.len() {
+            return Err(Error::invalid(format!(
+                "{context} requires a temperature per factor, {} factors, got {}",
+                self.sizes.len(),
+                temperatures.len()
+            )));
+        }
+        Ok(temperatures)
     }
 
     /// The factors run continuous in a call, one flag a factor (None: none), each a snapped
@@ -727,7 +803,10 @@ pub type ProgramForward = (Array, Vec<Array>, Vec<Array>, Vec<Vec<Option<Vec<usi
 /// factor (None for a continuous factor). What isn't kept is an empty list. With `continuous`, a
 /// flag a factor, a flagged factor passes its cell's output on unsnapped (indrajala-ml's state
 /// formation workplan, the warm-up); with `couplings`, factor `g`'s next state `(1 - couplings[g])
-/// h + couplings[g] q` (the workplan's gradual handover; None, every 1).
+/// h + couplings[g] q` (the workplan's gradual handover; None, every 1). With `temperatures`, factor
+/// `g`'s codes are soft at `temperatures[g]` (None, or no `temperatures`, the snapped machine): with
+/// the continuous flags and couplings, a training step's reading (indrajala-ml's array window
+/// workplan, D6). With `restarts`, the rows they flag at a window start it from their initial state.
 #[allow(clippy::too_many_arguments)]
 pub fn forward(
     program: &WindowProgram,
@@ -738,25 +817,33 @@ pub fn forward(
     codes: bool,
     continuous: Option<Vec<bool>>,
     couplings: Option<Vec<f64>>,
+    temperatures: Option<Vec<Option<f64>>>,
+    restarts: Option<&Restarts>,
 ) -> Result<ProgramForward, Error> {
     let context = "window_program_forward";
     program.check_count(parameters.len(), "parameters", context)?;
     let split = program.split(parameters);
     let windows = program.check_input(x, c0, context)?;
     let (k, width) = (program.columns, windows * program.columns);
-    let hard = vec![None; program.sizes.len()]; // inference reads the snapped machine
-    let continuous = program.check_continuous(continuous, &hard, context)?;
+    let temperatures = program.check_temperatures(temperatures, context)?;
+    let continuous = program.check_continuous(continuous, &temperatures, context)?;
     let couplings = program.check_couplings(couplings, &continuous, context)?;
+    if let Some(restarts) = restarts {
+        restarts.check(c0, windows, context)?;
+    }
     let mut outputs = Vec::with_capacity(windows);
     let (mut kept_states, mut kept_cells, mut kept_indices) = (Vec::new(), Vec::new(), Vec::new());
     let mut c = c0.clone();
     for w in 0..windows {
+        if let Some(restarts) = restarts {
+            c = restarts.restarted(w, &c);
+        }
         let mut tape = program.window(
             columns(x, width, w * k, (w + 1) * k),
             &c,
             &split,
             None,
-            &hard,
+            &temperatures,
             &continuous,
             &couplings,
             context,
@@ -860,6 +947,14 @@ impl Backward<'_> {
                 Cache::Dropout { mask } => tokens::dropout_downstream(self.delta(j), mask, *drop)?,
                 _ => delta(),
             },
+            Op::Conv { geometry } => conv::downstream_batch(p[0], self.delta(j), geometry)?,
+            Op::MaxPool { geometry } => {
+                let Cache::MaxPool { argmax } = &self.tape.caches[j] else {
+                    unreachable!("a max pool's cache in training")
+                };
+                conv::max_pool_downstream_batch(self.delta(j), argmax, geometry)?
+            }
+            Op::GivenOutput => dense::downstream_batch(p[0], self.delta(j))?,
         })
     }
 }
@@ -876,7 +971,8 @@ fn step_gradients<'a>(gradients: &'a [&'a Array], factors: &[FactorAt]) -> [Vec<
 
 impl WindowProgram {
     /// One window's backward pass after its forward pass (its tape), from the next state's
-    /// gradient `dc_next` and its targets `y` `(N, k * classes)`, each duplicate code's state held
+    /// gradient `dc_next` and its targets `y` `(N, k * classes)` (a given output's: the given
+    /// gradient at the window's outputs, its delta as given), each duplicate code's state held
     /// to its representative's code by `consolidation`, as indrajala-ml's
     /// `WindowRecurrentShape._window_backward` runs it: each gradient accumulated onto its entry in
     /// `gradients`, and the window's state's gradient returned.
@@ -955,15 +1051,26 @@ impl WindowProgram {
             attention: (0..self.ops.len()).map(|_| None).collect(),
             state_inputs: (0..self.ops.len()).map(|_| None).collect(),
         };
-        // the output layer's delta, (P - Y) / T, then times 1 / W
-        let Op::TokenOutput { tokens } = self.ops[last] else {
-            return Err(Error::invalid(format!(
-                "{context}: a window ends in its token_output op"
-            )));
+        // the output layer's delta: a token-wise softmax's (P - Y) / T, then times 1 / W; a given
+        // output's, the given gradient as it is (indrajala-ml's array window workplan, D4)
+        let delta = match self.ops[last] {
+            Op::TokenOutput { tokens } => {
+                let a = tape.output();
+                let difference = a.combine_with_array(y, |p, t| p - t, "subtract")?;
+                scaled(&scaled(&difference, |v| v / tokens as f64), |v| v * weight)
+            }
+            Op::GivenOutput => {
+                if y.shape != tape.output().shape {
+                    return Err(Error::invalid(format!(
+                        "{context}: a window's given gradient is its outputs' shape, {:?}, got {:?}",
+                        tape.output().shape,
+                        y.shape
+                    )));
+                }
+                y.clone()
+            }
+            _ => return Err(Error::invalid(format!("{context}: a window ends in its output op"))),
         };
-        let a = tape.output();
-        let difference = a.combine_with_array(y, |p, t| p - t, "subtract")?;
-        let delta = scaled(&scaled(&difference, |v| v / tokens as f64), |v| v * weight);
         back.deltas[last] = Some(delta);
         // the hidden ops' deltas, last first; each factor's pooling's gradient joins the downstream
         // the op before the one it reads reads (those reading one op summed in factor order first);
@@ -993,7 +1100,7 @@ impl WindowProgram {
             };
             let p = &parameters[offsets[i]..];
             match &self.ops[i] {
-                Op::TokenDense { relu: true, .. } => {
+                Op::TokenDense { relu: true, .. } | Op::Conv { .. } => {
                     d = mask::activation(&d, &tape.activations[tape.outputs[i]], Activation::Relu)?;
                 }
                 Op::Attention {
@@ -1086,6 +1193,26 @@ impl WindowProgram {
                     gradients[at] = gg;
                     gradients[at + 1] = gbeta;
                 }
+                Op::Conv { geometry } => {
+                    let Cache::Conv { cols } = &tape.caches[i] else {
+                        unreachable!("a conv layer's cache in training")
+                    };
+                    let (gw, gbias) = conv::accumulate_gradient_batch(
+                        back.delta(i),
+                        cols,
+                        &gradients[at],
+                        &gradients[at + 1],
+                        geometry,
+                    )?;
+                    gradients[at] = gw;
+                    gradients[at + 1] = gbias;
+                }
+                Op::GivenOutput => {
+                    let (gw, gbias) =
+                        dense::accumulate_gradient_batch(back.delta(i), input, &gradients[at], &gradients[at + 1])?;
+                    gradients[at] = gw;
+                    gradients[at + 1] = gbias;
+                }
                 Op::TokenDense { tokens, .. } | Op::TokenOutput { tokens } => {
                     let (size, input_size) = matrix_shape(parameters[at], "a token-wise layer's w", context)?;
                     let (_, rows) = token_shape(back.delta(i), *tokens, size)?;
@@ -1125,7 +1252,7 @@ impl WindowProgram {
                         *slot = value;
                     }
                 }
-                Op::Fork | Op::Add | Op::Split | Op::Branch | Op::Merge | Op::Dropout { .. } => {}
+                Op::Fork | Op::Add | Op::Split | Op::Branch | Op::Merge | Op::Dropout { .. } | Op::MaxPool { .. } => {}
             }
         }
         // the state's gradient: the step's, then each StateInput's, in the ops' order
@@ -1143,6 +1270,71 @@ fn scaled(a: &Array, f: impl Fn(f64) -> f64) -> Array {
         data: a.data.iter().map(|&v| f(v)).collect(),
         shape: a.shape,
     }
+}
+
+/// What a training call's output deltas come from: each window's targets, `(N, W * k * classes)`
+/// for a token-wise softmax output, or (a given loss's output, indrajala-ml's array window workplan,
+/// D4) a function of every window's outputs side by side, `(N, W * outputs)`, giving the loss's
+/// gradient at them, called once, after the forward pass and before the backward pass.
+pub enum Deltas<'a> {
+    /// each window's targets
+    Targets(&'a Array),
+    /// the given loss's gradient, from the outputs
+    Given(&'a mut dyn FnMut(&Array) -> Result<Array, Error>),
+}
+
+/// A call's rows that start again (indrajala-ml's array window workplan, D5): at window `w`, row
+/// `i`'s state is `first`'s row `i` (the initial state's snap) wherever `starts[w][i]`, whatever
+/// came before.
+pub struct Restarts {
+    /// the initial state's snap, `(N, S)`
+    pub first: Array,
+    /// a flag per window, then per row
+    pub starts: Vec<Vec<bool>>,
+}
+
+impl Restarts {
+    fn check(&self, c0: &Array, windows: usize, context: &str) -> Result<(), Error> {
+        let rows = match c0.shape {
+            Shape::Matrix(rows, _) => rows,
+            Shape::Vector(_) => 0,
+        };
+        if self.first.shape != c0.shape || self.starts.len() != windows || self.starts.iter().any(|s| s.len() != rows) {
+            return Err(Error::invalid(format!(
+                "{context} restarts rows from an initial state of c0's shape {:?}, a flag per row and window, \
+                 {windows} windows of {rows}, got first {:?} and {} windows",
+                c0.shape,
+                self.first.shape,
+                self.starts.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether any row starts again at window `w`.
+    fn any(&self, w: usize) -> bool {
+        self.starts[w].contains(&true)
+    }
+
+    /// `c` with the rows starting again at window `w` from `first`.
+    fn restarted(&self, w: usize, c: &Array) -> Array {
+        if self.any(w) {
+            select_rows(&self.starts[w], &self.first, c)
+        } else {
+            c.clone()
+        }
+    }
+}
+
+/// Each row `a`'s where `mask` is true, else `b`'s: copies only (the backends' `select_rows`).
+fn select_rows(mask: &[bool], a: &Array, b: &Array) -> Array {
+    let width = a.data.len() / mask.len().max(1);
+    let mut data = Vec::with_capacity(b.data.len());
+    for (i, &m) in mask.iter().enumerate() {
+        let source = if m { a } else { b };
+        data.extend_from_slice(&source.data[i * width..(i + 1) * width]);
+    }
+    Array { data, shape: b.shape }
 }
 
 /// The default bound on what a training call keeps of its windows' forward passes (D5): 2 GiB.
@@ -1167,12 +1359,16 @@ pub const MEMORY_BUDGET: usize = 2 << 30;
 /// path's gradient `couplings[g] dq` (its codes' losses whole), the cell's `(1 - couplings[g]) dq`
 /// (the workplan's gradual handover; None, every 1). With `straight`, a soft factor's gradient is
 /// straight through (`soft_codes_backward`'s; the workplan's D51). Refused before the windows past the first run when what they keep would pass `memory_budget`
-/// bytes.
+/// bytes. The deltas come from `deltas`: the targets, or a given loss's gradient (`Deltas`). With
+/// `restarts`, the rows they flag at a window start it from their initial state, and their state's
+/// gradient there goes to the second result, summed from the last restart back (None without
+/// any): with the first result, the state's gradient before the first window, the caller takes the
+/// initial state's (indrajala-ml's array window workplan, D5).
 #[allow(clippy::too_many_arguments)]
 pub fn learn(
     program: &WindowProgram,
     x: &Array,
-    y: &Array,
+    deltas: Deltas<'_>,
     parameters: &[&Array],
     gradients: &mut [&mut Array],
     c0: &Array,
@@ -1185,16 +1381,10 @@ pub fn learn(
     continuous: Option<Vec<bool>>,
     couplings: Option<Vec<f64>>,
     straight: bool,
-) -> Result<Array, Error> {
+    restarts: Option<&Restarts>,
+) -> Result<(Array, Option<Array>), Error> {
     let context = "window_program_learn";
-    let temperatures = temperatures.unwrap_or_else(|| vec![None; program.sizes.len()]);
-    if temperatures.len() != program.sizes.len() {
-        return Err(Error::invalid(format!(
-            "{context} requires a temperature per factor, {} factors, got {}",
-            program.sizes.len(),
-            temperatures.len()
-        )));
-    }
+    let temperatures = program.check_temperatures(temperatures, context)?;
     let continuous = program.check_continuous(continuous, &temperatures, context)?;
     if continuous.contains(&true) && !consolidation.is_empty() {
         return Err(Error::invalid(format!(
@@ -1219,14 +1409,15 @@ pub fn learn(
     let windows = program.check_input(x, c0, context)?;
     let (k, width) = (program.columns, windows * program.columns);
     let (rows, _) = matrix_shape(x, "x", context)?;
-    let (y_rows, targets) = matrix_shape(y, "y", context)?;
-    if y_rows != rows || targets % windows != 0 {
+    let given = matches!(program.ops.last(), Some(Op::GivenOutput));
+    if given != matches!(deltas, Deltas::Given(_)) {
         return Err(Error::invalid(format!(
-            "{context} requires y of one row an example and whole windows of targets, got {:?}",
-            y.shape
+            "{context}: a given_output op learns from a given gradient, a token_output op from targets"
         )));
     }
-    let per_window = targets / windows;
+    if let Some(restarts) = restarts {
+        restarts.check(c0, windows, context)?;
+    }
     let split = program.split(parameters);
     let consolidation = Consolidation::new(consolidation, &split.codes, context)?;
 
@@ -1234,6 +1425,9 @@ pub fn learn(
     let mut states = Vec::with_capacity(windows);
     let mut c = c0.clone();
     for w in 0..windows {
+        if let Some(restarts) = restarts {
+            c = restarts.restarted(w, &c);
+        }
         let tape = program.window(
             columns(x, width, w * k, (w + 1) * k),
             &c,
@@ -1257,6 +1451,31 @@ pub fn learn(
         states.push(std::mem::replace(&mut c, next));
         tapes.push(tape);
     }
+    // the deltas' source: the targets, or the given gradient at every window's outputs
+    let given_gradient;
+    let y = match deltas {
+        Deltas::Targets(y) => y,
+        Deltas::Given(gradient) => {
+            let outputs: Vec<&Array> = tapes.iter().map(WindowTape::output).collect();
+            let joined = join_columns(&outputs, context)?;
+            given_gradient = gradient(&joined)?;
+            if given_gradient.shape != joined.shape {
+                return Err(Error::invalid(format!(
+                    "{context}: the given gradient is the outputs' shape, {:?}, got {:?}",
+                    joined.shape, given_gradient.shape
+                )));
+            }
+            &given_gradient
+        }
+    };
+    let (y_rows, targets) = matrix_shape(y, "y", context)?;
+    if y_rows != rows || targets % windows != 0 {
+        return Err(Error::invalid(format!(
+            "{context} requires y of one row an example and whole windows of targets, got {:?}",
+            y.shape
+        )));
+    }
+    let per_window = targets / windows;
 
     // every gradient taken out of its array for the pass and put back, whatever its result
     let mut owned: Vec<Array> = gradients
@@ -1264,7 +1483,9 @@ pub fn learn(
         .map(|g| std::mem::replace(&mut **g, Array::from_vector(Vec::new())))
         .collect();
     let total: usize = program.sizes.iter().sum();
-    let mut dc = Array::from_matrix(vec![0.0; rows * total], rows, total);
+    let zeros = Array::from_matrix(vec![0.0; rows * total], rows, total);
+    let mut dc = zeros.clone();
+    let mut reset: Option<Array> = None;
     let mut outcome = Ok(());
     for w in (0..windows).rev() {
         let yw = columns(y, targets, w * per_window, (w + 1) * per_window);
@@ -1287,11 +1508,27 @@ pub fn learn(
                 break;
             }
         }
+        if let Some(restarts) = restarts.filter(|r| r.any(w)) {
+            // the restarting rows' state gradient to the initial state's, the rest on back
+            let restarted = select_rows(&restarts.starts[w], &dc, &zeros);
+            let summed = match reset.take() {
+                None => Ok(restarted),
+                Some(sum) => sum.combine_with_array(&restarted, |x, y| x + y, "add"),
+            };
+            match summed {
+                Ok(sum) => reset = Some(sum),
+                Err(error) => {
+                    outcome = Err(error);
+                    break;
+                }
+            }
+            dc = select_rows(&restarts.starts[w], &zeros, &dc);
+        }
     }
     for (g, value) in gradients.iter_mut().zip(owned) {
         **g = value;
     }
-    outcome.map(|()| dc)
+    outcome.map(|()| (dc, reset))
 }
 
 /// Each row's runs of `classes` values, each run's index of its largest, the first of equal

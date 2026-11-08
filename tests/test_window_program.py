@@ -21,6 +21,7 @@ from array_helpers import bits
 
 from indrajala_math_rust import (
     Array,
+    ConvGeometry,
     Generator,
     WindowProgram,
     affine_forward_batch,
@@ -30,6 +31,9 @@ from indrajala_math_rust import (
     attention_downstream_batch,
     attention_forward_batch,
     concatenate_columns,
+    conv_accumulate_gradient_batch,
+    conv_downstream_batch,
+    conv_forward_batch,
     default_rng,
     embedding_accumulate_gradient,
     embedding_forward,
@@ -41,6 +45,8 @@ from indrajala_math_rust import (
     layer_norm_forward_batch,
     layer_softmax_forward_batch,
     matmul_threads_for,
+    max_pool_downstream_batch,
+    max_pool_forward_batch,
     recurrence_step_backward,
     recurrence_step_forward,
     state_input_backward,
@@ -114,6 +120,7 @@ class Window:
         self.parameters: list[list[Array]] = [[_random(self.rng, vocabulary, features)]]
         self.split_features = features
         self.ends: list[int] = []  # each branch op's index: the factors' reads
+        self.pooled = tokens  # the tokens the poolings read (an array window's 1)
 
     def add(self, op: Op, *parameters: Array) -> Window:
         self.ops.append(op)
@@ -178,6 +185,57 @@ class Window:
         return [array for arrays in self.parameters for array in arrays]
 
 
+class ArrayWindow(Window):
+    """
+    A window of array layers (indrajala-ml's array window workplan, D7): conv, pool and flat dense
+    layers over one observation of height x width x channels values a window, its state entering
+    as one token, and a given loss's output layer.
+    """
+
+    def __init__(self, height: int, width: int, channels: int, seed: int) -> None:
+        self.tokens = height * width * channels  # a window's columns: the observation's values
+        self.vocabulary = 0
+        self.rng = np.random.default_rng(seed)
+        self.ops = []
+        self.parameters = []
+        self.ends = []
+        self.pooled = 1
+        self.image = (height, width, channels)
+        self.features = self.tokens
+
+    def conv(self, kernel: int, channels: int, stride: int = 1) -> ArrayWindow:
+        height, width, inputs = self.image
+        geometry = ConvGeometry(height, width, inputs, kernel, stride)
+        self.image = (geometry.out_height, geometry.out_width, channels)
+        self.features = channels * geometry.positions
+        self.add(("conv", geometry), _random(self.rng, channels, geometry.fan_in), _random(self.rng, channels))
+        return self
+
+    def max_pool(self, size: int) -> ArrayWindow:
+        height, width, channels = self.image
+        geometry = ConvGeometry(height, width, channels, size, size)
+        self.image = (geometry.out_height, geometry.out_width, channels)
+        self.features = channels * geometry.positions
+        self.add(("max_pool", geometry))
+        return self
+
+    def state_input(self, state_size: int) -> ArrayWindow:
+        self.add(("state_input", 1), _random(self.rng, self.features, state_size))
+        return self
+
+    def flat_dense(self, size: int, activation: str) -> ArrayWindow:
+        W, b = _random(self.rng, size, self.features), _random(self.rng, size)
+        self.features = size
+        self.add(("token_dense", 1, activation), W, b)
+        return self
+
+    def given_output(self, outputs: int) -> ArrayWindow:
+        W, b = _random(self.rng, outputs, self.features), _random(self.rng, outputs)
+        self.features = outputs
+        self.add(("given_output",), W, b)
+        return self
+
+
 class Recurrence:
     """Each factor's pooling query, cell and codes, and initial state, in the network's order."""
 
@@ -205,14 +263,34 @@ class Recurrence:
         ]
 
 
-def _per_layer(window: Window, recurrence: Recurrence, reads: Reads, X: Array, C0: Array, couplings=None):
-    # the per-layer path: indrajala-ml's forward_windows, its layers' crate calls one by one
+def _restarted(starts: list[list[bool]] | None, w: int, first: Array | None, C: Array) -> Array:
+    # the rows starting again at window w from first, the backends' select_rows by hand
+    if starts is None or not any(row[w] for row in starts):
+        return C
+    assert first is not None
+    A, B = first.tolist(), C.tolist()
+    return Array([(A if row[w] else B)[i] for i, row in enumerate(starts)])
+
+
+def _per_layer(
+    window: Window,
+    recurrence: Recurrence,
+    reads: Reads,
+    X: Array,
+    C0: Array,
+    couplings=None,
+    temperatures=None,
+    starts=None,
+    first=None,
+):
+    # the per-layer path: indrajala-ml's forward_windows (or run_steps), its layers' crate calls one by one
     k = window.tokens
     windows = X.shape[1] // k
     each = _each(reads, len(recurrence.sizes))
     C = C0
     outputs, states, cells, indices = [], [], [], []
     for w in range(windows):
+        C = _restarted(starts, w, first, C)
         a = X[:, w * k : (w + 1) * k]
         forks: list[Array] = []
         splits: list[Array] = []
@@ -259,6 +337,12 @@ def _per_layer(window: Window, recurrence: Recurrence, reads: Reads, X: Array, C
                 n, tokens = a.shape[0], op[1]
                 rows = forward(W, a.reshape((n * tokens, W.shape[1])), b)
                 a = rows.reshape((n, tokens * W.shape[0]))
+            elif kind == "conv":
+                a = conv_forward_batch(parameters[0], a, parameters[1], op[1])[0]
+            elif kind == "max_pool":
+                a = max_pool_forward_batch(a, op[1])[0]
+            elif kind == "given_output":
+                a = affine_forward_batch(parameters[0], a, parameters[1])
             elif kind == "attention":
                 _, heads, causal, dropout, cos, sin = op
                 table = {} if cos is None else {"cos": cos, "sin": sin}
@@ -283,9 +367,10 @@ def _per_layer(window: Window, recurrence: Recurrence, reads: Reads, X: Array, C
             recurrence.U,
             recurrence.b,
             recurrence.E,
-            k,
+            window.pooled,
             cross=recurrence.cross,
             couplings=couplings,
+            temperatures=temperatures,
         )
         outputs.append(a)
         states.append(step.state)
@@ -540,6 +625,12 @@ def _forward_training(window: Window, read_at: list[int], a: Array, C: Array, rn
             )
             n, tokens = a.shape[0], op[1]
             a = forward(W, a.reshape((n * tokens, W.shape[1])), b).reshape((n, tokens * W.shape[0]))
+        elif kind == "conv":
+            a, cache = conv_forward_batch(parameters[0], a, parameters[1], op[1])
+        elif kind == "max_pool":
+            a, cache = max_pool_forward_batch(a, op[1])
+        elif kind == "given_output":
+            a = affine_forward_batch(parameters[0], a, parameters[1])
         elif kind == "attention":
             _, heads, causal, dropout, cos, sin = op
             table = {} if cos is None else {"cos": cos, "sin": sin}
@@ -576,22 +667,26 @@ def _learn_per_layer(
     temperatures=None,
     couplings=None,
     straight=False,
+    starts=None,
+    first=None,
 ):
+    # Y: the targets, or a given loss's gradient as a function of the outputs (an array window's)
     k, ops, L = window.tokens, window.ops, len(window.ops)
     read_at = _each(reads, len(recurrence.sizes))
     windows = X.shape[1] // k
     weight = 1.0 / windows
-    width = Y.shape[1] // windows
     grads = [[_zeros(p) for p in ps] for ps in window.parameters]
     g_parts = {name: [_zeros(a) for a in getattr(recurrence, name)] for name in ("q", "W", "U", "b")}
     g_codes = [None if e is None else _zeros(e) for e in recurrence.E]
     commitments = [0.25 if e is not None else 0.0 for e in recurrence.E]
     representatives = {tuple(d): tuple(r) for d, r in consolidation}
-    states, generators, C = [], [], C0
+    states, generators, C, outputs = [], [], C0, []
     for w in range(windows):
+        C = _restarted(starts, w, first, C)
         states.append(C)
         generators.append(rng.state)
-        _, _, _, read = _forward_training(window, read_at, X[:, w * k : (w + 1) * k], C, rng)
+        _, results, _, read = _forward_training(window, read_at, X[:, w * k : (w + 1) * k], C, rng)
+        outputs.append(results[-1])
         C = recurrence_step_forward(
             read,
             C,
@@ -600,13 +695,17 @@ def _learn_per_layer(
             recurrence.U,
             recurrence.b,
             recurrence.E,
-            k,
+            window.pooled,
             cross=recurrence.cross,
             temperatures=temperatures,
             couplings=couplings,
         ).state
     after = rng.state
-    dC = Array.zeros((X.shape[0], sum(recurrence.sizes)))
+    if callable(Y):
+        Y = Y(concatenate_columns(outputs))
+    width = Y.shape[1] // windows
+    zeros = Array.zeros((X.shape[0], sum(recurrence.sizes)))
+    dC, reset = zeros, None
     adds: dict[int, int] = {}
     branches: dict[int, list[int]] = {}
     merged: dict[int, int] = {}  # each merged branch op's merge
@@ -633,7 +732,7 @@ def _learn_per_layer(
             recurrence.U,
             recurrence.b,
             recurrence.E,
-            k,
+            window.pooled,
             cross=recurrence.cross,
             temperatures=temperatures,
             couplings=couplings,
@@ -660,7 +759,10 @@ def _learn_per_layer(
         attention_back: dict[int, tuple[Array, Array, Array, Array]] = {}
         # a StateInput's (state delta, P's gradient), then a FiLM one's G's gradient and input delta
         state_back: dict[int, tuple[Array, ...]] = {}
-        deltas[-1] = ((results[-1] - Y[:, w * width : (w + 1) * width]) / ops[-1][1]) * weight
+        if ops[-1][0] == "given_output":
+            deltas[-1] = Y[:, w * width : (w + 1) * width]
+        else:
+            deltas[-1] = ((results[-1] - Y[:, w * width : (w + 1) * width]) / ops[-1][1]) * weight
 
         def downstream(
             j: int, deltas=deltas, caches=caches, attention_back=attention_back, state_back=state_back
@@ -687,6 +789,12 @@ def _learn_per_layer(
                 return rows.reshape((n, tokens * W.shape[1]))
             if kind == "attention":
                 return attention_back[j][0]
+            if kind == "conv":
+                return conv_downstream_batch(ps[0], delta, ops[j][1])
+            if kind == "max_pool":
+                return max_pool_downstream_batch(delta, caches[j], ops[j][1])
+            if kind == "given_output":
+                return layer_downstream_batch(ps[0], delta)
             assert kind == "dropout"
             return token_dropout_downstream(delta, caches[j], ops[j][1])
 
@@ -716,7 +824,7 @@ def _learn_per_layer(
                 d = downstream(i + 1)
                 if pooling is not None:
                     d = d + pooling
-            if kind == "token_dense" and ops[i][2] == "relu":
+            if (kind == "token_dense" and ops[i][2] == "relu") or kind == "conv":
                 d = array_relu_mask(d, results[i])
             elif kind == "attention":
                 _, heads, causal, dropout, cos, sin = ops[i]
@@ -770,12 +878,22 @@ def _learn_per_layer(
                         delta.reshape((n * tokens, W.shape[0])), x.reshape((n * tokens, W.shape[1])), *grads[i]
                     )
                 )
+            elif kind == "conv":
+                gW, gb = grads[i]
+                grads[i] = list(conv_accumulate_gradient_batch(delta, caches[i], gW, gb, op[1]))
+            elif kind == "given_output":
+                grads[i] = list(layer_accumulate_gradient_batch(delta, x, *grads[i]))
             elif kind == "attention":
                 _, dq, dk, dv = attention_back[i]
                 grads[i] = list(attention_accumulate_gradient_batch(delta, x, caches[i][3], dq, dk, dv, *grads[i]))
         dC = dC_w
         for i in sorted(state_back):
             dC = dC + state_back[i][0]
+        if starts is not None and any(row[w] for row in starts):
+            mask = [row[w] for row in starts]
+            restarted = _restarted(starts, w, dC, zeros)
+            reset = restarted if reset is None else reset + restarted
+            dC = _restarted([[not m] for m in mask], 0, dC, zeros)
     rng.state = after
     parts = [
         array
@@ -790,7 +908,7 @@ def _learn_per_layer(
         )
         if array is not None
     ]
-    return [array for arrays in grads for array in arrays] + parts, dC
+    return [array for arrays in grads for array in arrays] + parts, dC, reset
 
 
 def _check_learn(
@@ -819,7 +937,7 @@ def _check_learn(
     gradients = [_zeros(p) for p in parameters]
     commitments = [0.25 if e is not None else 0.0 for e in recurrence.E]
     rng_program, rng_per_layer = default_rng(seed), default_rng(seed)
-    dC = window_program_learn(
+    dC, _ = window_program_learn(
         program,
         X,
         Y,
@@ -834,7 +952,7 @@ def _check_learn(
         couplings=couplings,
         straight=straight,
     )
-    expected, expected_dC = _learn_per_layer(
+    expected, expected_dC, _ = _learn_per_layer(
         window, recurrence, reads, X, Y, C0, rng_per_layer, consolidation, temperatures, couplings, straight
     )
     assert len(gradients) == len(expected)
@@ -938,7 +1056,7 @@ def test_straight_leaves_a_hard_training_step_as_it_was_by_bits():
     results = []
     for straight in (False, True):
         gradients = [_zeros(p) for p in parameters]
-        dC = window_program_learn(
+        dC, _ = window_program_learn(
             program, X, Y, parameters, gradients, C0, default_rng(40), 1.0 / 3, [0.25, 0.25], straight=straight
         )
         results.append([dC, *gradients])
@@ -1278,10 +1396,10 @@ def test_a_continuous_call_is_the_program_without_the_flagged_factors_codes(fact
     marked = [Array(np.full(p.shape, 7.0).tolist()) if id(p) in dropped else g for p, g in zip(a, ga, strict=True)]
     commitments = [0.25 if e is not None else 0.0 for e in recurrence.E]
     plain_commitments = [0.25 if e is not None else 0.0 for e in plain.E]
-    dc_a = window_program_learn(
+    dc_a, _ = window_program_learn(
         snapped, X, Y, a, marked, C0, default_rng(24), 1.0 / windows, commitments, continuous=free
     )
-    dc_b = window_program_learn(continuous, X, Y, b, gb, C0, default_rng(24), 1.0 / windows, plain_commitments)
+    dc_b, _ = window_program_learn(continuous, X, Y, b, gb, C0, default_rng(24), 1.0 / windows, plain_commitments)
     _assert_bits(dc_a, dc_b)
     kept = iter(gb)
     for p, g in zip(a, marked, strict=True):
@@ -1323,3 +1441,215 @@ def test_a_continuous_call_refuses_a_malformed_flag(free, temperatures, message:
             temperatures=temperatures,
             continuous=free,
         )
+
+
+# windows of array layers (indrajala-ml's array window workplan, D7): conv, pool, flat dense and a
+# given output; restarts from the initial state; the given gradient
+
+
+def _policy(state_size: int, seed: int) -> ArrayWindow:
+    # the machine policy's body in small: conv, conv, pool, conv, the state, a relu, the given output
+    return (
+        ArrayWindow(9, 10, 2, seed)
+        .conv(1, 4)
+        .conv(3, 4)
+        .max_pool(2)
+        .conv(2, 5)
+        .state_input(state_size)
+        .flat_dense(8, "relu")
+        .given_output(3)
+    )
+
+
+def _array_inputs(window: ArrayWindow, recurrence: Recurrence, n: int, windows: int, seed: int):
+    rng = np.random.default_rng(seed)
+    X = _random(rng, n, windows * window.tokens)
+    C0 = _random(rng, n, sum(recurrence.sizes))
+    first = _random(rng, n, sum(recurrence.sizes))
+    starts = rng.random((n, windows)) < 0.3
+    starts[0, windows - 1] = True  # at least one restart
+    return X, C0, first, starts.tolist()
+
+
+def _array_program(window: ArrayWindow, recurrence: Recurrence, reads: Reads) -> WindowProgram:
+    return WindowProgram(
+        window.ops, window.tokens, reads, recurrence.sizes, recurrence.snapped, cross=recurrence.cross, tokens=1
+    )
+
+
+ARRAY_RECURRENCES = {
+    "one factor": ([(4, 6)], False, None, None),
+    "soft and coupled": ([(3, 5), (2, 4)], False, [0.7, None], [0.5, 1.0]),
+    "continuous, crossed": ([(3, 5), (2, None)], True, None, None),
+}
+
+
+@pytest.mark.parametrize("n", [3, 64])
+@pytest.mark.parametrize("reads_output", [True, False])
+@pytest.mark.parametrize("name", ARRAY_RECURRENCES)
+def test_an_array_window_is_the_per_layer_path_with_restarts(name: str, reads_output: bool, n: int):
+    factors, cross, temperatures, couplings = ARRAY_RECURRENCES[name]
+    window = _policy(sum(s for s, _ in factors), seed=1)
+    recurrence = Recurrence(8 if reads_output else 5 * 6, factors, cross, seed=2)
+    reads = len(window.ops) - 1 if reads_output else 4  # the output layer's input, or the StateInput's
+    X, C0, first, starts = _array_inputs(window, recurrence, n, 3, seed=3)
+    program = _array_program(window, recurrence, reads)
+    parameters = [*window.flat(), *recurrence.flat()]
+    for restart in (False, True):
+        kept = {"starts": starts, "first": first} if restart else {}
+        outputs, states, cells, indices = window_program_forward(
+            program,
+            X,
+            parameters,
+            C0,
+            states=True,
+            codes=True,
+            temperatures=temperatures,
+            couplings=couplings,
+            **kept,
+        )
+        expected = _per_layer(
+            window, recurrence, reads, X, C0, couplings, temperatures, starts if restart else None, first
+        )
+        _assert_bits(outputs, expected[0])
+        for actual, wanted in zip([*states, *cells], [*expected[1], *expected[2]], strict=True):
+            _assert_bits(actual, wanted)
+        assert indices == expected[3]
+
+
+def _given(seed: int) -> Any:
+    # a given loss's gradient at the outputs, a fixed function of them, recording what it saw
+    seen: list[Array] = []
+
+    def gradient(outputs: Array) -> Array:
+        seen.append(outputs)
+        G = np.random.default_rng(seed).normal(size=outputs.shape)
+        return Array((G * np.array(outputs.tolist())).tolist())
+
+    gradient.seen = seen  # type: ignore[attr-defined]
+    return gradient
+
+
+@pytest.mark.parametrize("n", [3, 64])
+@pytest.mark.parametrize("reads_output", [True, False])
+@pytest.mark.parametrize("name", ARRAY_RECURRENCES)
+def test_an_array_windows_training_step_from_a_given_gradient_is_the_per_layer_path(
+    name: str, reads_output: bool, n: int
+):
+    factors, cross, temperatures, couplings = ARRAY_RECURRENCES[name]
+    window = _policy(sum(s for s, _ in factors), seed=4)
+    recurrence = Recurrence(8 if reads_output else 5 * 6, factors, cross, seed=5)
+    reads = len(window.ops) - 1 if reads_output else 4
+    windows = 3
+    X, C0, first, starts = _array_inputs(window, recurrence, n, windows, seed=6)
+    program = _array_program(window, recurrence, reads)
+    parameters = [*window.flat(), *recurrence.flat()]
+    commitments = [0.25 if e is not None else 0.0 for e in recurrence.E]
+    for restart in (False, True):
+        kept = {"starts": starts, "first": first} if restart else {}
+        gradients = [_zeros(p) for p in parameters]
+        given, expected_given = _given(7), _given(7)
+        rng_program, rng_per_layer = default_rng(8), default_rng(8)
+        dC, reset = window_program_learn(
+            program,
+            X,
+            given,
+            parameters,
+            gradients,
+            C0,
+            rng_program,
+            1.0 / windows,
+            commitments,
+            temperatures=temperatures,
+            couplings=couplings,
+            **kept,
+        )
+        expected, expected_dC, expected_reset = _learn_per_layer(
+            window,
+            recurrence,
+            reads,
+            X,
+            expected_given,
+            C0,
+            rng_per_layer,
+            temperatures=temperatures,
+            couplings=couplings,
+            starts=starts if restart else None,
+            first=first,
+        )
+        assert len(given.seen) == 1
+        _assert_bits(given.seen[0], expected_given.seen[0])
+        for actual, wanted in zip(gradients, expected, strict=True):
+            _assert_bits(actual, wanted)
+        _assert_bits(dC, expected_dC)
+        if restart:
+            assert reset is not None and expected_reset is not None
+            _assert_bits(reset, expected_reset)
+        else:
+            assert reset is None
+        assert rng_program.state == rng_per_layer.state
+
+
+def test_the_given_outputs_are_the_training_readings_forward_pass_by_bits():
+    window = _policy(5, seed=9)
+    recurrence = Recurrence(8, [(3, 5), (2, 4)], False, seed=10)
+    X, C0, first, starts = _array_inputs(window, recurrence, 4, 3, seed=11)
+    program = _array_program(window, recurrence, len(window.ops) - 1)
+    parameters = [*window.flat(), *recurrence.flat()]
+    reading = {"temperatures": [0.6, None], "couplings": [0.5, 1.0], "starts": starts, "first": first}
+    given = _given(12)
+    window_program_learn(
+        program,
+        X,
+        given,
+        parameters,
+        [_zeros(p) for p in parameters],
+        C0,
+        default_rng(1),
+        1.0 / 3,
+        [0.25, 0.25],
+        **reading,
+    )
+    _assert_bits(given.seen[0], window_program_forward(program, X, parameters, C0, **reading)[0])
+
+
+def test_an_array_training_step_raises_what_its_given_gradient_raises_and_refuses_a_wrong_shape():
+    window = _policy(4, seed=13)
+    recurrence = Recurrence(8, [(4, 6)], False, seed=14)
+    X, C0, _, _ = _array_inputs(window, recurrence, 3, 2, seed=15)
+    program = _array_program(window, recurrence, len(window.ops) - 1)
+    parameters = [*window.flat(), *recurrence.flat()]
+    gradients = [_zeros(p) for p in parameters]
+    before = [bits(g) for g in gradients]
+
+    def learn(y: Any, **kept: Any) -> Any:
+        return window_program_learn(program, X, y, parameters, gradients, C0, default_rng(1), 0.5, [0.25], **kept)
+
+    def raises(outputs: Array) -> Array:
+        raise KeyError("the caller's")
+
+    with pytest.raises(KeyError, match="the caller's"):
+        learn(raises)
+    with pytest.raises(ValueError, match="the outputs' shape"):
+        learn(lambda outputs: Array.zeros((3, 1)))
+    with pytest.raises(ValueError, match="from a given gradient"):
+        learn(Array.zeros((3, 6)))
+    with pytest.raises(ValueError, match="come together"):
+        learn(lambda outputs: outputs, starts=[[False, True]] * 3)
+    with pytest.raises(ValueError, match="a flag per row and window"):
+        learn(lambda outputs: outputs, starts=[[False, True, False]] * 3, first=C0)
+    assert [bits(g) for g in gradients] == before
+
+
+@pytest.mark.parametrize(
+    ("ops", "message"),
+    [
+        ([("token_dense", 1, "relu"), ("given_output",), ("given_output",)], "one output op"),
+        ([("given_output",), ("token_dense", 1, "relu")], "one output op"),
+        ([("given_output", 1)], "takes 0 settings"),
+        ([("conv",), ("given_output",)], "takes 1 settings"),
+    ],
+)
+def test_the_program_refuses_malformed_array_ops(ops: list[Op], message: str):
+    with pytest.raises(ValueError, match=message):
+        WindowProgram(ops, 4, 0, [2], [True], cross=False, tokens=1)
