@@ -7,9 +7,10 @@ use pyo3::types::PyTuple;
 
 use crate::array::RustArray;
 use crate::error::py_err;
+use crate::nn::conv::ConvGeometry;
 use crate::random::generator::Generator;
-use indrajala_math::program::{Op, ProgramForward, Reads, MEMORY_BUDGET};
-use indrajala_math::Array;
+use indrajala_math::program::{Deltas, Op, ProgramForward, Reads, Restarts, MEMORY_BUDGET};
+use indrajala_math::{Array, Error};
 
 /// The op a descriptor names: `(kind, *settings)`, as `WindowProgram`'s documentation lists.
 fn parse_op(descriptor: &Bound<'_, PyTuple>) -> PyResult<Op> {
@@ -119,10 +120,26 @@ fn parse_op(descriptor: &Bound<'_, PyTuple>) -> PyResult<Op> {
             expect(1)?;
             Op::Dropout { p: item(1)?.extract()? }
         }
+        "conv" => {
+            expect(1)?;
+            Op::Conv {
+                geometry: item(1)?.extract::<PyRef<'_, ConvGeometry>>()?.0,
+            }
+        }
+        "max_pool" => {
+            expect(1)?;
+            Op::MaxPool {
+                geometry: item(1)?.extract::<PyRef<'_, ConvGeometry>>()?.0,
+            }
+        }
+        "given_output" => {
+            expect(0)?;
+            Op::GivenOutput
+        }
         _ => {
             return Err(PyValueError::new_err(format!(
                 "{context} has no op {kind:?}: embedding, position, state_input, fork, add, split, branch, \
-                 merge, layer_norm, token_dense, token_output, attention, dropout"
+                 merge, layer_norm, token_dense, token_output, attention, dropout, conv, max_pool, given_output"
             )))
         }
     })
@@ -135,10 +152,14 @@ fn parse_op(descriptor: &Bound<'_, PyTuple>) -> PyResult<Op> {
 /// `("state_input", tokens)` or `("state_input", tokens, scale)` (FiLM's when true), `("fork",)`, `("add",)`, `("layer_norm", epsilon)`,
 /// `("token_dense", tokens, "relu" | "linear")`, `("token_output", tokens)`,
 /// `("attention", heads, causal, dropout, cos, sin)` (`cos`, `sin` the rotary table's arrays, or
-/// None for both), `("dropout", p)`, `("split",)`, `("branch",)`, `("merge",)`. `columns` is a window's width `k`
-/// (its tokens), `reads` the op whose input the poolings read (one for every factor, or a list,
-/// each factor's), `sizes` the factors' state sizes, `snapped` whether each has codes, `cross` the
-/// cross-term.
+/// None for both), `("dropout", p)`, `("split",)`, `("branch",)`, `("merge",)`; and a window of
+/// array layers' (indrajala-ml's array window workplan, D7) `("conv", geometry)` (a ReLU conv
+/// layer, parameters `W`, `b`), `("max_pool", geometry)` (`ConvGeometry`s) and `("given_output",)`
+/// (a given loss's affine output layer, parameters `W`, `b`), a flat dense layer a `token_dense`
+/// of one token. `columns` is a window's width `k` (its tokens; an array window's observation's
+/// values), `tokens` the tokens the poolings read (None: `columns`; an array window's 1), `reads`
+/// the op whose input the poolings read (one for every factor, or a list, each factor's), `sizes`
+/// the factors' state sizes, `snapped` whether each has codes, `cross` the cross-term.
 ///
 /// Branches: `split` keeps its input; the ops after it are its first branch; each `branch` ends a
 /// branch and starts the next from the split's input, the last branch running to the program's
@@ -160,7 +181,7 @@ enum PyReads {
 #[pymethods]
 impl WindowProgram {
     #[new]
-    #[pyo3(signature = (ops, columns, reads, sizes, snapped, *, cross))]
+    #[pyo3(signature = (ops, columns, reads, sizes, snapped, *, cross, tokens = None))]
     fn new(
         ops: Vec<Bound<'_, PyTuple>>,
         columns: usize,
@@ -168,21 +189,55 @@ impl WindowProgram {
         sizes: Vec<usize>,
         snapped: Vec<bool>,
         cross: bool,
+        tokens: Option<usize>,
     ) -> PyResult<Self> {
         let ops = ops.iter().map(parse_op).collect::<PyResult<Vec<_>>>()?;
         let reads = match reads {
             PyReads::One(read) => Reads::One(read),
             PyReads::Each(each) => Reads::Each(each),
         };
-        indrajala_math::program::WindowProgram::new(ops, columns, reads, sizes, snapped, cross)
-            .map(WindowProgram)
-            .map_err(py_err)
+        indrajala_math::program::WindowProgram::new(
+            ops,
+            columns,
+            tokens.unwrap_or(columns),
+            reads,
+            sizes,
+            snapped,
+            cross,
+        )
+        .map(WindowProgram)
+        .map_err(py_err)
     }
 
     /// How many parameters a call takes: the ops', then the factors'.
     #[getter]
     fn parameter_count(&self) -> usize {
         self.0.parameter_count()
+    }
+}
+
+/// A call's restarts from `starts` `(N, W)` flags, a row a list, and the initial state's snap
+/// `first` `(N, S)`: both or neither.
+fn restarts(starts: Option<Vec<Vec<bool>>>, first: Option<&RustArray>) -> PyResult<Option<Restarts>> {
+    match (starts, first) {
+        (None, None) => Ok(None),
+        (Some(starts), Some(first)) => {
+            let windows = starts.first().map_or(0, Vec::len);
+            if starts.iter().any(|row| row.len() != windows) {
+                return Err(PyValueError::new_err(
+                    "starts is a flag per row and window, every row as long",
+                ));
+            }
+            Ok(Some(Restarts {
+                first: first.0.clone(),
+                starts: (0..windows)
+                    .map(|w| starts.iter().map(|row| row[w]).collect())
+                    .collect(),
+            }))
+        }
+        _ => Err(PyValueError::new_err(
+            "starts and first come together: the rows that restart, and from what",
+        )),
     }
 }
 
@@ -197,10 +252,13 @@ type PyProgramForward = (RustArray, Vec<RustArray>, Vec<RustArray>, Vec<Vec<Opti
 /// factor (None for a continuous factor). What isn't kept is an empty list. With `continuous`, a
 /// flag a factor, a flagged factor passes its cell's output on unsnapped (indrajala-ml's state
 /// formation workplan, the warm-up); with `couplings`, factor `g`'s next state `(1 - couplings[g])
-/// h + couplings[g] q` (the workplan's gradual handover; None, every 1).
+/// h + couplings[g] q` (the workplan's gradual handover; None, every 1). With `temperatures`, factor
+/// `g`'s codes soft at `temperatures[g]` (None: hard), a training step's reading with the flags
+/// and couplings (indrajala-ml's array window workplan, D6). With `starts` `(N, W)` and `first`
+/// `(N, S)`, the rows flagged at a window start it from `first` (an episode began there; D5).
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (program, x, parameters, c0, *, states = false, codes = false, continuous = None, couplings = None))]
+#[pyo3(signature = (program, x, parameters, c0, *, states = false, codes = false, continuous = None, couplings = None, temperatures = None, starts = None, first = None))]
 pub fn window_program_forward(
     program: &WindowProgram,
     x: &RustArray,
@@ -210,14 +268,29 @@ pub fn window_program_forward(
     codes: bool,
     continuous: Option<Vec<bool>>,
     couplings: Option<Vec<f64>>,
+    temperatures: Option<Vec<Option<f64>>>,
+    starts: Option<Vec<Vec<bool>>>,
+    first: Option<PyRef<'_, RustArray>>,
 ) -> PyResult<PyProgramForward> {
     let parameters: Vec<&Array> = parameters.iter().map(|p| &p.0).collect();
     let arrays = |v: Vec<Array>| v.into_iter().map(RustArray::from).collect::<Vec<_>>();
-    indrajala_math::program::forward(&program.0, x, &parameters, c0, states, codes, continuous, couplings)
-        .map(|(outputs, kept_states, kept_cells, kept_indices): ProgramForward| {
-            (outputs.into(), arrays(kept_states), arrays(kept_cells), kept_indices)
-        })
-        .map_err(py_err)
+    let restarts = restarts(starts, first.as_deref())?;
+    indrajala_math::program::forward(
+        &program.0,
+        x,
+        &parameters,
+        c0,
+        states,
+        codes,
+        continuous,
+        couplings,
+        temperatures,
+        restarts.as_ref(),
+    )
+    .map(|(outputs, kept_states, kept_cells, kept_indices): ProgramForward| {
+        (outputs.into(), arrays(kept_states), arrays(kept_cells), kept_indices)
+    })
+    .map_err(py_err)
 }
 
 /// A training step's gradients over every window of `x` `(N, W * k)` with targets `y`
@@ -240,13 +313,21 @@ pub fn window_program_forward(
 /// (the workplan's gradual handover; None, every 1). With `straight`, a soft factor's gradient is
 /// straight through (`soft_codes_backward`'s; the workplan's D51). Refused before the windows past the first run when what they keep would pass `memory_budget`
 /// bytes.
+///
+/// `y` is the targets, or (a `given_output` program; indrajala-ml's array window workplan, D4) a
+/// function called once with every window's outputs side by side, `(N, W * outputs)`, after the
+/// forward pass, returning the loss's gradient at them, its delta as given; an exception it
+/// raises is this call's. With `starts` `(N, W)` and `first` `(N, S)`, the rows flagged at a window
+/// start it from `first`, and their state's gradient there is summed into the second result (D5).
+/// Returns `(dc, reset)`: the state's gradient before the first window, and the restarts' (None
+/// without any).
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (program, x, y, parameters, gradients, c0, rng, weight, commitments, *, consolidation = Vec::new(), memory_budget = MEMORY_BUDGET, temperatures = None, continuous = None, couplings = None, straight = false))]
+#[pyo3(signature = (program, x, y, parameters, gradients, c0, rng, weight, commitments, *, consolidation = Vec::new(), memory_budget = MEMORY_BUDGET, temperatures = None, continuous = None, couplings = None, straight = false, starts = None, first = None))]
 pub fn window_program_learn(
     program: &WindowProgram,
     x: &RustArray,
-    y: &RustArray,
+    y: Bound<'_, PyAny>,
     parameters: Vec<PyRef<'_, RustArray>>,
     mut gradients: Vec<PyRefMut<'_, RustArray>>,
     c0: &RustArray,
@@ -259,13 +340,36 @@ pub fn window_program_learn(
     continuous: Option<Vec<bool>>,
     couplings: Option<Vec<f64>>,
     straight: bool,
-) -> PyResult<RustArray> {
+    starts: Option<Vec<Vec<bool>>>,
+    first: Option<PyRef<'_, RustArray>>,
+) -> PyResult<(RustArray, Option<RustArray>)> {
     let parameters: Vec<&Array> = parameters.iter().map(|p| &p.0).collect();
     let mut gradients: Vec<&mut Array> = gradients.iter_mut().map(|g| &mut g.0).collect();
-    indrajala_math::program::learn(
+    let restarts = restarts(starts, first.as_deref())?;
+    let targets = y.cast::<RustArray>().ok().map(|t| t.borrow().0.clone());
+    // a Python exception the given gradient raises, kept to raise as this call's
+    let mut raised: Option<PyErr> = None;
+    let mut given = |outputs: &Array| -> Result<Array, Error> {
+        let result = y
+            .call1((RustArray::from(outputs.clone()),))
+            .and_then(|g| Ok(g.extract::<PyRef<'_, RustArray>>()?.0.clone()));
+        result.map_err(|error| {
+            raised = Some(error);
+            Error::InvalidArgument("window_program_learn: the given gradient raised".into())
+        })
+    };
+    let deltas =
+        match &targets {
+            Some(targets) => Deltas::Targets(targets),
+            None if y.is_callable() => Deltas::Given(&mut given),
+            None => return Err(PyValueError::new_err(
+                "window_program_learn's y is the targets, an Array, or the given gradient, a function of the outputs",
+            )),
+        };
+    let outcome = indrajala_math::program::learn(
         &program.0,
         x,
-        y,
+        deltas,
         &parameters,
         &mut gradients,
         c0,
@@ -278,9 +382,14 @@ pub fn window_program_learn(
         continuous,
         couplings,
         straight,
-    )
-    .map(RustArray::from)
-    .map_err(py_err)
+        restarts.as_ref(),
+    );
+    if let Some(error) = raised {
+        return Err(error);
+    }
+    outcome
+        .map(|(dc, reset)| (RustArray::from(dc), reset.map(RustArray::from)))
+        .map_err(py_err)
 }
 
 /// Each row's runs of `classes` values, each run's index of its largest, the first of equal

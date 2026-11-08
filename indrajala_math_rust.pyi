@@ -2,7 +2,7 @@
 # against the built module by `python -m mypy.stubtest indrajala_math_rust` (CI), so a Rust
 # signature change that isn't mirrored here fails the build.
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any, Literal, Self, final, overload
 
 type _ActivationName = Literal["relu", "gelu", "gelu_tanh", "silu"]
@@ -598,6 +598,7 @@ class WindowProgram:
         snapped: list[bool],
         *,
         cross: bool,
+        tokens: int | None = None,
     ) -> WindowProgram: ...
     @property
     def parameter_count(self) -> int: ...
@@ -612,12 +613,15 @@ def window_program_forward(
     codes: bool = False,
     continuous: list[bool] | None = None,
     couplings: list[float] | None = None,
+    temperatures: list[float | None] | None = None,
+    starts: list[list[bool]] | None = None,
+    first: Array | None = None,
 ) -> tuple[Array, list[Array], list[Array], list[list[list[int] | None]]]: ...
 def argmax_token_rows(matrix: Array, classes: int) -> list[tuple[int, ...]]: ...
 def window_program_learn(
     program: WindowProgram,
     x: Array,
-    y: Array,
+    y: Array | Callable[[Array], Array],
     parameters: list[Array],
     gradients: list[Array],
     c0: Array,
@@ -631,4 +635,6 @@ def window_program_learn(
     continuous: list[bool] | None = None,
     couplings: list[float] | None = None,
     straight: bool = False,
-) -> Array: ...
+    starts: list[list[bool]] | None = None,
+    first: Array | None = None,
+) -> tuple[Array, Array | None]: ...
